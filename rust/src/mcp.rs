@@ -220,7 +220,7 @@ pub fn handle_rpc_line(gw: &mut Gateway, line: &str) -> Option<String> {
                     "serverInfo",
                     JsonValue::object(vec![
                         ("name", JsonValue::String("apexuse-mcp".into())),
-                        ("version", JsonValue::String("0.2.1".into())),
+                        ("version", JsonValue::String("0.3.0".into())),
                     ]),
                 ),
             ]))
