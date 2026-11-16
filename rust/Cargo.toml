@@ -1,0 +1,13 @@
+[package]
+name = "handsmcp-mcp"
+version = "0.2.0"
+edition = "2021"
+description = "Cross-platform hybrid accessibility + Set-of-Mark visual indexing MCP server"
+
+[lib]
+name = "handsmcp_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "handsmcp-mcp"
+path = "src/main.rs"
