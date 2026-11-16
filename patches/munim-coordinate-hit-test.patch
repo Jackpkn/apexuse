@@ -1,0 +1,53 @@
+--- a/macos/Sources/main.swift
++++ b/macos/Sources/main.swift
+@@ -1696,6 +1696,34 @@
+                 return message
+             case .success(let pid):
+                 target = under ?? pid.flatMap { windowTarget(forPid: $0, containing: point) }
++            }
++        }
++        if ProcessInfo.processInfo.environment["HANDSMCP_RESTRICT_TARGETS"] == "1" {
++            guard let target, pointInTargetWindow(point: point, frame: target.frame) else {
++                return "error: coordinate is outside the selected app window; no input was sent"
++            }
++        }
++        // Prefer an accessibility action for an exact hit in this same app
++        // and window. Some applications accept posted mouse events without
++        // acting on them. Never retry via mouse after a failed AXPress because
++        // the result could be uncertain and duplicate an action.
++        if ProcessInfo.processInfo.environment["HANDSMCP_RESTRICT_TARGETS"] == "1",
++           clickCount == 1, let target {
++            let appElement = AXUIElementCreateApplication(target.pid)
++            var hit: AXUIElement?
++            if AXUIElementCopyElementAtPosition(appElement, Float(point.x), Float(point.y), &hit) == .success,
++               let hit, pidOf(hit) == target.pid,
++               let hitWindow = windowTarget(for: hit), hitWindow.wid == target.wid {
++                let facts = readFacts(hit)
++                if facts.frame?.contains(point) == true,
++                   permitsCoordinatePress(role: facts.role, enabled: facts.enabled,
++                                          actions: Set(axActions(hit)), inWeb: isInWebContent(hit)) {
++                    let status = AXUIElementPerformAction(hit, kAXPressAction as CFString)
++                    if status == .success {
++                        return "pressed accessibility target at (\(Int(x)), \(Int(y))); verify the resulting state"
++                    }
++                    return "error: accessibility press failed; inspect state before retrying"
++                }
+             }
+         }
+         if let target, backgroundClick(target, at: point, clickCount: clickCount) {
+--- /dev/null
++++ b/macos/Sources/CoordinatePressPolicy.swift
+@@ -0,0 +1,13 @@
++import Foundation
++import CoreGraphics
++
++/// A coordinate hit may be pressed semantically only when its identity and
++/// enabled state are known. Browser content keeps the existing event path.
++func permitsCoordinatePress(role: String, enabled: Bool?, actions: Set<String>, inWeb: Bool) -> Bool {
++    let roles: Set<String> = ["AXButton", "AXCheckBox", "AXRadioButton", "AXMenuItem", "AXLink"]
++    return enabled == true && !inWeb && roles.contains(role) && actions.contains("AXPress")
++}
++
++func pointInTargetWindow(point: CGPoint, frame: CGRect) -> Bool {
++    !frame.isEmpty && frame.contains(point)
++}

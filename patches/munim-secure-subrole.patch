@@ -1,0 +1,381 @@
+diff --git a/macos/Sources/Perception.swift b/macos/Sources/Perception.swift
+index 8955e49..8f3a5b8 100644
+--- a/macos/Sources/Perception.swift
++++ b/macos/Sources/Perception.swift
+@@ -65,8 +65,24 @@ private func sizeValue(_ v: AnyObject?) -> CGSize? {
+ }
+ 
+ func readFacts(_ el: AXUIElement) -> AXFacts {
+-    let v = axCopyMultiple(el, factAttributes)
+-        ?? factAttributes.map { axCopy(el, $0) }
++    // Secure fields are often AXTextField with AXSecureTextField as the
++    // subrole. Identify them before requesting value-bearing attributes.
++    let identityKeys = [kAXRoleAttribute as String, kAXSubroleAttribute as String]
++    let identity = axCopyMultiple(el, identityKeys) ?? identityKeys.map { axCopy(el, $0) }
++    let role = stringValue(identity[0]) ?? "AXUnknown"
++    let subrole = stringValue(identity[1])
++    let secure = role == "AXSecureTextField" || subrole == "AXSecureTextField"
++    let unverified = !secure && (role == "AXUnknown" || (role == "AXTextField" && subrole == nil))
++    let v: [AnyObject?]
++    if secure || unverified {
++        let safeKeys = factAttributes.enumerated().filter { ![2, 3, 4, 10].contains($0.offset) }.map(\.element)
++        var safe = axCopyMultiple(el, safeKeys) ?? safeKeys.map { axCopy(el, $0) }
++        safe.insert(contentsOf: [nil, nil, nil], at: 2)
++        safe.append(nil)
++        v = safe
++    } else {
++        v = axCopyMultiple(el, factAttributes) ?? factAttributes.map { axCopy(el, $0) }
++    }
+     let frame: CGRect? =
+         if let origin = pointValue(v[8]), let size = sizeValue(v[9]) {
+             CGRect(origin: origin, size: size)
+@@ -74,7 +90,7 @@ func readFacts(_ el: AXUIElement) -> AXFacts {
+             nil
+         }
+     return AXFacts(
+-        role: stringValue(v[0]) ?? "AXUnknown",
++        role: secure ? "AXSecureTextField" : (unverified ? "AXUnverifiedTextField" : (stringValue(v[0]) ?? "AXUnknown")),
+         subrole: stringValue(v[1]),
+         title: stringValue(v[2]),
+         description: stringValue(v[3]),
+@@ -184,9 +200,9 @@ let unclippedRoles: Set<String> = modalRoles.union(["AXMenu"])
+ let controlRoles: Set<String> = [
+     "AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXComboBox", "AXLink",
+     "AXMenuItem", "AXMenuButton", "AXSlider", "AXSegmentedControl", "AXDisclosureTriangle",
+-    "AXTextField", "AXTextArea", "AXSearchField", "AXIncrementor",
++    "AXTextField", "AXSecureTextField", "AXUnverifiedTextField", "AXTextArea", "AXSearchField", "AXIncrementor",
+ ]
+-let textInputRoles: Set<String> = ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"]
++let textInputRoles: Set<String> = ["AXTextField", "AXSecureTextField", "AXUnverifiedTextField", "AXTextArea", "AXSearchField", "AXComboBox"]
+ /// Title-bar buttons: part of the window, not of the app's content.
+ let windowControlSubroles: Set<String> = [
+     "AXCloseButton", "AXMinimizeButton", "AXZoomButton", "AXFullScreenButton",
+@@ -212,6 +228,7 @@ final class OutlineWalk {
+     /// Enabled, labelled, actionable controls of the app itself. Zero means the
+     /// app describes itself poorly, and its text is worth reading with OCR.
+     var appControls = 0
++    var hasSecureField = false
+     /// Labels, values and frames of listed elements, so OCR does not repeat them.
+     var labelled: [(frame: CGRect, text: String)] = []
+     /// The walk stopped at `maxDepth` somewhere, so a missing control may just
+@@ -300,6 +317,10 @@ final class OutlineWalk {
+             appControls += 1
+         }
+         if role == "AXWebArea" { webAreas.append(el) }
++        if role == "AXSecureTextField" || role == "AXUnverifiedTextField" {
++            hasSecureField = true
++            return // Do not traverse value-bearing descendants.
++        }
+ 
+         var childClip = clip
+         if depth == 1 || clippingRoles.contains(role), let frame = facts.frame, frame.width > 0, frame.height > 0 {
+diff --git a/macos/Sources/main.swift b/macos/Sources/main.swift
+index c184b31..8f26197 100644
+--- a/macos/Sources/main.swift
++++ b/macos/Sources/main.swift
+@@ -189,10 +189,16 @@ final class Registry {
+                 return .failure("error: \(id) no longer exists — the app changed; call get_app_state again")
+             }
+             // A busy app may not answer in time; that says nothing about the element.
+-            guard err == .success, let listed else { return .success(el) }
++            guard err == .success, let listed else {
++                return .failure("error: cannot verify the element; call get_app_state again")
++            }
++            let liveRole = (role as? String) ?? "AXUnknown"
++            let liveSubrole = axString(el, kAXSubroleAttribute as String)
++            let secure = liveRole == "AXSecureTextField" || liveSubrole == "AXSecureTextField"
++            let unverified = !secure && (liveRole == "AXUnknown" || (liveRole == "AXTextField" && liveSubrole == nil))
+             let now = Fingerprint(
+-                role: (role as? String) ?? "AXUnknown",
+-                name: axString(el, kAXTitleAttribute as String) ?? axString(el, kAXDescriptionAttribute as String))
++                role: secure ? "AXSecureTextField" : (unverified ? "AXUnverifiedTextField" : liveRole),
++                name: (secure || unverified) ? nil : (axString(el, kAXTitleAttribute as String) ?? axString(el, kAXDescriptionAttribute as String)))
+             if now != listed {
+                 return .failure(
+                     "error: \(id) changed since get_app_state (was \(listed.described), now \(now.described)); "
+@@ -247,6 +253,14 @@ struct ResolvedApp {
+     let note: String?
+ }
+ 
++/// Restrict input-enabled Apple app identities to their sealed system paths.
++func trustedSystemAppPath(_ app: NSRunningApplication) -> Bool {
++    let paths = ["com.apple.textedit": "/System/Applications/TextEdit.app",
++                 "com.apple.calculator": "/System/Applications/Calculator.app"]
++    guard let bundle = app.bundleIdentifier?.lowercased(), let expected = paths[bundle] else { return true }
++    return app.bundleURL?.resolvingSymlinksInPath().path == expected
++}
++
+ /// Resolve an app by name, bundle id, or pid.
+ ///
+ /// A single bundle id can have several running instances — Chrome routinely does.
+@@ -264,7 +278,12 @@ func resolveApp(_ query: String) -> ResolvedApp? {
+     }
+ 
+     var matches: [NSRunningApplication]
+-    if let pid = Int32(trimmed), running.contains(where: { $0.processIdentifier == pid }) {
++    if lowered.hasPrefix("bundle:") {
++        let bundle = String(lowered.dropFirst("bundle:".count))
++        guard !bundle.isEmpty else { return nil }
++        matches = running.filter { $0.bundleIdentifier?.lowercased() == bundle }
++        matches = matches.filter { trustedSystemAppPath($0) }
++    } else if let pid = Int32(trimmed), running.contains(where: { $0.processIdentifier == pid }) {
+         matches = running.filter { $0.processIdentifier == pid }
+     } else if Int32(trimmed) != nil {
+         // Numeric query that is not a live PID (e.g. app name "2048"): exact name
+@@ -302,7 +321,7 @@ func resolveApp(_ query: String) -> ResolvedApp? {
+ // MARK: - Tree walking
+ 
+ let interactiveRoles: Set<String> = [
+-    "AXButton", "AXTextField", "AXTextArea", "AXCheckBox", "AXRadioButton",
++    "AXButton", "AXTextField", "AXSecureTextField", "AXUnverifiedTextField", "AXTextArea", "AXCheckBox", "AXRadioButton",
+     "AXPopUpButton", "AXMenuItem", "AXMenuButton", "AXLink", "AXComboBox",
+     "AXSlider", "AXDisclosureTriangle", "AXSegmentedControl", "AXSearchField",
+     "AXTabGroup", "AXIncrementor", "AXColorWell", "AXCell",
+@@ -754,8 +773,9 @@ func isWithin(_ node: AXUIElement, _ ancestor: AXUIElement) -> Bool {
+ }
+ 
+ func describeHit(_ element: AXUIElement) -> String {
+-    let role = axString(element, kAXRoleAttribute as String) ?? "an element"
+-    let name = axString(element, kAXTitleAttribute as String) ?? axString(element, kAXDescriptionAttribute as String) ?? ""
++    let facts = readFacts(element)
++    let role = facts.role
++    let name = facts.title ?? facts.description ?? ""
+     return name.isEmpty ? role : "\(role) \"\(truncate(name, 50))\""
+ }
+ 
+@@ -1273,6 +1293,17 @@ func pressKey(_ key: String, modifiers: [String], pid: pid_t) -> String? {
+ // MARK: - Tool implementations
+ 
+ func toolListApps() -> String {
++    // handsmcp consumes a structured inventory with no untrusted titles or names.
++    if ProcessInfo.processInfo.environment["HANDSMCP_SAFE_INVENTORY"] == "1" {
++        let entries: [[String: Any]] = NSWorkspace.shared.runningApplications.compactMap { app in
++            guard app.activationPolicy == .regular, trustedSystemAppPath(app),
++                  let bundle = app.bundleIdentifier else { return nil }
++            return ["bundle_id": bundle, "pid": Int(app.processIdentifier)]
++        }
++        guard let data = try? JSONSerialization.data(withJSONObject: entries),
++              let output = String(data: data, encoding: .utf8) else { return "error: inventory unavailable" }
++        return output
++    }
+     var out: [String] = []
+     let apps = NSWorkspace.shared.runningApplications
+         .filter { $0.activationPolicy == .regular }
+@@ -1452,28 +1483,11 @@ func toolGetAppState(_ args: [String: Any]) -> String {
+         header += "\n" + dialogNote(dialogNames)
+     }
+ 
+-    // Apps that describe themselves poorly (Spotify, games, canvases) get their
+-    // on-screen text read with OCR, listed with ids like any element.
++    // OCR is disabled until the entire captured window can be checked for
++    // secure controls, including nodes omitted by traversal limits.
+     lastReadUsedOCR = false
+-    if ocrMode == "always" || (ocrMode == "auto" && walk.appControls == 0 && !walk.depthLimited && !stillBuilding) {
+-        let focused = axElement(ax, kAXFocusedWindowAttribute as String)
+-        let window = windows.first { entry in focused.map { CFEqual($0, entry.element) } == true }?.element
+-            ?? windows[0].element
+-        switch ScreenText.read(pid: app.processIdentifier, window: window, labelled: walk.labelled,
+-                               limit: min(max(walk.budget, 0), 400)) {
+-        case .success(let found):
+-            lastReadUsedOCR = true
+-            if !found.isEmpty {
+-                lines.append("── on-screen text (OCR)")
+-                lines += found
+-            }
+-        case .failure(let reason):
+-            if reason == ScreenText.preparingMessage {
+-                header += "\nnote: \(reason)"
+-            } else if ocrMode == "always" {
+-                header += "\nnote: OCR unavailable: \(reason)"
+-            }
+-        }
++    if ocrMode != "never" {
++        header += "\nnote: OCR disabled by handsmcp secure-field policy"
+     }
+ 
+     // A filtered outline keeps the same ids: every element was registered while
+@@ -1551,14 +1565,35 @@ func resolveTargetPid(_ args: [String: Any], element: AXUIElement? = nil) -> Res
+     return .success(Registry.targetPid)
+ }
+ 
++/// Additional fail-closed target checks for the narrow handsmcp gateway.
++func handsmcpTargetMatches(_ element: AXUIElement, bundle: String, role: String, name: String? = nil, focused: Bool = false) -> Bool {
++    guard let pid = pidOf(element), let app = NSRunningApplication(processIdentifier: pid),
++          app.bundleIdentifier?.lowercased() == bundle.lowercased(), trustedSystemAppPath(app),
++          axString(element, kAXRoleAttribute as String) == role else { return false }
++    if let name {
++        guard (axString(element, kAXTitleAttribute as String) ?? axString(element, kAXDescriptionAttribute as String)) == name else { return false }
++    }
++    if focused {
++        guard let current = axElement(AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute as String),
++              CFEqual(current, element) else { return false }
++    }
++    return true
++}
++
+ func toolClick(_ args: [String: Any]) -> String {
+     let clickCount = (args["click_count"] as? Int) ?? 1
+     guard clickCount > 0, clickCount <= 3 else {
+         return "error: click_count must be an integer between 1 and 3"
+     }
+ 
++    if ProcessInfo.processInfo.environment["HANDSMCP_RESTRICT_TARGETS"] == "1" && !(args["element_id"] is String) {
++        return "error: handsmcp requires an accessibility element target"
++    }
+     if let id = args["element_id"] as? String {
+-        if let text = Registry.text(id) { return clickText(id, text, clickCount: clickCount) }
++        if let text = Registry.text(id) {
++            if ProcessInfo.processInfo.environment["HANDSMCP_RESTRICT_TARGETS"] == "1" { return "error: OCR targets are disabled" }
++            return clickText(id, text, clickCount: clickCount)
++        }
+         let el: AXUIElement
+         switch Registry.fresh(id) {
+         case .failure(let message):
+@@ -1566,6 +1601,13 @@ func toolClick(_ args: [String: Any]) -> String {
+         case .success(let fresh):
+             el = fresh
+         }
++        if ProcessInfo.processInfo.environment["HANDSMCP_RESTRICT_TARGETS"] == "1" {
++            guard clickCount == 1, let name = args["handsmcp_expected_name"] as? String,
++                  let bundle = args["handsmcp_expected_bundle"] as? String,
++                  handsmcpTargetMatches(el, bundle: bundle, role: "AXButton", name: name) else {
++                return "error: requested button identity could not be verified"
++            }
++        }
+         // Prefer the semantic action; it works even when the element is scrolled
+         // out of view or overlapped, where a synthetic click would hit the wrong thing.
+         //
+@@ -1587,10 +1629,14 @@ func toolClick(_ args: [String: Any]) -> String {
+         }
+         if axActions(el).contains(kAXPressAction as String), clickCount == 1, !isInWebContent(el) {
+             if AXUIElementPerformAction(el, kAXPressAction as CFString) == .success {
+-                let label = axString(el, kAXTitleAttribute as String) ?? axString(el, kAXDescriptionAttribute as String) ?? id
++                let facts = readFacts(el)
++                let label = facts.title ?? facts.description ?? id
+                 return "pressed \(id) \"\(label)\" via AXPress"
+             }
+         }
++        if ProcessInfo.processInfo.environment["HANDSMCP_RESTRICT_TARGETS"] == "1" {
++            return "error: semantic button press was unavailable; no coordinate fallback was sent"
++        }
+         // Coordinate fallback: see MOUSE_TARGETING. A minimized or hidden
+         // window takes no clicks until it is parked where it renders.
+         if let pid = pidOf(el),
+@@ -1683,11 +1729,16 @@ func clickText(_ id: String, _ text: OCRText, clickCount: Int) -> String {
+ 
+ func toolTypeText(_ args: [String: Any]) -> String {
+     guard let text = args["text"] as? String else { return "error: missing required argument 'text'" }
+-    // Remote control types into whatever the machine has focused, which is
+-    // what the person watching its screen expects: they just clicked there.
++    // Text input must name a current AX element so secure-field checks run.
++    // OCR and remote/global keyboard paths cannot establish that identity.
+     if RemoteControl.isEnabled {
+-        RemoteControl.typeText(text)
+-        return "typed \(text.count) characters"
++        return "error: remote text input disabled by handsmcp secure-field policy"
++    }
++    guard let requestedID = args["element_id"] as? String else {
++        return "error: text input requires an accessibility element id"
++    }
++    if Registry.text(requestedID) != nil {
++        return "error: text input into OCR targets is disabled"
+     }
+     var element: AXUIElement?
+     var textPid: pid_t?
+@@ -1705,7 +1756,17 @@ func toolTypeText(_ args: [String: Any]) -> String {
+         case .success(let fresh):
+             el = fresh
+         }
++        if ProcessInfo.processInfo.environment["HANDSMCP_RESTRICT_TARGETS"] == "1" {
++            guard let bundle = args["handsmcp_expected_bundle"] as? String,
++                  handsmcpTargetMatches(el, bundle: bundle, role: "AXTextArea") else {
++                return "error: requested text area identity could not be verified"
++            }
++        }
+         if let refusal = refuseSecureFieldInput(el, id) { return refusal }
++        if let origin = axPoint(el, kAXPositionAttribute as String),
++           let size = axSize(el, kAXSizeAttribute as String), size.width > 0, size.height > 0 {
++            AgentCursor.shared.show(at: CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2))
++        }
+         element = el
+         // A minimized window takes keys only once parked; park before focusing.
+         if let owner = pidOf(el), let refusal = WindowParking.shared.reach(
+@@ -1715,7 +1776,10 @@ func toolTypeText(_ args: [String: Any]) -> String {
+         }
+         // Focus the field within its own app rather than raising the app, so a
+         // background window still receives the text.
+-        AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
++        let focusResult = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
++        guard focusResult == .success else {
++            return "error: could not focus the requested field; no text was sent"
++        }
+         usleep(60_000)
+     }
+     let pid: pid_t
+@@ -1739,11 +1803,22 @@ func toolTypeText(_ args: [String: Any]) -> String {
+     {
+         return "error: cannot type: \(refusal)"
+     }
+-    withKeyboardFocus(pid: pid, window: element.flatMap { axElement($0, kAXWindowAttribute as String) },
+-                      keys: text.count) {
++    guard let element else { return "error: no verified target field; no text was sent" }
++    var sent = false
++    var reason = "target focus could not be verified"
++    withKeyboardFocus(pid: pid, window: axElement(element, kAXWindowAttribute as String), keys: text.count) {
++        guard case .success(let fresh) = Registry.fresh(requestedID), CFEqual(fresh, element) else {
++            reason = "target could not be revalidated"; return
++        }
++        guard let focused = axElement(AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute as String) else {
++            reason = "app did not report its focused element"; return
++        }
++        guard CFEqual(focused, element) else { reason = "a different element has focus"; return }
++        guard refuseSecureFieldInput(element, requestedID) == nil else { reason = "field is secure or unverified"; return }
+         typeText(text, pid: pid)
++        sent = true
+     }
+-    return "typed \(text.count) characters"
++    return sent ? "typed \(text.count) characters" : "error: \(reason); no text was sent"
+ }
+ 
+ func toolPressKey(_ args: [String: Any]) -> String {
+@@ -2626,7 +2701,13 @@ func refuseSecureFieldInput(_ element: AXUIElement, _ id: String) -> String? {
+     if Identity.current.tunable("ALLOW_SECURE_FIELD_INPUT") == "1" {
+         return nil
+     }
+-    guard axString(element, kAXRoleAttribute as String) == "AXSecureTextField" else { return nil }
++    let role = axString(element, kAXRoleAttribute as String)
++    let subrole = axString(element, kAXSubroleAttribute as String)
++    guard let role else { return "error: cannot verify whether \(id) is a secure field" }
++    if role == "AXTextField" && subrole == nil {
++        return "error: cannot verify whether \(id) is a secure field"
++    }
++    guard role == "AXSecureTextField" || subrole == "AXSecureTextField" else { return nil }
+ 
+     // Hand back rather than just refusing. Operator-class agents solve password
+     // prompts by pausing and giving the human the keyboard — the credential is
+@@ -2662,6 +2743,12 @@ func toolSetValue(_ args: [String: Any]) -> String {
+     case .success(let fresh):
+         el = fresh
+     }
++    if ProcessInfo.processInfo.environment["HANDSMCP_RESTRICT_TARGETS"] == "1" {
++        guard let bundle = args["handsmcp_expected_bundle"] as? String,
++              handsmcpTargetMatches(el, bundle: bundle, role: "AXTextArea", focused: true) else {
++            return "error: requested text area is not the verified focused target"
++        }
++    }
+     if let refusal = refuseSecureFieldInput(el, id) { return refusal }
+     // Setting AXValue replaces field contents atomically, which is far more
+     // reliable than select-all-then-type for long strings.
+@@ -2682,6 +2769,12 @@ func toolSelectText(_ args: [String: Any]) -> String {
+         el = fresh
+     }
+ 
++    let role = axString(el, kAXRoleAttribute as String)
++    let subrole = axString(el, kAXSubroleAttribute as String)
++    guard let role, role != "AXSecureTextField", subrole != "AXSecureTextField",
++          !(role == "AXTextField" && subrole == nil) else {
++        return "error: cannot read or select text in a secure or unverified field"
++    }
+     let text = axString(el, kAXValueAttribute as String) ?? ""
+     let start = (args["start"] as? Int) ?? 0
+     let length = (args["length"] as? Int) ?? max(0, text.count - start)

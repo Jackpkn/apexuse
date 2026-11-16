@@ -1,0 +1,30 @@
+--- a/macos/Sources/main.swift
++++ b/macos/Sources/main.swift
+@@ -1757,9 +1757,11 @@
+             el = fresh
+         }
+         if ProcessInfo.processInfo.environment["HANDSMCP_RESTRICT_TARGETS"] == "1" {
++            let expectedRole = (args["handsmcp_expected_role"] as? String) ?? "AXTextArea"
+             guard let bundle = args["handsmcp_expected_bundle"] as? String,
+-                  handsmcpTargetMatches(el, bundle: bundle, role: "AXTextArea") else {
+-                return "error: requested text area identity could not be verified"
++                  ["AXTextArea", "AXTextField", "AXSearchField"].contains(expectedRole),
++                  handsmcpTargetMatches(el, bundle: bundle, role: expectedRole) else {
++                return "error: requested text field identity could not be verified"
+             }
+         }
+         if let refusal = refuseSecureFieldInput(el, id) { return refusal }
+@@ -2744,9 +2746,11 @@
+         el = fresh
+     }
+     if ProcessInfo.processInfo.environment["HANDSMCP_RESTRICT_TARGETS"] == "1" {
++        let expectedRole = (args["handsmcp_expected_role"] as? String) ?? "AXTextArea"
+         guard let bundle = args["handsmcp_expected_bundle"] as? String,
+-              handsmcpTargetMatches(el, bundle: bundle, role: "AXTextArea", focused: true) else {
+-            return "error: requested text area is not the verified focused target"
++              ["AXTextArea", "AXTextField", "AXSearchField"].contains(expectedRole),
++              handsmcpTargetMatches(el, bundle: bundle, role: expectedRole, focused: true) else {
++            return "error: requested text field is not the verified focused target"
+         }
+     }
+     if let refusal = refuseSecureFieldInput(el, id) { return refusal }
