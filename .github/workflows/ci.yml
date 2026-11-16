@@ -1,0 +1,65 @@
+name: ApexUse CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    name: Build & Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            bin: rust/target/release/apexuse-mcp
+          - os: ubuntu-latest
+            bin: rust/target/release/apexuse-mcp
+          - os: windows-latest
+            bin: rust/target/release/apexuse-mcp.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux X11 / AT-SPI2 / OCR runtime deps
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb dbus-x11 libx11-6 libxtst6 xdotool \
+            at-spi2-core python3-gi gir1.2-atspi-2.0 \
+            tesseract-ocr xdg-utils
+
+      - name: Run Rust unit & integration tests
+        shell: bash
+        run: cargo test --manifest-path rust/Cargo.toml
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --manifest-path rust/Cargo.toml
+
+      - name: Smoke-test native OS driver initialization
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            xvfb-run -a "./${{ matrix.bin }}" doctor
+          else
+            "./${{ matrix.bin }}" doctor
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Python MCP stdio E2E tests
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install "mcp>=1.30,<2" "pytest>=9,<10"
+          pytest -q

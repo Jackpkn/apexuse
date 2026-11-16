@@ -1,11 +1,12 @@
 import os
+import sys
 from pathlib import Path
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
-RUST_BIN = ROOT / "rust/target/release/apexuse-mcp"
+RUST_BIN = ROOT / "rust/target/release" / ("apexuse-mcp.exe" if sys.platform == "win32" else "apexuse-mcp")
 
 
 @pytest.fixture
