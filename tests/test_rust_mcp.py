@@ -126,3 +126,92 @@ async def test_rust_mcp_direct_policy_executes_without_confirmation_loop(tmp_pat
             assert typ.structuredContent["ok"] is True
             assert typ.structuredContent["policy"] == "direct"
 
+            # Fast OCR-off + max_marks SoM mode
+            vis_fast = await session.call_tool(
+                "visual_inspect", {"app": "Calculator", "ocr": "off", "max_marks": 1}
+            )
+            assert vis_fast.structuredContent["ok"] is True
+            assert vis_fast.structuredContent["marks_count"] == 1
+
+            # Direct open_url in desktop tool
+            url_res = await session.call_tool(
+                "desktop",
+                {
+                    "action": "open_url",
+                    "arguments": {"app": "com.google.Chrome", "url": "https://example.com"},
+                },
+            )
+            assert url_res.structuredContent["ok"] is True
+            assert url_res.structuredContent["url"] == "https://example.com"
+
+            # Chained run_actions batch execution + local wait_for
+            await session.call_tool("inspect_app", {"app": "Calculator"})
+            batch = await session.call_tool(
+                "computer",
+                {
+                    "action": "run_actions",
+                    "arguments": {
+                        "inspect_after": True,
+                        "steps": [
+                            {"action": "click", "ref": "e1"},
+                            {"action": "type", "ref": "e2", "text": "batch e2e"},
+                            {"action": "press_key", "key": "enter"},
+                        ],
+                    },
+                },
+            )
+            assert batch.structuredContent["ok"] is True
+            assert batch.structuredContent["executed"] == 3
+            assert "content" in batch.structuredContent
+
+            wait = await session.call_tool(
+                "computer",
+                {
+                    "action": "wait_for",
+                    "arguments": {
+                        "app": "Calculator",
+                        "window": 0,
+                        "query": "Notes",
+                        "timeout_ms": 500,
+                    },
+                },
+            )
+            assert wait.structuredContent["ok"] is True
+            assert wait.structuredContent["source"] == "ax"
+
+            await session.call_tool("inspect_app", {"app": "Calculator"})
+            coord_click = await session.call_tool(
+                "computer",
+                {
+                    "action": "click",
+                    "arguments": {"x": 145, "y": 240},
+                },
+            )
+            assert coord_click.structuredContent["ok"] is True
+
+            # Executable workflow_memory replay with step_args
+            rec = await session.call_tool(
+                "workflow_memory",
+                {
+                    "action": "record",
+                    "app": "Calculator",
+                    "goal": "Fast note entry",
+                    "steps": [
+                        {"action": "click", "target_role": "Button", "target_label": "7"},
+                        {"action": "type", "target_role": "TextArea", "target_label": "Notes"},
+                    ],
+                },
+            )
+            assert rec.structuredContent["ok"] is True
+            rep = await session.call_tool(
+                "workflow_memory",
+                {
+                    "action": "replay",
+                    "app": "Calculator",
+                    "goal": "Fast note entry",
+                    "step_args": [None, {"text": "replayed via mcp"}],
+                },
+            )
+            assert rep.structuredContent["ok"] is True
+            assert rep.structuredContent["completed_steps"] == 2
+
