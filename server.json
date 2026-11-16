@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Jackpkn/apexuse",
+  "title": "ApexUse — Computer Use MCP Server",
+  "description": "Local-first cross-platform Computer Use MCP server in Rust combining native Accessibility, Set-of-Mark visual grounding, OCR, batched actions, and workflow memory.",
+  "version": "0.2.0",
+  "repository": {
+    "url": "https://github.com/Jackpkn/apexuse",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "cargo",
+      "identifier": "apexuse-mcp",
+      "version": "0.2.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

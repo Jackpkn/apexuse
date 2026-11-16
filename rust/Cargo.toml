@@ -2,7 +2,13 @@
 name = "apexuse-mcp"
 version = "0.2.0"
 edition = "2021"
-description = "Cross-platform hybrid accessibility + Set-of-Mark visual indexing MCP server"
+description = "Local-first cross-platform Computer Use MCP server using native Accessibility, Set-of-Mark visual grounding, OCR, and workflow memory"
+license = "MIT"
+repository = "https://github.com/Jackpkn/apexuse"
+homepage = "https://github.com/Jackpkn/apexuse"
+readme = "../README.md"
+keywords = ["mcp", "computer-use", "automation", "accessibility", "set-of-mark"]
+categories = ["command-line-utilities", "development-tools", "gui", "os"]
 
 [lib]
 name = "apexuse_mcp"

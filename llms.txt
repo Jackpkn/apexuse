@@ -1,0 +1,36 @@
+# ApexUse (apexuse-mcp)
+
+> Local-first, open-source Computer Use MCP server written in pure Rust and native OS APIs for macOS, Windows, and Linux. Gives AI coding agents (Claude Code, OpenAI Codex, Gemini CLI, Antigravity) hybrid Accessibility + Set-of-Mark (`[m1]..[mN]`) visual grounding, OCR, batched `run_actions`, local `wait_for` polling, `verify_change` auto-retry, an independent floating `AgentCursor`, and workflow memory over MCP stdio with zero external Rust crate dependencies and no external LLM keys.
+
+## Repository & Links
+
+- Source: https://github.com/Jackpkn/apexuse
+- README: https://github.com/Jackpkn/apexuse/blob/main/README.md
+- Agent Config Guide: https://github.com/Jackpkn/apexuse/blob/main/agent-configs/README.md
+- Agent Skill: https://github.com/Jackpkn/apexuse/blob/main/.agents/skills/apexuse/SKILL.md
+- MCP Registry Manifest: https://github.com/Jackpkn/apexuse/blob/main/server.json
+- License (MIT): https://github.com/Jackpkn/apexuse/blob/main/LICENSE
+
+## Core MCP Tools (`apexuse-mcp`)
+
+- `inspect_app`: Read-only Accessibility snapshot (`e1..eN` refs, bounds, workflow hints) without taking a screenshot.
+- `visual_inspect`: Captures window or `"desktop"`, fuses Accessibility + OCR (`ocr="auto"|"fast"|"accurate"|"off"`), overlays `[m1]..[mN]` badges, and returns annotated PNG + mark index.
+- `computer`: `inspect`, `click`, `double_click`, `right_click`, `hover`, `drag`, `type`, `press_key`, target-scoped `scroll` (`ref`/`mark`/`x,y`), `run_actions` (up to 12 local chained steps), `wait_for` (local AX/OCR poll up to 60s), `confirm`; supports `verify_change`, `max_retries`, `settle_ms`, `retry_delay_ms`, `require_change`.
+- `desktop`: `list_applications`, `launch_application`, `activate_application`, `open_url`, `visual_click`, `double_click`, `right_click`, `hover`, `drag`.
+- `screenshot`: Unannotated PNG window capture after safety preflight.
+- `workflow_memory`: Non-secret structural macro recording and parameterized replay (`list`, `lookup`, `record`, `replay`, `clear`).
+
+## OS Architecture
+
+- macOS 14+ (`rust/native/macos_bridge.m`): `AXUIElement`, `ScreenCaptureKit`, Apple `Vision` OCR, `ApexUseCursorView` overlay, `CGEvent`/`NSEvent`. Live verified.
+- Windows 10/11 (`rust/src/driver/windows.rs`): Pure-Rust Win32 FFI (`IUIAutomation` COM, `PrintWindow`/`BitBlt`, WinRT `Windows.Media.Ocr`, `SendInput`, layered `AgentCursor`, `som_png` overlay). Cross-checked; CI build configured.
+- Linux X11/Wayland (`rust/src/driver/linux.rs`): Runtime `dlopen` `libX11` / `libXtst`, `AT-SPI2` (`gi.repository.Atspi`), Wayland helpers (`grim`/`spectacle`/`gnome-screenshot`, `wtype`/`ydotool`), `tesseract` OCR, `som_png` overlay. Cross-checked; CI build configured.
+
+## Build & Verify
+
+```sh
+cargo build --release --manifest-path rust/Cargo.toml
+cargo test --manifest-path rust/Cargo.toml
+./rust/target/release/apexuse-mcp doctor
+./rust/target/release/apexuse-mcp install antigravity
+```
