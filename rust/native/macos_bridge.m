@@ -418,7 +418,7 @@ static void walk_ax_node(AXUIElementRef el, int depth, int maxDepth,
   // Electron/Chrome don't burn IPC time walking thousands of invisible lines,
   // while still scanning visible ones.
   if (depth >= 2 && hasFrame && !CGRectIsEmpty(windowClip)) {
-    if (frame.size.width < 1 || frame.size.height < 1 ||
+    if (frame.size.width <= 2.0 || frame.size.height <= 2.0 ||
         !CGRectIntersectsRect(windowClip, frame)) {
       return;
     }
@@ -843,15 +843,53 @@ char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
     NSArray *axWins =
         [winsObj isKindOfClass:[NSArray class]] ? (NSArray *)winsObj : @[];
 
-    int axIdx = (window_index >= 0) ? window_index : 0;
-    if (window_index < 0 && axWins.count > 1) {
-      for (int wi = 0; wi < (int)axWins.count; wi++) {
-        CGRect wf = CGRectZero;
-        if (ax_frame((__bridge AXUIElementRef)axWins[wi], &wf) &&
-            wf.size.width > 120 && wf.size.height > 140) {
-          axIdx = wi;
-          break;
-        }
+    int bestStdIdx = -1;
+    double bestStdScore = -1e18;
+    double maxStdArea = 0.0;
+    for (int wi = 0; wi < (int)axWins.count; wi++) {
+      AXUIElementRef wEl = (__bridge AXUIElementRef)axWins[wi];
+      CGRect wf = CGRectZero;
+      if (!ax_frame(wEl, &wf) || wf.size.width <= 120 || wf.size.height <= 140)
+        continue;
+      NSString *sub = ax_string(wEl, kAXSubroleAttribute) ?: @"";
+      BOOL isStd = [sub isEqualToString:@"AXStandardWindow"] ||
+                   [sub isEqualToString:@"AXDialog"];
+      double area = wf.size.width * wf.size.height;
+      if (isStd && area > maxStdArea)
+        maxStdArea = area;
+    }
+    for (int wi = 0; wi < (int)axWins.count; wi++) {
+      AXUIElementRef wEl = (__bridge AXUIElementRef)axWins[wi];
+      CGRect wf = CGRectZero;
+      if (!ax_frame(wEl, &wf) || wf.size.width <= 120 || wf.size.height <= 140)
+        continue;
+      NSString *sub = ax_string(wEl, kAXSubroleAttribute) ?: @"";
+      NSString *wt = ax_string(wEl, kAXTitleAttribute) ?: @"";
+      BOOL isStd = [sub isEqualToString:@"AXStandardWindow"] ||
+                   [sub isEqualToString:@"AXDialog"];
+      double area = wf.size.width * wf.size.height;
+      double sc = (isStd ? 1e12 : 0.0) + (wt.length > 0 ? 1e9 : 0.0) +
+                  ((maxStdArea > 0 && area >= maxStdArea * 0.45)
+                       ? (1e7 - wi * 1000.0)
+                       : area);
+      if (sc > bestStdScore) {
+        bestStdScore = sc;
+        bestStdIdx = wi;
+      }
+    }
+
+    int axIdx = (window_index >= 0) ? window_index : (bestStdIdx >= 0 ? bestStdIdx : 0);
+    if (window_index >= 0 && window_index < (int)axWins.count && bestStdIdx >= 0 &&
+        bestStdIdx != window_index) {
+      AXUIElementRef reqW = (__bridge AXUIElementRef)axWins[window_index];
+      NSString *reqSub = ax_string(reqW, kAXSubroleAttribute) ?: @"";
+      NSString *reqTitle = ax_string(reqW, kAXTitleAttribute) ?: @"";
+      CGRect reqF = CGRectZero;
+      BOOL reqIsStd = [reqSub isEqualToString:@"AXStandardWindow"] ||
+                      [reqSub isEqualToString:@"AXDialog"];
+      if (!reqIsStd && reqTitle.length == 0 && ax_frame(reqW, &reqF) &&
+          maxStdArea > 0 && (reqF.size.width * reqF.size.height) < maxStdArea * 0.55) {
+        axIdx = bestStdIdx;
       }
     }
     if (axIdx >= 0 && axIdx < (int)axWins.count) {
@@ -977,8 +1015,9 @@ char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
       double bestScore = 1e18;
       for (SCWindow *w in candidates) {
         double onScreenBonus = w.isOnScreen ? -1e12 : 0.0;
-        double score =
-            onScreenBonus - (w.frame.size.width * w.frame.size.height);
+        double titleBonus = (w.title && w.title.length > 0) ? -1e7 : 0.0;
+        double score = onScreenBonus + titleBonus -
+                       (w.frame.size.width * w.frame.size.height);
         if (score < bestScore) {
           bestScore = score;
           chosen = w;
@@ -1334,100 +1373,174 @@ static CGWindowID find_primary_window_for_pid(pid_t pid, CGRect *out_frame) {
   if (!info)
     return 0;
   NSArray *list = CFBridgingRelease(info);
+  double maxArea = 0.0;
   for (NSDictionary *w in list) {
     if ([w[(__bridge NSString *)kCGWindowLayer] intValue] != 0)
       continue;
     if ((pid_t)[w[(__bridge NSString *)kCGWindowOwnerPID] intValue] != pid)
       continue;
+    NSNumber *alpha = w[(__bridge NSString *)kCGWindowAlpha];
+    if (alpha && alpha.doubleValue <= 0.01)
+      continue;
     CGRect bounds = CGRectZero;
     if (CGRectMakeWithDictionaryRepresentation(
             (__bridge CFDictionaryRef)w[(__bridge NSString *)kCGWindowBounds],
             &bounds) &&
-        bounds.size.width > 10 && bounds.size.height > 10) {
-      if (out_frame)
-        *out_frame = bounds;
-      return (
-          CGWindowID)[w[(__bridge NSString *)kCGWindowNumber] unsignedIntValue];
+        bounds.size.width > 120 && bounds.size.height > 140) {
+      double a = bounds.size.width * bounds.size.height;
+      if (a > maxArea)
+        maxArea = a;
     }
   }
-  return 0;
+  CGWindowID bestWid = 0;
+  CGRect bestBounds = CGRectZero;
+  double bestScore = -1e18;
+  int idx = 0;
+  for (NSDictionary *w in list) {
+    if ([w[(__bridge NSString *)kCGWindowLayer] intValue] != 0)
+      continue;
+    if ((pid_t)[w[(__bridge NSString *)kCGWindowOwnerPID] intValue] != pid)
+      continue;
+    NSNumber *alpha = w[(__bridge NSString *)kCGWindowAlpha];
+    if (alpha && alpha.doubleValue <= 0.01)
+      continue;
+    CGRect bounds = CGRectZero;
+    if (!CGRectMakeWithDictionaryRepresentation(
+            (__bridge CFDictionaryRef)w[(__bridge NSString *)kCGWindowBounds],
+            &bounds) ||
+        bounds.size.width <= 10 || bounds.size.height <= 10)
+      continue;
+    double area = bounds.size.width * bounds.size.height;
+    NSString *name = w[(__bridge NSString *)kCGWindowName];
+    BOOL named = [name isKindOfClass:[NSString class]] && name.length > 0;
+    BOOL major = (maxArea <= 0.0) ? (bounds.size.width > 120 && bounds.size.height > 140)
+                                  : (area >= maxArea * 0.45);
+    double score = (major ? 1e9 : 0.0) + (named ? 1e6 : 0.0) -
+                   (major ? (double)idx * 100.0 : -area);
+    if (score > bestScore) {
+      bestScore = score;
+      bestWid =
+          (CGWindowID)[w[(__bridge NSString *)kCGWindowNumber] unsignedIntValue];
+      bestBounds = bounds;
+    }
+    idx++;
+  }
+  if (bestWid != 0 && out_frame)
+    *out_frame = bestBounds;
+  return bestWid;
 }
 
-static void attach_window_fields(CGEventRef ev, CGWindowID wid) {
-  if (!ev || wid == 0)
-    return;
-  // Populate kCGMouseEventWindowUnderMousePointer (91) &
-  // ...ThatCanHandleThisEvent (92) so CGEventPostToPid routes to the target
-  // window without moving the MacBook cursor.
-  CGEventSetIntegerValueField(ev, (CGEventField)91, (int64_t)wid);
-  CGEventSetIntegerValueField(ev, (CGEventField)92, (int64_t)wid);
+static NSInteger gAgentMouseEventNum = 100;
+
+static CGEventRef make_pid_mouse_cg_event(pid_t pid, CGWindowID wid,
+                                          CGRect winFrame, NSEventType nsType,
+                                          CGEventType cgType,
+                                          CGMouseButton cgBtn,
+                                          CGPoint screenPt, int clickCount,
+                                          double pressure) {
+  if ([NSThread isMainThread] && wid != 0 && !CGRectIsEmpty(winFrame)) {
+    CGFloat mainH = NSScreen.screens.firstObject
+                        ? NSScreen.screens.firstObject.frame.size.height
+                        : (CGFloat)CGDisplayPixelsHigh(CGMainDisplayID());
+    CGFloat localX = MAX(0.0, MIN(winFrame.size.width, screenPt.x - winFrame.origin.x));
+    CGFloat localFromTop =
+        MAX(0.0, MIN(winFrame.size.height, screenPt.y - winFrame.origin.y));
+    NSInteger evNum = ++gAgentMouseEventNum;
+    NSEvent *nsEv = [NSEvent
+        mouseEventWithType:nsType
+                  location:NSMakePoint(localX, mainH - localFromTop)
+             modifierFlags:0
+                 timestamp:[[NSProcessInfo processInfo] systemUptime]
+              windowNumber:(NSInteger)wid
+                   context:nil
+               eventNumber:evNum
+                clickCount:clickCount
+                  pressure:(float)pressure];
+    if (nsEv && nsEv.CGEvent) {
+      CGEventRef cg = CGEventCreateCopy(nsEv.CGEvent);
+      if (cg) {
+        if (pid > 0) {
+          CGEventSetIntegerValueField(cg, kCGEventTargetUnixProcessID,
+                                      (int64_t)pid);
+        }
+        return cg;
+      }
+    }
+  }
+  CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStatePrivate);
+  CGEventRef ev = CGEventCreateMouseEvent(src, cgType, screenPt, cgBtn);
+  if (ev) {
+    CGEventSetFlags(ev, 0);
+    CGEventSetIntegerValueField(ev, kCGMouseEventClickState, clickCount);
+    CGEventSetDoubleValueField(ev, kCGMouseEventPressure, pressure);
+    if (wid != 0) {
+      CGEventSetIntegerValueField(ev, (CGEventField)91, (int64_t)wid);
+      CGEventSetIntegerValueField(ev, (CGEventField)92, (int64_t)wid);
+    }
+  }
+  if (src)
+    CFRelease(src);
+  return ev;
 }
 
-static void post_mouse_move_to_pid(pid_t pid, CGWindowID wid, CGPoint pt) {
+static void post_mouse_move_to_pid(pid_t pid, CGWindowID wid, CGRect wf,
+                                   CGPoint pt) {
   if (pid <= 0)
     return;
-  CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStatePrivate);
-  CGEventRef move =
-      CGEventCreateMouseEvent(src, kCGEventMouseMoved, pt, kCGMouseButtonLeft);
+  CGEventRef move = make_pid_mouse_cg_event(
+      pid, wid, wf, NSEventTypeMouseMoved, kCGEventMouseMoved,
+      kCGMouseButtonLeft, pt, 0, 0.0);
   if (move) {
-    CGEventSetFlags(move, 0);
-    attach_window_fields(move, wid);
     CGEventPostToPid(pid, move);
     CFRelease(move);
   }
-  if (src)
-    CFRelease(src);
 }
 
-static void post_mouse_click_to_pid(pid_t pid, CGWindowID wid, CGPoint pt,
-                                    int clickCount, BOOL rightButton) {
+static void post_mouse_click_to_pid(pid_t pid, CGWindowID wid, CGRect wf,
+                                    CGPoint pt, int clickCount,
+                                    BOOL rightButton) {
   if (pid <= 0)
     return;
-  CGEventType downType =
+  NSEventType nsDown =
+      rightButton ? NSEventTypeRightMouseDown : NSEventTypeLeftMouseDown;
+  NSEventType nsUp =
+      rightButton ? NSEventTypeRightMouseUp : NSEventTypeLeftMouseUp;
+  CGEventType cgDown =
       rightButton ? kCGEventRightMouseDown : kCGEventLeftMouseDown;
-  CGEventType upType = rightButton ? kCGEventRightMouseUp : kCGEventLeftMouseUp;
+  CGEventType cgUp = rightButton ? kCGEventRightMouseUp : kCGEventLeftMouseUp;
   CGMouseButton btn = rightButton ? kCGMouseButtonRight : kCGMouseButtonLeft;
 
-  CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStatePrivate);
-  post_mouse_move_to_pid(pid, wid, pt);
+  post_mouse_move_to_pid(pid, wid, wf, pt);
   usleep(20000);
   for (int i = 1; i <= clickCount; i++) {
-    CGEventRef down = CGEventCreateMouseEvent(src, downType, pt, btn);
-    CGEventRef up = CGEventCreateMouseEvent(src, upType, pt, btn);
-    if (down && up) {
-      CGEventSetFlags(down, 0);
-      CGEventSetFlags(up, 0);
-      CGEventSetIntegerValueField(down, kCGMouseEventClickState, i);
-      CGEventSetIntegerValueField(up, kCGMouseEventClickState, i);
-      attach_window_fields(down, wid);
-      attach_window_fields(up, wid);
+    CGEventRef down = make_pid_mouse_cg_event(pid, wid, wf, nsDown, cgDown, btn,
+                                              pt, i, 1.0);
+    CGEventRef up =
+        make_pid_mouse_cg_event(pid, wid, wf, nsUp, cgUp, btn, pt, i, 0.0);
+    if (down) {
       CGEventPostToPid(pid, down);
-      usleep(25000);
-      CGEventPostToPid(pid, up);
-      if (i < clickCount)
-        usleep(35000);
-    }
-    if (down)
       CFRelease(down);
-    if (up)
+    }
+    usleep(35000);
+    if (up) {
+      CGEventPostToPid(pid, up);
       CFRelease(up);
+    }
+    if (i < clickCount)
+      usleep(35000);
   }
-  if (src)
-    CFRelease(src);
 }
 
-static void post_mouse_drag_to_pid(pid_t pid, CGWindowID wid, CGPoint p1,
-                                   CGPoint p2) {
+static void post_mouse_drag_to_pid(pid_t pid, CGWindowID wid, CGRect wf,
+                                   CGPoint p1, CGPoint p2) {
   if (pid <= 0)
     return;
-  CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStatePrivate);
-  post_mouse_move_to_pid(pid, wid, p1);
+  post_mouse_move_to_pid(pid, wid, wf, p1);
   usleep(20000);
-  CGEventRef down = CGEventCreateMouseEvent(src, kCGEventLeftMouseDown, p1,
-                                            kCGMouseButtonLeft);
+  CGEventRef down = make_pid_mouse_cg_event(
+      pid, wid, wf, NSEventTypeLeftMouseDown, kCGEventLeftMouseDown,
+      kCGMouseButtonLeft, p1, 1, 1.0);
   if (down) {
-    CGEventSetFlags(down, 0);
-    attach_window_fields(down, wid);
     CGEventPostToPid(pid, down);
     CFRelease(down);
   }
@@ -1437,26 +1550,22 @@ static void post_mouse_drag_to_pid(pid_t pid, CGWindowID wid, CGPoint p1,
     double t = (double)i / (double)steps;
     CGPoint cur =
         CGPointMake(p1.x + (p2.x - p1.x) * t, p1.y + (p2.y - p1.y) * t);
-    CGEventRef drag = CGEventCreateMouseEvent(src, kCGEventLeftMouseDragged,
-                                              cur, kCGMouseButtonLeft);
+    CGEventRef drag = make_pid_mouse_cg_event(
+        pid, wid, wf, NSEventTypeLeftMouseDragged, kCGEventLeftMouseDragged,
+        kCGMouseButtonLeft, cur, 1, 1.0);
     if (drag) {
-      CGEventSetFlags(drag, 0);
-      attach_window_fields(drag, wid);
       CGEventPostToPid(pid, drag);
       CFRelease(drag);
     }
     usleep(12000);
   }
-  CGEventRef up =
-      CGEventCreateMouseEvent(src, kCGEventLeftMouseUp, p2, kCGMouseButtonLeft);
+  CGEventRef up = make_pid_mouse_cg_event(
+      pid, wid, wf, NSEventTypeLeftMouseUp, kCGEventLeftMouseUp,
+      kCGMouseButtonLeft, p2, 1, 0.0);
   if (up) {
-    CGEventSetFlags(up, 0);
-    attach_window_fields(up, wid);
     CGEventPostToPid(pid, up);
     CFRelease(up);
   }
-  if (src)
-    CFRelease(src);
 }
 
 static void type_unicode_text_to_pid(pid_t pid, NSString *text) {
@@ -1914,8 +2023,9 @@ char *handsmcp_macos_perform_action(const char *req_json) {
       return dup_json(@{@"ok" : @NO, @"code" : @"coordinate_outside_window"});
     }
     pid_t targetPid = pid;
-    CGWindowID wid = find_window_at_point(isDesktop ? 0 : pid, pt,
-                                          isDesktop ? &targetPid : NULL, NULL);
+    CGRect widFrame = CGRectZero;
+    CGWindowID wid = find_window_at_point(
+        isDesktop ? 0 : pid, pt, isDesktop ? &targetPid : NULL, &widFrame);
     AXUIElementRef hit = NULL;
     NSString *role = nil;
     if (!check_hit_safe(targetPid, isChrome, x, y, &hit, &role)) {
@@ -1989,7 +2099,7 @@ char *handsmcp_macos_perform_action(const char *req_json) {
         CFRelease(hit);
       }
     }
-    post_mouse_click_to_pid(eventPid, wid, pt, clickCount, rightBtn);
+    post_mouse_click_to_pid(eventPid, wid, widFrame, pt, clickCount, rightBtn);
     touch_agent_cursor_ttl();
     return dup_json(@{
       @"ok" : @YES,
@@ -2007,10 +2117,11 @@ char *handsmcp_macos_perform_action(const char *req_json) {
       return dup_json(@{@"ok" : @NO, @"code" : @"coordinate_outside_window"});
     }
     pid_t targetPid = pid;
-    CGWindowID wid = find_window_at_point(isDesktop ? 0 : pid, pt,
-                                          isDesktop ? &targetPid : NULL, NULL);
+    CGRect widFrame = CGRectZero;
+    CGWindowID wid = find_window_at_point(
+        isDesktop ? 0 : pid, pt, isDesktop ? &targetPid : NULL, &widFrame);
     show_agent_cursor_at(pt, NO);
-    post_mouse_move_to_pid(targetPid, wid, pt);
+    post_mouse_move_to_pid(targetPid, wid, widFrame, pt);
     touch_agent_cursor_ttl();
     return dup_json(@{@"ok" : @YES, @"method" : @"agent_cursor_hover"});
   }
@@ -2024,14 +2135,15 @@ char *handsmcp_macos_perform_action(const char *req_json) {
       return dup_json(@{@"ok" : @NO, @"code" : @"coordinate_outside_window"});
     }
     pid_t targetPid = pid;
-    CGWindowID wid = find_window_at_point(isDesktop ? 0 : pid, p1,
-                                          isDesktop ? &targetPid : NULL, NULL);
+    CGRect widFrame = CGRectZero;
+    CGWindowID wid = find_window_at_point(
+        isDesktop ? 0 : pid, p1, isDesktop ? &targetPid : NULL, &widFrame);
     if (!check_hit_safe(targetPid, isChrome, x1, y1, NULL, NULL) ||
         !check_hit_safe(targetPid, isChrome, x2, y2, NULL, NULL)) {
       return dup_json(@{@"ok" : @NO, @"code" : @"unsafe_target_field"});
     }
     show_agent_cursor_at(p1, YES);
-    post_mouse_drag_to_pid(targetPid, wid, p1, p2);
+    post_mouse_drag_to_pid(targetPid, wid, widFrame, p1, p2);
     show_agent_cursor_at(p2, NO);
     touch_agent_cursor_ttl();
     return dup_json(@{@"ok" : @YES, @"method" : @"pid_drag"});
@@ -2048,8 +2160,9 @@ char *handsmcp_macos_perform_action(const char *req_json) {
       return dup_json(@{@"ok" : @NO, @"code" : @"coordinate_outside_window"});
     }
     pid_t targetPid = pid;
-    CGWindowID wid = find_window_at_point(isDesktop ? 0 : pid, pt,
-                                          isDesktop ? &targetPid : NULL, NULL);
+    CGRect widFrame = CGRectZero;
+    CGWindowID wid = find_window_at_point(
+        isDesktop ? 0 : pid, pt, isDesktop ? &targetPid : NULL, &widFrame);
     AXUIElementRef hit = NULL;
     NSString *role = nil;
     if (!check_hit_safe(targetPid, isChrome, x, y, &hit, &role)) {
@@ -2092,7 +2205,7 @@ char *handsmcp_macos_perform_action(const char *req_json) {
           touch_agent_cursor_ttl();
           return dup_json(@{@"ok" : @NO, @"code" : @"replacement_set_failed"});
         }
-        post_mouse_click_to_pid(eventPid, wid, pt, 1, NO);
+        post_mouse_click_to_pid(eventPid, wid, widFrame, pt, 1, NO);
         usleep(50000);
         post_key_chord_to_pid(eventPid, 0 /* a */, kCGEventFlagMaskCommand);
         usleep(25000);
@@ -2109,7 +2222,7 @@ char *handsmcp_macos_perform_action(const char *req_json) {
       }
       CFRelease(editable);
       if (webTarget) {
-        post_mouse_click_to_pid(eventPid, wid, pt, 1, NO);
+        post_mouse_click_to_pid(eventPid, wid, widFrame, pt, 1, NO);
         usleep(50000);
       }
     } else {
@@ -2121,7 +2234,7 @@ char *handsmcp_macos_perform_action(const char *req_json) {
         }
         CFRelease(hit);
       }
-      post_mouse_click_to_pid(eventPid, wid, pt, 1, NO);
+      post_mouse_click_to_pid(eventPid, wid, widFrame, pt, 1, NO);
       usleep(60000);
     }
     type_unicode_text_to_pid(eventPid, text);
@@ -2172,23 +2285,59 @@ char *handsmcp_macos_perform_action(const char *req_json) {
       dx = amount;
     CGRect wf = CGRectZero;
     CGWindowID wid = (pid > 0) ? find_primary_window_for_pid(pid, &wf) : 0;
-    CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStatePrivate);
-    CGEventRef ev =
-        CGEventCreateScrollWheelEvent(src, kCGScrollEventUnitLine, 2, dy, dx);
-    if (ev && pid > 0) {
-      if (!CGRectIsEmpty(wf)) {
-        CGPoint center = CGPointMake(CGRectGetMidX(wf), CGRectGetMidY(wf));
-        CGEventSetLocation(ev, center);
-        show_agent_cursor_at(center, NO);
+    CGPoint pt = !CGRectIsEmpty(wf)
+                     ? CGPointMake(CGRectGetMidX(wf), CGRectGetMidY(wf))
+                     : CGPointZero;
+    if (req[@"x"] && req[@"y"]) {
+      pt = CGPointMake([req[@"x"] doubleValue], [req[@"y"] doubleValue]);
+      pid_t pTmp = pid;
+      CGWindowID hitWid = find_window_at_point(
+          isDesktop ? 0 : pid, pt, isDesktop ? &pTmp : NULL, &wf);
+      if (hitWid != 0) {
+        wid = hitWid;
+        pid = pTmp;
       }
-      attach_window_fields(ev, wid);
+    }
+    if (!CGRectIsEmpty(wf)) {
+      show_agent_cursor_at(pt, NO);
+      post_mouse_move_to_pid(pid, wid, wf, pt);
+      usleep(15000);
+    }
+    CGEventRef ev = NULL;
+    if ([NSThread isMainThread] && wid != 0 && !CGRectIsEmpty(wf)) {
+      CGEventRef base = make_pid_mouse_cg_event(
+          pid, wid, wf, NSEventTypeMouseMoved, kCGEventMouseMoved,
+          kCGMouseButtonLeft, pt, 0, 0.0);
+      if (base) {
+        CGEventSetType(base, kCGEventScrollWheel);
+        CGEventSetIntegerValueField(base, kCGScrollWheelEventDeltaAxis1, dy);
+        CGEventSetIntegerValueField(base, kCGScrollWheelEventDeltaAxis2, dx);
+        CGEventSetIntegerValueField(base, kCGScrollWheelEventPointDeltaAxis1,
+                                    (int64_t)dy * 12);
+        CGEventSetIntegerValueField(base, kCGScrollWheelEventPointDeltaAxis2,
+                                    (int64_t)dx * 12);
+        CGEventSetIntegerValueField(base, kCGScrollWheelEventIsContinuous, 1);
+        ev = base;
+      }
+    }
+    if (!ev) {
+      CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStatePrivate);
+      ev = CGEventCreateScrollWheelEvent(src, kCGScrollEventUnitLine, 2, dy, dx);
+      if (ev && !CGRectIsEmpty(wf))
+        CGEventSetLocation(ev, pt);
+      if (ev && wid != 0) {
+        CGEventSetIntegerValueField(ev, (CGEventField)91, (int64_t)wid);
+        CGEventSetIntegerValueField(ev, (CGEventField)92, (int64_t)wid);
+      }
+      if (src)
+        CFRelease(src);
+    }
+    if (ev && pid > 0) {
       CGEventPostToPid(pid, ev);
       touch_agent_cursor_ttl();
     }
     if (ev)
       CFRelease(ev);
-    if (src)
-      CFRelease(src);
     return dup_json(@{@"ok" : @YES, @"method" : @"pid_scroll"});
   }
 
