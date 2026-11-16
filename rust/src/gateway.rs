@@ -547,11 +547,12 @@ impl Gateway {
         let Some(app) = self.snapshot_app.clone() else {
             return ToolOutput::json(err_json("stale_ref", "Inspect or visual_inspect an app or 'desktop' first"));
         };
-        if self.snapshot_filtered {
+        let has_coords = sub_args.get("x").is_some() || sub_args.get("y").is_some();
+        if has_coords && self.snapshot_filtered {
             return ToolOutput::json(err_json("invalid_state", "Visual coordinate clicks require an unfiltered snapshot"));
         }
 
-        if sub_args.get("mark").is_none() && sub_args.get("x").is_none() && sub_args.get("y").is_none() && sub_args.get("ref").is_some() {
+        if sub_args.get("mark").is_none() && !has_coords && sub_args.get("ref").is_some() {
             let rid = sub_args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
             let Some(el) = self.elements_by_ref.get(rid).cloned() else {
                 return ToolOutput::json(err_json("stale_ref", "Unknown or stale element ref"));
@@ -578,7 +579,7 @@ impl Gateway {
             Ok(res) => res,
             Err(e) => return e,
         };
-        if (sub_args.get("x").is_some() || sub_args.get("y").is_some()) && !allow_coords {
+        if has_coords && !allow_coords {
             return ToolOutput::json(err_json("invalid_argument", "Use desktop/visual_click or provide ref/mark"));
         }
         let mark_id = sub_args.get("mark").and_then(|v| v.as_str()).map(str::to_string);
@@ -758,9 +759,9 @@ impl Gateway {
 
         match action {
             "inspect" => self.handle_inspect_app(sub_args),
-            "click" => self.request_pointer_click("click", sub_args, 1, "left", false),
-            "double_click" => self.request_pointer_click("double_click", sub_args, 2, "left", false),
-            "right_click" => self.request_pointer_click("right_click", sub_args, 1, "right", false),
+            "click" => self.request_pointer_click("click", sub_args, 1, "left", true),
+            "double_click" => self.request_pointer_click("double_click", sub_args, 2, "left", true),
+            "right_click" => self.request_pointer_click("right_click", sub_args, 1, "right", true),
             "hover" => self.request_hover(sub_args),
             "drag" => self.request_drag(sub_args),
             "type" => {
@@ -1627,6 +1628,13 @@ impl Gateway {
             .get("ocr")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let window = match sub_args.get("window") {
+            None | Some(JsonValue::Null) => None,
+            Some(v) => match v.as_i64() {
+                Some(n) if n >= 0 => Some(n as i32),
+                _ => return ToolOutput::json(err_json("invalid_argument", "'window' must be a non-negative integer")),
+            },
+        };
 
         if self.audit.record("wait_for", "allow", "requested").is_err() {
             return ToolOutput::json(err_json("audit_unavailable", "Audit log write failed"));
@@ -1641,9 +1649,18 @@ impl Gateway {
                 return ToolOutput::json(err_json("panic_stop", "STOP file present"));
             }
             self.driver.tick();
-            let snap = match self.driver.inspect_app(&target, None, 150, 12) {
+            let snap = match self.driver.inspect_app(&target, window, 150, 12) {
                 Ok(s) => s,
-                Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
+                Err(e) => {
+                    let transient = matches!(e.code.as_str(), "app_not_running" | "window_not_found");
+                    let elapsed_now = start.elapsed();
+                    if transient && elapsed_now < deadline {
+                        let rem = deadline - elapsed_now;
+                        thread::sleep(rem.min(Duration::from_millis(poll_ms)));
+                        continue;
+                    }
+                    return ToolOutput::json(err_json(&e.code, &e.message));
+                }
             };
             if !self.check_frontmost_permitted(&snap.frontmost_bundle_id) {
                 return ToolOutput::json(err_json("invalid_app", "Frontmost application is protected"));
@@ -1659,7 +1676,7 @@ impl Gateway {
             let ax_found = full_outline.to_ascii_lowercase().contains(&q_lower);
             let mut ocr_match_text: Option<String> = None;
             if use_ocr && !ax_found {
-                if let Ok(cap) = self.driver.capture_and_ocr(&target, None, OcrMode::Fast, false) {
+                if let Ok(cap) = self.driver.capture_and_ocr(&target, window, OcrMode::Fast, false) {
                     if let Some(bx) = cap
                         .ocr_boxes
                         .iter()
@@ -1680,7 +1697,7 @@ impl Gateway {
                     snap.render_outline(if absent { None } else { Some(query) })
                 };
                 self.invalidate_snapshot();
-                self.record_snapshot_meta(&snap, None, 150, 12, !absent && ax_found);
+                self.record_snapshot_meta(&snap, window, 150, 12, !absent && ax_found);
                 return ToolOutput::json(JsonValue::object(vec![
                     ("ok", JsonValue::Bool(true)),
                     ("matched", JsonValue::Bool(true)),
@@ -3012,6 +3029,144 @@ mod tests {
         );
         assert_eq!(rep.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(rep.payload.get("completed_steps").and_then(|v| v.as_i64()), Some(2));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn computer_click_accepts_coords_on_unfiltered_and_rejects_on_filtered_while_keeping_ref() {
+        let dir = std::env::temp_dir().join(format!("handsmcp_gw_clk_coord_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut gw = Gateway::new(Box::new(MockDriver::new()), PolicySettings::default(), dir.clone());
+
+        let _ = gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("com.apple.calculator".into()))]),
+        );
+        let ok_coord = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("x", JsonValue::Number(145.0)),
+                        ("y", JsonValue::Number(240.0)),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(ok_coord.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let _ = gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![
+                ("app", JsonValue::String("com.apple.calculator".into())),
+                ("query", JsonValue::String("7".into())),
+            ]),
+        );
+        let blocked_coord = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("x", JsonValue::Number(145.0)),
+                        ("y", JsonValue::Number(240.0)),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(blocked_coord.payload.get("code").and_then(|v| v.as_str()), Some("invalid_state"));
+
+        let ok_ref = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                ("arguments", JsonValue::object(vec![("ref", JsonValue::String("e1".into()))])),
+            ]),
+        );
+        assert_eq!(ok_ref.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn computer_wait_for_scopes_window_and_retries_transient_startup_errors() {
+        struct TransientStartupDriver {
+            calls: std::sync::atomic::AtomicUsize,
+            seen_window: std::sync::Mutex<Option<i32>>,
+        }
+        impl OsDriver for TransientStartupDriver {
+            fn doctor(&self) -> Result<DoctorStatus, crate::driver::DriverError> {
+                MockDriver::new().doctor()
+            }
+            fn list_apps(&self) -> Result<Vec<crate::driver::RunningApp>, crate::driver::DriverError> {
+                MockDriver::new().list_apps()
+            }
+            fn activate_app(&self, b: &str) -> Result<(), crate::driver::DriverError> {
+                MockDriver::new().activate_app(b)
+            }
+            fn launch_app(&self, b: &str) -> Result<(), crate::driver::DriverError> {
+                MockDriver::new().launch_app(b)
+            }
+            fn inspect_app(
+                &self,
+                bundle_id: &str,
+                w: Option<i32>,
+                me: i32,
+                md: i32,
+            ) -> Result<AppSnapshot, crate::driver::DriverError> {
+                *self.seen_window.lock().unwrap() = w;
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    return Err(crate::driver::DriverError::new("window_not_found", "Starting up"));
+                }
+                MockDriver::new().inspect_app(bundle_id, w, me, md)
+            }
+            fn capture_and_ocr(
+                &self,
+                bundle_id: &str,
+                w: Option<i32>,
+                ocr_mode: OcrMode,
+                encode_png: bool,
+            ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
+                MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_png)
+            }
+            fn render_som_png(&self, b: &str, m: &str, wf: &Rect) -> Result<String, crate::driver::DriverError> {
+                MockDriver::new().render_som_png(b, m, wf)
+            }
+            fn perform_action(&self, req: &ActionRequest) -> Result<crate::driver::ActionResult, crate::driver::DriverError> {
+                MockDriver::new().perform_action(req)
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("handsmcp_gw_wait_win_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let drv = TransientStartupDriver {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            seen_window: std::sync::Mutex::new(None),
+        };
+        let mut gw = Gateway::new(Box::new(drv), PolicySettings::default(), dir.clone());
+        let res = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("wait_for".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("app", JsonValue::String("com.apple.calculator".into())),
+                        ("query", JsonValue::String("Notes".into())),
+                        ("window", JsonValue::Number(0.0)),
+                        ("timeout_ms", JsonValue::Number(800.0)),
+                        ("poll_ms", JsonValue::Number(100.0)),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(res.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(res.payload.get("source").and_then(|v| v.as_str()), Some("ax"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
