@@ -1,3 +1,4 @@
+use crate::config::ImageFormat;
 use crate::driver::{DriverError, Rect};
 use crate::json::parse_json;
 use std::collections::VecDeque;
@@ -176,6 +177,480 @@ pub fn encode_rgba_png_bytes(width: usize, height: usize, rgba: &[u8]) -> Vec<u8
 
 pub fn encode_rgba_png_b64(width: usize, height: usize, rgba: &[u8]) -> String {
     base64_encode(&encode_rgba_png_bytes(width, height, rgba))
+}
+
+// MARK: - Pure-Rust Baseline JPEG Encoder
+
+const STD_LUMA_QUANT: [u8; 64] = [
+    16, 11, 10, 16, 24, 40, 51, 61,
+    12, 12, 14, 19, 26, 58, 60, 55,
+    14, 13, 16, 24, 40, 57, 69, 56,
+    14, 17, 22, 29, 51, 87, 80, 62,
+    18, 22, 37, 56, 68, 109, 103, 77,
+    24, 35, 55, 64, 81, 104, 113, 92,
+    49, 64, 78, 87, 103, 121, 120, 101,
+    72, 92, 95, 98, 112, 100, 103, 99,
+];
+
+const STD_CHROMA_QUANT: [u8; 64] = [
+    17, 18, 24, 47, 99, 99, 99, 99,
+    18, 21, 26, 66, 99, 99, 99, 99,
+    24, 26, 56, 99, 99, 99, 99, 99,
+    47, 66, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+];
+
+const ZIGZAG: [usize; 64] = [
+     0,  1,  8, 16,  9,  2,  3, 10,
+    17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+const BITS_DC_LUMA: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+const VALS_DC_LUMA: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+
+const BITS_DC_CHROMA: [u8; 16] = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
+const VALS_DC_CHROMA: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+
+const BITS_AC_LUMA: [u8; 16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125];
+const VALS_AC_LUMA: [u8; 162] = [
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12,
+    0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08,
+    0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16,
+    0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+    0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
+    0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79,
+    0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
+    0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+    0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6,
+    0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5,
+    0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4,
+    0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
+    0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea,
+    0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+    0xf9, 0xfa,
+];
+
+const BITS_AC_CHROMA: [u8; 16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 119];
+const VALS_AC_CHROMA: [u8; 162] = [
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21,
+    0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
+    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91,
+    0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0,
+    0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34,
+    0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26,
+    0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38,
+    0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
+    0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+    0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
+    0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96,
+    0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5,
+    0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4,
+    0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3,
+    0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2,
+    0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda,
+    0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9,
+    0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+    0xf9, 0xfa,
+];
+
+#[derive(Clone, Copy, Default)]
+struct HuffmanCode {
+    code: u16,
+    len: u8,
+}
+
+fn build_huffman_lut(bits: &[u8; 16], values: &[u8]) -> [HuffmanCode; 256] {
+    let mut lut = [HuffmanCode { code: 0, len: 0 }; 256];
+    let mut code = 0u16;
+    let mut val_idx = 0;
+    for len in 1..=16 {
+        let count = bits[len - 1] as usize;
+        for _ in 0..count {
+            let val = values[val_idx] as usize;
+            lut[val] = HuffmanCode {
+                code,
+                len: len as u8,
+            };
+            code += 1;
+            val_idx += 1;
+        }
+        code <<= 1;
+    }
+    lut
+}
+
+struct HuffmanLuts {
+    dc_luma: [HuffmanCode; 256],
+    dc_chroma: [HuffmanCode; 256],
+    ac_luma: [HuffmanCode; 256],
+    ac_chroma: [HuffmanCode; 256],
+}
+
+fn get_huffman_luts() -> &'static HuffmanLuts {
+    static LUTS: OnceLock<HuffmanLuts> = OnceLock::new();
+    LUTS.get_or_init(|| HuffmanLuts {
+        dc_luma: build_huffman_lut(&BITS_DC_LUMA, &VALS_DC_LUMA),
+        dc_chroma: build_huffman_lut(&BITS_DC_CHROMA, &VALS_DC_CHROMA),
+        ac_luma: build_huffman_lut(&BITS_AC_LUMA, &VALS_AC_LUMA),
+        ac_chroma: build_huffman_lut(&BITS_AC_CHROMA, &VALS_AC_CHROMA),
+    })
+}
+
+fn get_dct_coeff() -> &'static [[f32; 8]; 8] {
+    static DCT_COEFF: OnceLock<[[f32; 8]; 8]> = OnceLock::new();
+    DCT_COEFF.get_or_init(|| {
+        let mut lut = [[0.0f32; 8]; 8];
+        for u in 0..8 {
+            let c = if u == 0 { 1.0 / std::f32::consts::SQRT_2 } else { 1.0 };
+            for x in 0..8 {
+                let angle = (2 * x + 1) as f32 * u as f32 * std::f32::consts::PI / 16.0;
+                lut[u][x] = 0.5 * c * angle.cos();
+            }
+        }
+        lut
+    })
+}
+
+fn scale_quant_table(base: &[u8; 64], quality: u8) -> [u8; 64] {
+    let q = quality.clamp(1, 100) as u32;
+    let s = if q < 50 {
+        5000 / q
+    } else {
+        200 - q * 2
+    };
+    let mut table = [0u8; 64];
+    for i in 0..64 {
+        let val = (base[i] as u32 * s + 50) / 100;
+        table[i] = val.clamp(1, 255) as u8;
+    }
+    table
+}
+
+fn fdct_2d(block: &mut [f32; 64], coeff: &[[f32; 8]; 8]) {
+    let mut temp = [0.0f32; 64];
+    for y in 0..8 {
+        for u in 0..8 {
+            let mut sum = 0.0f32;
+            for x in 0..8 {
+                sum += block[y * 8 + x] * coeff[u][x];
+            }
+            temp[y * 8 + u] = sum;
+        }
+    }
+    for u in 0..8 {
+        for v in 0..8 {
+            let mut sum = 0.0f32;
+            for y in 0..8 {
+                sum += temp[y * 8 + u] * coeff[v][y];
+            }
+            block[v * 8 + u] = sum;
+        }
+    }
+}
+
+fn quantize_and_zigzag(block: &[f32; 64], q_table: &[u8; 64]) -> [i16; 64] {
+    let mut out = [0i16; 64];
+    for k in 0..64 {
+        let idx = ZIGZAG[k];
+        let coeff = block[idx];
+        let q = q_table[idx] as f32;
+        let rounded = (coeff / q).round();
+        if k == 0 {
+            out[k] = rounded.clamp(-2047.0, 2047.0) as i16;
+        } else {
+            out[k] = rounded.clamp(-1023.0, 1023.0) as i16;
+        }
+    }
+    out
+}
+
+struct BitWriter {
+    buffer: u32,
+    bits_in_buffer: u8,
+    output: Vec<u8>,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        Self {
+            buffer: 0,
+            bits_in_buffer: 0,
+            output: Vec::with_capacity(32 * 1024),
+        }
+    }
+
+    fn write_bits(&mut self, code: u16, len: u8) {
+        if len == 0 {
+            return;
+        }
+        self.buffer = (self.buffer << len) | ((code as u32) & ((1u32 << len) - 1));
+        self.bits_in_buffer += len;
+        while self.bits_in_buffer >= 8 {
+            self.bits_in_buffer -= 8;
+            let byte = ((self.buffer >> self.bits_in_buffer) & 0xFF) as u8;
+            self.output.push(byte);
+            if byte == 0xFF {
+                self.output.push(0x00);
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.bits_in_buffer > 0 {
+            let pad = 8 - self.bits_in_buffer;
+            let byte = (((self.buffer << pad) | ((1u32 << pad) - 1)) & 0xFF) as u8;
+            self.output.push(byte);
+            if byte == 0xFF {
+                self.output.push(0x00);
+            }
+            self.buffer = 0;
+            self.bits_in_buffer = 0;
+        }
+    }
+}
+
+fn bit_length(val: i32) -> u8 {
+    let abs_val = val.unsigned_abs();
+    if abs_val == 0 {
+        0
+    } else {
+        32 - abs_val.leading_zeros() as u8
+    }
+}
+
+fn value_bits(val: i16, cat: u8) -> u16 {
+    if val >= 0 {
+        val as u16
+    } else {
+        (val as i32 + ((1i32 << cat) - 1)) as u16
+    }
+}
+
+fn encode_block(
+    block: &[i16; 64],
+    dc_prev: &mut i16,
+    dc_lut: &[HuffmanCode; 256],
+    ac_lut: &[HuffmanCode; 256],
+    writer: &mut BitWriter,
+) {
+    let raw_diff = (block[0] as i32) - (*dc_prev as i32);
+    let diff = raw_diff.clamp(-2047, 2047) as i16;
+    *dc_prev = (*dc_prev as i32 + diff as i32) as i16;
+
+    let cat = bit_length(diff as i32);
+    let dc_code = dc_lut[cat as usize];
+    writer.write_bits(dc_code.code, dc_code.len);
+    if cat > 0 {
+        let v = value_bits(diff, cat);
+        writer.write_bits(v, cat);
+    }
+
+    let mut r = 0u8;
+    for k in 1..64 {
+        let val = block[k];
+        if val == 0 {
+            r += 1;
+        } else {
+            while r >= 16 {
+                let zrl = ac_lut[0xF0];
+                writer.write_bits(zrl.code, zrl.len);
+                r -= 16;
+            }
+            let cat = bit_length(val as i32);
+            let symbol = (r << 4) | cat;
+            let code = ac_lut[symbol as usize];
+            writer.write_bits(code.code, code.len);
+            let v = value_bits(val, cat);
+            writer.write_bits(v, cat);
+            r = 0;
+        }
+    }
+    if r > 0 {
+        let eob = ac_lut[0x00];
+        writer.write_bits(eob.code, eob.len);
+    }
+}
+
+pub fn encode_rgba_jpeg_bytes(w: usize, h: usize, rgba: &[u8], quality: u8) -> Vec<u8> {
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return Vec::new();
+    }
+
+    let q_luma = scale_quant_table(&STD_LUMA_QUANT, quality);
+    let q_chroma = scale_quant_table(&STD_CHROMA_QUANT, quality);
+
+    let mut out = Vec::with_capacity(w * h / 2 + 1024);
+
+    // SOI (0xFF, 0xD8)
+    out.extend_from_slice(&[0xFF, 0xD8]);
+
+    // APP0 JFIF (0xFF, 0xE0)
+    out.extend_from_slice(&[
+        0xFF, 0xE0, // marker
+        0x00, 0x10, // length = 16
+        b'J', b'F', b'I', b'F', 0x00, // identifier "JFIF\0"
+        0x01, 0x01, // version 1.1
+        0x00,       // density units (0 = no units)
+        0x00, 0x01, // X density = 1
+        0x00, 0x01, // Y density = 1
+        0x00,       // thumbnail width = 0
+        0x00,       // thumbnail height = 0
+    ]);
+
+    // DQT Luma (table 0)
+    out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+    for &z in &ZIGZAG {
+        out.push(q_luma[z]);
+    }
+
+    // DQT Chroma (table 1)
+    out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x01]);
+    for &z in &ZIGZAG {
+        out.push(q_chroma[z]);
+    }
+
+    // SOF0 (Baseline DCT)
+    out.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
+    out.extend_from_slice(&(h as u16).to_be_bytes());
+    out.extend_from_slice(&(w as u16).to_be_bytes());
+    out.push(3); // 3 components
+    out.extend_from_slice(&[0x01, 0x11, 0x00]); // Y: 1x1, table 0
+    out.extend_from_slice(&[0x02, 0x11, 0x01]); // Cb: 1x1, table 1
+    out.extend_from_slice(&[0x03, 0x11, 0x01]); // Cr: 1x1, table 1
+
+    // DHT Luma DC
+    out.extend_from_slice(&[0xFF, 0xC4]);
+    let len_dc_luma = (2 + 1 + 16 + VALS_DC_LUMA.len()) as u16;
+    out.extend_from_slice(&len_dc_luma.to_be_bytes());
+    out.push(0x00);
+    out.extend_from_slice(&BITS_DC_LUMA);
+    out.extend_from_slice(&VALS_DC_LUMA);
+
+    // DHT Luma AC
+    out.extend_from_slice(&[0xFF, 0xC4]);
+    let len_ac_luma = (2 + 1 + 16 + VALS_AC_LUMA.len()) as u16;
+    out.extend_from_slice(&len_ac_luma.to_be_bytes());
+    out.push(0x10);
+    out.extend_from_slice(&BITS_AC_LUMA);
+    out.extend_from_slice(&VALS_AC_LUMA);
+
+    // DHT Chroma DC
+    out.extend_from_slice(&[0xFF, 0xC4]);
+    let len_dc_chroma = (2 + 1 + 16 + VALS_DC_CHROMA.len()) as u16;
+    out.extend_from_slice(&len_dc_chroma.to_be_bytes());
+    out.push(0x01);
+    out.extend_from_slice(&BITS_DC_CHROMA);
+    out.extend_from_slice(&VALS_DC_CHROMA);
+
+    // DHT Chroma AC
+    out.extend_from_slice(&[0xFF, 0xC4]);
+    let len_ac_chroma = (2 + 1 + 16 + VALS_AC_CHROMA.len()) as u16;
+    out.extend_from_slice(&len_ac_chroma.to_be_bytes());
+    out.push(0x11);
+    out.extend_from_slice(&BITS_AC_CHROMA);
+    out.extend_from_slice(&VALS_AC_CHROMA);
+
+    // SOS (Start of Scan)
+    out.extend_from_slice(&[
+        0xFF, 0xDA, // marker
+        0x00, 0x0C, // length = 12
+        0x03,       // 3 components
+        0x01, 0x00, // Y: DC 0, AC 0
+        0x02, 0x11, // Cb: DC 1, AC 1
+        0x03, 0x11, // Cr: DC 1, AC 1
+        0x00,       // Ss = 0
+        0x3F,       // Se = 63
+        0x00,       // Ah=0, Al=0
+    ]);
+
+    let mut writer = BitWriter::new();
+    let luts = get_huffman_luts();
+    let dct_coeff = get_dct_coeff();
+
+    let mcu_cols = (w + 7) / 8;
+    let mcu_rows = (h + 7) / 8;
+
+    let mut dc_y = 0i16;
+    let mut dc_cb = 0i16;
+    let mut dc_cr = 0i16;
+
+    let mut y_block = [0.0f32; 64];
+    let mut cb_block = [0.0f32; 64];
+    let mut cr_block = [0.0f32; 64];
+
+    for mcu_y in 0..mcu_rows {
+        for mcu_x in 0..mcu_cols {
+            for by in 0..8 {
+                let py = (mcu_y * 8 + by).min(h - 1);
+                for bx in 0..8 {
+                    let px = (mcu_x * 8 + bx).min(w - 1);
+                    let idx = (py * w + px) * 4;
+                    let r = rgba[idx] as f32;
+                    let g = rgba[idx + 1] as f32;
+                    let b = rgba[idx + 2] as f32;
+
+                    let b_idx = by * 8 + bx;
+                    y_block[b_idx] = 0.299 * r + 0.587 * g + 0.114 * b - 128.0;
+                    cb_block[b_idx] = -0.168736 * r - 0.331264 * g + 0.5 * b;
+                    cr_block[b_idx] = 0.5 * r - 0.418688 * g - 0.081312 * b;
+                }
+            }
+
+            fdct_2d(&mut y_block, dct_coeff);
+            let y_quant = quantize_and_zigzag(&y_block, &q_luma);
+            encode_block(&y_quant, &mut dc_y, &luts.dc_luma, &luts.ac_luma, &mut writer);
+
+            fdct_2d(&mut cb_block, dct_coeff);
+            let cb_quant = quantize_and_zigzag(&cb_block, &q_chroma);
+            encode_block(&cb_quant, &mut dc_cb, &luts.dc_chroma, &luts.ac_chroma, &mut writer);
+
+            fdct_2d(&mut cr_block, dct_coeff);
+            let cr_quant = quantize_and_zigzag(&cr_block, &q_chroma);
+            encode_block(&cr_quant, &mut dc_cr, &luts.dc_chroma, &luts.ac_chroma, &mut writer);
+        }
+    }
+
+    writer.flush();
+    out.extend_from_slice(&writer.output);
+
+    // EOI (0xFF, 0xD9)
+    out.extend_from_slice(&[0xFF, 0xD9]);
+
+    out
+}
+
+pub fn encode_rgba_jpeg_b64(w: usize, h: usize, rgba: &[u8], quality: u8) -> String {
+    base64_encode(&encode_rgba_jpeg_bytes(w, h, rgba, quality))
+}
+
+pub fn encode_rgba_image_b64(
+    w: usize,
+    h: usize,
+    rgba: &[u8],
+    format: ImageFormat,
+    quality: u8,
+) -> String {
+    match format {
+        ImageFormat::Jpeg => encode_rgba_jpeg_b64(w, h, rgba, quality),
+        ImageFormat::Png => encode_rgba_png_b64(w, h, rgba),
+    }
 }
 
 /// Computes an 8x8 block-averaged luminance hex digest (128 hex chars), matching
@@ -743,27 +1218,31 @@ fn draw_text_5x7(
     }
 }
 
-pub fn render_som_rgba_to_b64(
-    png_b64_or_cap_id: &str,
+pub fn render_som_image_to_b64(
+    img_or_cap_id: &str,
     marks_json: &str,
     win_frame: &Rect,
+    format: ImageFormat,
+    quality: u8,
+    max_width: usize,
 ) -> Result<String, DriverError> {
     if win_frame.w <= 0.0 || win_frame.h <= 0.0 {
         return Err(DriverError::new("invalid_argument", "Invalid window frame dimensions"));
     }
-    let from_cache = png_b64_or_cap_id.starts_with("cap_");
+    let from_cache = img_or_cap_id.starts_with("cap_");
     let (src_w, src_h, src_rgba) = if from_cache {
-        let frame = take_cached_frame(png_b64_or_cap_id)
+        let frame = take_cached_frame(img_or_cap_id)
             .ok_or_else(|| DriverError::new("capture_cache_miss", "Cached capture frame expired"))?;
         (frame.width, frame.height, frame.rgba)
     } else {
-        let png_bytes = base64_decode(png_b64_or_cap_id)
+        let png_bytes = base64_decode(img_or_cap_id)
             .map_err(|e| DriverError::new("invalid_argument", e))?;
         decode_png_rgba(&png_bytes).map_err(|e| DriverError::new("invalid_png", e))?
     };
 
-    let (img_w, img_h, mut rgba) = if from_cache && src_w > 1440 {
-        downscale_rgba(&src_rgba, src_w, src_h, 1440)
+    let target_max_w = max_width.clamp(640, 2560);
+    let (img_w, img_h, mut rgba) = if src_w > target_max_w {
+        downscale_rgba(&src_rgba, src_w, src_h, target_max_w)
     } else {
         (src_w, src_h, src_rgba)
     };
@@ -826,7 +1305,22 @@ pub fn render_som_rgba_to_b64(
         );
     }
 
-    Ok(encode_rgba_png_b64(img_w, img_h, &rgba))
+    Ok(encode_rgba_image_b64(img_w, img_h, &rgba, format, quality))
+}
+
+pub fn render_som_rgba_to_b64(
+    png_b64_or_cap_id: &str,
+    marks_json: &str,
+    win_frame: &Rect,
+) -> Result<String, DriverError> {
+    render_som_image_to_b64(
+        png_b64_or_cap_id,
+        marks_json,
+        win_frame,
+        ImageFormat::Png,
+        80,
+        1440,
+    )
 }
 
 #[cfg(test)]
@@ -924,5 +1418,89 @@ mod tests {
         assert_eq!(&rgba[0..4], &[0, 0, 180, 255]);
         assert_eq!(&rgba[4 * 4..4 * 4 + 4], &[0, 50, 180, 255]);
         assert_eq!(&rgba[(3 * 4 + 2) * 4..(3 * 4 + 2) * 4 + 4], &[80, 150, 180, 255]);
+    }
+
+    #[test]
+    fn jpeg_encoder_writes_valid_baseline_jfif_for_non_multiple_of_eight_dims() {
+        let w = 123usize;
+        let h = 77usize;
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                rgba[i] = (x * 2) as u8;
+                rgba[i + 1] = (y * 3) as u8;
+                rgba[i + 2] = ((x + y) % 256) as u8;
+                rgba[i + 3] = 255;
+            }
+        }
+
+        let q80 = encode_rgba_jpeg_bytes(w, h, &rgba, 80);
+        let q95 = encode_rgba_jpeg_bytes(w, h, &rgba, 95);
+
+        // Assert starts with SOI (0xFF, 0xD8) + APP0 (0xFF, 0xE0)
+        assert!(q80.starts_with(&[0xFF, 0xD8, 0xFF, 0xE0]));
+        assert!(q95.starts_with(&[0xFF, 0xD8, 0xFF, 0xE0]));
+
+        // Assert ends with EOI (0xFF, 0xD9)
+        assert!(q80.ends_with(&[0xFF, 0xD9]));
+        assert!(q95.ends_with(&[0xFF, 0xD9]));
+
+        // Assert SOF0 contains big-endian height 77 and width 123
+        fn find_sof0_dims(bytes: &[u8]) -> Option<(usize, usize)> {
+            let mut i = 0;
+            while i + 9 <= bytes.len() {
+                if bytes[i] == 0xFF && bytes[i + 1] == 0xC0 {
+                    let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as usize;
+                    let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as usize;
+                    return Some((w, h));
+                }
+                i += 1;
+            }
+            None
+        }
+
+        assert_eq!(find_sof0_dims(&q80), Some((123, 77)));
+        assert_eq!(find_sof0_dims(&q95), Some((123, 77)));
+
+        // Higher quality should yield larger compressed file
+        assert!(
+            q95.len() > q80.len(),
+            "q95 len {} should be > q80 len {}",
+            q95.len(),
+            q80.len()
+        );
+    }
+
+    #[test]
+    fn render_som_image_supports_jpeg_and_custom_max_width() {
+        let cap_id = cache_rgba_frame("lin", 1600, 900, vec![64u8; 1600 * 900 * 4]);
+        let marks_json = r#"[{"id":"m1","source":"ax","x":50,"y":50,"w":100,"h":40}]"#;
+        let win = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1600.0,
+            h: 900.0,
+        };
+
+        let b64 = render_som_image_to_b64(&cap_id, marks_json, &win, ImageFormat::Jpeg, 80, 1280)
+            .unwrap();
+        let bytes = base64_decode(&b64).unwrap();
+
+        assert!(bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
+        assert!(bytes.ends_with(&[0xFF, 0xD9]));
+
+        let mut dims = None;
+        let mut i = 0;
+        while i + 9 <= bytes.len() {
+            if bytes[i] == 0xFF && bytes[i + 1] == 0xC0 {
+                let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as usize;
+                let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as usize;
+                dims = Some((w, h));
+                break;
+            }
+            i += 1;
+        }
+        assert_eq!(dims, Some((1280, 720)));
     }
 }
