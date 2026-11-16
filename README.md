@@ -1,4 +1,4 @@
-# ApexUse — Local-First Computer Use MCP Server (macOS, Windows & Linux)
+# ApexUse — Computer Use MCP Server for AI Agents (macOS, Windows & Linux)
 
 [![CI](https://github.com/Jackpkn/apexuse/actions/workflows/ci.yml/badge.svg)](https://github.com/Jackpkn/apexuse/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)

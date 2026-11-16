@@ -1,6 +1,6 @@
-# ApexUse (apexuse-mcp)
+# ApexUse — Computer Use MCP Server (apexuse-mcp)
 
-> Local-first, open-source Computer Use MCP server written in pure Rust and native OS APIs for macOS, Windows, and Linux. Gives AI coding agents (Claude Code, OpenAI Codex, Gemini CLI, Antigravity) hybrid Accessibility + Set-of-Mark (`[m1]..[mN]`) visual grounding, OCR, batched `run_actions`, local `wait_for` polling, `verify_change` auto-retry, an independent floating `AgentCursor`, and workflow memory over MCP stdio with zero external Rust crate dependencies and no external LLM keys.
+> ApexUse is a local-first, open-source Computer Use MCP server written in pure Rust and native OS APIs for macOS, Windows, and Linux. Gives AI coding agents (Claude Code, OpenAI Codex, Gemini CLI, Antigravity) hybrid Accessibility + Set-of-Mark (`[m1]..[mN]`) visual grounding, OCR, batched `run_actions`, local `wait_for` polling, `verify_change` auto-retry, an independent floating `AgentCursor`, and workflow memory over MCP stdio with zero external Rust crate dependencies and no external LLM keys.
 
 ## Repository & Links
 
