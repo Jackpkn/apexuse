@@ -7,16 +7,18 @@ description: Use for cross-app desktop and browser computer-use via Accessibilit
 
 Use the `handsmcp` MCP tools for desktop, Electron, and browser interaction across all permitted apps using an independent on-screen `AgentCursor` and per-PID event routing:
 
-1. **Discover & Inspect First**:
-   - Call `desktop` (`action: "list_applications"`) to see running apps, or `launch_application` / `activate_application` with an exact bundle ID.
-   - Prefer `visual_inspect` (`app: "<bundle_id>"` or `"desktop"`) to capture a Set-of-Mark annotated image (`[m1]..[mN]`) fusing Accessibility boxes + Apple Vision OCR, or `inspect_app` (`app`, optional `window`, `query`) for semantic `[e1]..` refs and learned `workflow_hints`.
-   - Call `workflow_memory` (`action: "lookup"`, `app`) before unfamiliar flows, and `record` reusable non-secret workflows afterward.
+1. **Discover & Inspect Fast**:
+   - Call `desktop` (`action: "list_applications"`) to see running apps, `launch_application` / `activate_application`, or `open_url` (`url: "https://..."`, optional `app`, defaults to Chrome) to open web pages directly without clicking the address bar.
+   - Prefer `inspect_app` (`app`, optional `query`, no screenshot) when Accessibility semantics suffice; use `visual_inspect` (`app: "<bundle_id>"` or `"desktop"`, optional `ocr: "auto"|"fast"|"accurate"|"off"`, optional `max_marks`) when you need visual `[m1]..[mN]` Set-of-Mark grounding (`ocr: "off"` skips OCR for instant AX-only visual marks; `"fast"` runs rapid Vision OCR).
+   - Call `workflow_memory` (`action: "lookup"`, `app`) before unfamiliar flows, `record` reusable non-secret workflows afterward, and `replay` (`id` or `app`+`goal`, optional `step_args`) to execute learned macros in one turn.
 
-2. **Act Across Apps**:
-   - `computer` actions: `click`, `double_click`, `right_click`, `hover` (accepts `ref` or `mark`), `drag` (`from_ref`/`from_mark` -> `to_ref`/`to_mark`), `type` (`ref` or `mark`, `text`, optional `mode="insert"|"replace"`), `press_key` (`key`, optional `modifiers`), `scroll` (`direction`, `amount`), `inspect`.
-   - `desktop` actions: `visual_click`, `double_click`, `right_click`, `hover`, `drag` (supports `mark`, `ref`, or `x`/`y` coordinates after an unfiltered snapshot).
-   - Under `policy.autonomous.yaml` (`confirmation: direct`), actions execute directly without per-click confirmation loops. **Only** if a stricter policy returns `confirmation_required` should you show the summary to the user and wait before calling `confirm`.
-   - Always re-inspect (`visual_inspect` or `inspect_app`) after state-changing actions to verify the result.
+2. **Act & Chain Across Apps**:
+   - `computer` actions: `click`, `double_click`, `right_click`, `hover` (accepts `ref`, `mark`, or `x`/`y` after an unfiltered snapshot), `drag` (`from_ref`/`from_mark`/`x1`,`y1` -> `to_ref`/`to_mark`/`x2`,`y2`), `type` (`ref` or `mark`, `text`, optional `mode="insert"|"replace"`), `press_key` (`key`, optional `modifiers`), `scroll` (`direction`, `amount`), `inspect`, `run_actions`, `wait_for`.
+   - Use `computer` (`action: "run_actions"`, `arguments: { steps: [...], inspect_after?: true }`) to chain up to 12 deterministic steps (`click`, `type`, `press_key`, `scroll`, `sleep_ms`, `activate_application`, etc.) locally in a single turn with zero LLM round-trips between steps.
+   - Use `computer` (`action: "wait_for"`, `arguments: { app, query, window?, timeout_ms?, poll_ms?, absent?, ocr? }`) to wait locally for uploads, page loads, app launches, or spinners instead of sleeping in model turns.
+   - `desktop` actions: `open_url`, `visual_click`, `double_click`, `right_click`, `hover`, `drag` (supports `mark`, `ref`, or `x`/`y` coordinates after an unfiltered snapshot).
+   - Under `policy.autonomous.yaml` (`confirmation: direct`), actions execute directly without per-click confirmation loops (with single-point safety verification on macOS). **Only** if a stricter policy returns `confirmation_required` should you show the summary to the user and wait before calling `confirm`.
+   - Re-inspect (`inspect_app` or `visual_inspect`) after major navigation, or pass `inspect_after: true` on `run_actions`.
 
 3. **Safety Boundaries (Always Enforced)**:
    - Protected password-manager, wallet, keychain, and banking apps are blocked.
