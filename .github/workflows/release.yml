@@ -1,0 +1,104 @@
+name: ApexUse Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+        default: "v0.2.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Package (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: macos-arm64
+            bin: rust/target/release/apexuse-mcp
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: linux-x86_64
+            bin: rust/target/release/apexuse-mcp
+            archive: tar.gz
+          - os: windows-latest
+            target: windows-x86_64
+            bin: rust/target/release/apexuse-mcp.exe
+            archive: zip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Rust tests
+        shell: bash
+        run: cargo test --manifest-path rust/Cargo.toml
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --manifest-path rust/Cargo.toml
+
+      - name: Package release archive
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          fi
+          mkdir -p pkg dist
+          cp "${{ matrix.bin }}" README.md LICENSE policy.yaml policy.autonomous.yaml pkg/
+          BASE="apexuse-mcp-${TAG}-${{ matrix.target }}"
+          export BASE
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            powershell.exe -NoProfile -Command 'Compress-Archive -Force -Path pkg\* -DestinationPath "dist\$env:BASE.zip"'
+            sha256sum "dist/${BASE}.zip" > "dist/${BASE}.zip.sha256"
+          else
+            tar -czf "dist/${BASE}.tar.gz" -C pkg .
+            shasum -a 256 "dist/${BASE}.tar.gz" > "dist/${BASE}.tar.gz.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/* --clobber
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            gh release create "$TAG" artifacts/* --target "$GITHUB_SHA" --title "ApexUse $TAG" --generate-notes
+          else
+            gh release create "$TAG" artifacts/* --title "ApexUse $TAG" --generate-notes
+          fi

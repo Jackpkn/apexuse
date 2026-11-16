@@ -37,9 +37,15 @@ Zero external LLM keys. Zero external Rust crate dependencies. Zero cloud relay.
 
 ## Quick Start
 
-### 1. Build from source
+### 1. Install or build from source
 
-Requires only the Rust toolchain (plus Xcode Command Line Tools on macOS):
+Download prebuilt binaries for **macOS (`arm64`)**, **Linux (`x86_64`)**, or **Windows (`x86_64`)** from [GitHub Releases](https://github.com/Jackpkn/apexuse/releases), install via Cargo:
+
+```sh
+cargo install --git https://github.com/Jackpkn/apexuse apexuse-mcp
+```
+
+Or clone and build directly (requires only the Rust toolchain, plus Xcode Command Line Tools on macOS):
 
 ```sh
 git clone https://github.com/Jackpkn/apexuse.git
@@ -169,6 +175,7 @@ cargo test --manifest-path rust/Cargo.toml
 ```text
 ├── .agents/skills/apexuse/SKILL.md  # Agent skill instructions for ApexUse MCP tools
 ├── .github/workflows/ci.yml         # 3-OS CI matrix (macOS, Ubuntu Xvfb/AT-SPI, Windows)
+├── .github/workflows/release.yml    # Automated macOS/Linux/Windows release binaries
 ├── agent-configs/README.md          # Client setup snippets (Antigravity, Gemini, Codex, Claude)
 ├── llms.txt                         # AI search & crawler index summary
 ├── policy.yaml                      # Default direct policy
