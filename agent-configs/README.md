@@ -1,37 +1,62 @@
-# Experimental agent connection
+# Agent Configuration Guide
 
-The server is incomplete. These examples only connect the current limited prototype; they do not provide general computer control. Keep the agent's per-tool approvals enabled, and install or provide `skills/handsmcp/SKILL.md` to the agent.
+`apexuse-mcp` runs as a local stdio MCP server with no network listener or external LLM dependency.
 
-Set the absolute project path below. The Python environment and built `runtime/munim-computer-use` must already exist. The Cua preview has been exercised in Antigravity for application listing and inspection; the other clients and general desktop control remain unverified.
+First build the release binary:
+
+```sh
+cargo build --release --manifest-path /absolute/path/to/repo/rust/Cargo.toml
+```
+
+You can also print the snippet for your client directly from the binary:
+
+```sh
+/absolute/path/to/repo/rust/target/release/apexuse-mcp install antigravity
+```
+
+Pair the MCP server with [`.agents/skills/apexuse/SKILL.md`](../.agents/skills/apexuse/SKILL.md) so your agent follows optimal `inspect_app` / `visual_inspect` / `run_actions` patterns.
+
+---
 
 ## Antigravity IDE or CLI
 
-Use MCP Servers > Manage MCP Servers > View raw config in the IDE, or the CLI's MCP manager. Official documentation describes the global `~/.gemini/config/mcp_config.json` and workspace `.agents/mcp_config.json`: https://antigravity.google/docs/mcp
+Add to `~/.gemini/antigravity/mcp_config.json` (global) or workspace `.agents/mcp_config.json`:
 
 ```json
-{"mcpServers":{"handsmcp":{"command":"/absolute/path/handsmcp/.venv/bin/python","args":["-m","handsmcp.server"],"env":{"PYTHONPATH":"/absolute/path/handsmcp/src"}}}}
+{
+  "mcpServers": {
+    "apexuse": {
+      "command": "/absolute/path/to/repo/rust/target/release/apexuse-mcp",
+      "args": [],
+      "env": {
+        "APEXUSE_POLICY": "/absolute/path/to/repo/policy.autonomous.yaml"
+      }
+    }
+  }
+}
 ```
 
 ## Gemini CLI
 
-The same `mcpServers` entry belongs in `~/.gemini/settings.json`; see https://geminicli.com/docs/tools/mcp-server/. Do not overwrite existing settings.
+Merge the same `mcpServers` block into `~/.gemini/settings.json` (or workspace `.gemini/settings.json`). Keep any existing `mcpServers` entries intact.
 
-## Codex
+## OpenAI Codex
+
+Add to your Codex config:
 
 ```toml
-[mcp_servers.handsmcp]
-command = "/absolute/path/handsmcp/.venv/bin/python"
-args = ["-m", "handsmcp.server"]
+[mcp_servers.apexuse]
+command = "/absolute/path/to/repo/rust/target/release/apexuse-mcp"
+args = []
 startup_timeout_sec = 60
 tool_timeout_sec = 180
-[mcp_servers.handsmcp.env]
-PYTHONPATH = "/absolute/path/handsmcp/src"
+
+[mcp_servers.apexuse.env]
+APEXUSE_POLICY = "/absolute/path/to/repo/policy.autonomous.yaml"
 ```
 
 ## Claude Code
 
 ```sh
-claude mcp add handsmcp --env PYTHONPATH=/absolute/path/handsmcp/src -- /absolute/path/handsmcp/.venv/bin/python -m handsmcp.server
+claude mcp add apexuse --env APEXUSE_POLICY=/absolute/path/to/repo/policy.autonomous.yaml -- /absolute/path/to/repo/rust/target/release/apexuse-mcp
 ```
-
-The upstream HCU Claude schema adapter applies to HCU's AX/GUI schemas; whether this server's own schema needs adaptation has not been tested.
