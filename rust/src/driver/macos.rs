@@ -2,7 +2,7 @@
 
 use super::{
     ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError, OcrBox,
-    OsDriver, Rect, RunningApp, UiElement, WindowMeta,
+    OcrMode, OsDriver, Rect, RunningApp, UiElement, WindowMeta,
 };
 use crate::json::{parse_json, JsonValue};
 use std::ffi::{CStr, CString};
@@ -24,10 +24,11 @@ extern "C" {
     fn handsmcp_macos_capture_and_ocr(
         bundle_id: *const c_char,
         window_index: c_int,
-        run_ocr: c_int,
+        ocr_mode: c_int,
+        encode_png: c_int,
     ) -> *mut c_char;
     fn handsmcp_macos_render_som(
-        png_b64: *const c_char,
+        png_b64_or_cap_id: *const c_char,
         marks_json: *const c_char,
         win_x: c_double,
         win_y: c_double,
@@ -35,6 +36,12 @@ extern "C" {
         win_h: c_double,
     ) -> *mut c_char;
     fn handsmcp_macos_perform_action(req_json: *const c_char) -> *mut c_char;
+    fn handsmcp_macos_check_point(
+        bundle_id: *const c_char,
+        x: c_double,
+        y: c_double,
+    ) -> *mut c_char;
+    fn handsmcp_macos_open_url(bundle_id: *const c_char, url: *const c_char) -> *mut c_char;
     fn handsmcp_macos_tick();
 }
 
@@ -258,12 +265,18 @@ impl OsDriver for MacosDriver {
         &self,
         bundle_id: &str,
         window: Option<i32>,
-        run_ocr: bool,
+        ocr_mode: OcrMode,
+        encode_png: bool,
     ) -> Result<CaptureResult, DriverError> {
         let c = to_cstr(bundle_id)?;
         let win_idx = window.unwrap_or(-1);
         let val = take_json(unsafe {
-            handsmcp_macos_capture_and_ocr(c.as_ptr(), win_idx, if run_ocr { 1 } else { 0 })
+            handsmcp_macos_capture_and_ocr(
+                c.as_ptr(),
+                win_idx,
+                ocr_mode.as_int(),
+                if encode_png { 1 } else { 0 },
+            )
         })?;
         let wf = val
             .get("window_frame")
@@ -298,11 +311,17 @@ impl OsDriver for MacosDriver {
             .and_then(|v| v.as_str())
             .unwrap_or(&cap_bundle)
             .to_string();
+        let capture_id = val
+            .get("capture_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         Ok(CaptureResult {
             bundle_id: cap_bundle,
             frontmost_bundle_id: cap_front,
             pid: val.get("pid").and_then(|v| v.as_i64()).unwrap_or(0),
             window_id: val.get("window_id").and_then(|v| v.as_i64()).unwrap_or(0) as u64,
+            capture_id,
             window_frame: wf,
             image_width: val.get("image_width").and_then(|v| v.as_i64()).unwrap_or(0) as usize,
             image_height: val.get("image_height").and_then(|v| v.as_i64()).unwrap_or(0) as usize,
@@ -425,6 +444,23 @@ impl OsDriver for MacosDriver {
             .unwrap_or("native")
             .to_string();
         Ok(ActionResult { method })
+    }
+
+    fn supports_fast_point_verify(&self) -> bool {
+        true
+    }
+
+    fn verify_point_safe(&self, bundle_id: &str, x: f64, y: f64) -> Result<bool, DriverError> {
+        let c = to_cstr(bundle_id)?;
+        let val = take_json(unsafe { handsmcp_macos_check_point(c.as_ptr(), x, y) })?;
+        Ok(val.get("ok").and_then(|v| v.as_bool()) == Some(true))
+    }
+
+    fn open_url(&self, bundle_id: &str, url: &str) -> Result<(), DriverError> {
+        let cb = to_cstr(bundle_id)?;
+        let cu = to_cstr(url)?;
+        take_json(unsafe { handsmcp_macos_open_url(cb.as_ptr(), cu.as_ptr()) })?;
+        Ok(())
     }
 
     fn tick(&self) {

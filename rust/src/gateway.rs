@@ -1,5 +1,5 @@
 use crate::driver::{
-    ActionRequest, AppSnapshot, DoctorStatus, OsDriver, Rect, UiElement,
+    ActionRequest, AppSnapshot, DoctorStatus, OcrMode, OsDriver, Rect, UiElement,
 };
 use crate::json::JsonValue;
 use crate::memory::{WorkflowMemory, WorkflowStep};
@@ -10,6 +10,8 @@ use crate::policy::{
 use crate::som::{format_mark_index, fuse_marks, supports_ax_press, VisualMark};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub struct ToolOutput {
     pub payload: JsonValue,
@@ -286,11 +288,7 @@ impl Gateway {
         ]))
     }
 
-    fn verify_visual_safety(&self, target: &str) -> Result<AppSnapshot, ToolOutput> {
-        let full = match self.driver.inspect_app(target, None, 250, 14) {
-            Ok(s) => s,
-            Err(e) => return Err(ToolOutput::json(err_json(&e.code, &e.message))),
-        };
+    fn validate_visual_snapshot(&self, target: &str, full: &AppSnapshot) -> Result<(), ToolOutput> {
         if !self.check_frontmost_permitted(&full.frontmost_bundle_id) {
             return Err(ToolOutput::json(err_json("invalid_app", "Frontmost application is protected")));
         }
@@ -305,6 +303,15 @@ impl Gateway {
                 "Visual capture refused: safety scan incomplete or window contains secure/unverified fields",
             )));
         }
+        Ok(())
+    }
+
+    fn verify_visual_safety(&self, target: &str) -> Result<AppSnapshot, ToolOutput> {
+        let full = match self.driver.inspect_app(target, None, 250, 14) {
+            Ok(s) => s,
+            Err(e) => return Err(ToolOutput::json(err_json(&e.code, &e.message))),
+        };
+        self.validate_visual_snapshot(target, &full)?;
         Ok(full)
     }
 
@@ -325,14 +332,58 @@ impl Gateway {
                 _ => return ToolOutput::json(err_json("invalid_argument", "'window' must be a non-negative integer")),
             },
         };
+        let ocr_mode = match args.get("ocr").and_then(|v| v.as_str()) {
+            None | Some("auto") | Some("fast") => OcrMode::Fast,
+            Some("accurate") => OcrMode::Accurate,
+            Some("off") | Some("none") => OcrMode::Off,
+            Some(_) => return ToolOutput::json(err_json("invalid_argument", "'ocr' must be auto, fast, accurate, or off")),
+        };
+        let max_marks = match args.get("max_marks") {
+            None | Some(JsonValue::Null) => 80usize,
+            Some(v) => match v.as_i64() {
+                Some(n) if (1..=150).contains(&n) => n as usize,
+                _ => return ToolOutput::json(err_json("invalid_argument", "'max_marks' must be 1..=150")),
+            },
+        };
         if self.audit.record("screenshot", "allow", "requested").is_err() {
             return ToolOutput::json(err_json("audit_unavailable", "Audit log write failed"));
         }
 
         self.invalidate_snapshot();
-        let full = match self.verify_visual_safety(&target) {
-            Ok(s) => s,
-            Err(e) => return e,
+        let (full, cap) = if target != "desktop" && window.is_none() {
+            // Run AX safety walk and ScreenCaptureKit + Vision OCR concurrently.
+            let driver = &*self.driver;
+            let (ax_res, cap_res) = thread::scope(|s| {
+                let cap_handle = s.spawn(|| driver.capture_and_ocr(&target, None, ocr_mode, false));
+                let ax_res = driver.inspect_app(&target, None, 250, 14);
+                let cap_res = match cap_handle.join() {
+                    Ok(r) => r,
+                    Err(_) => Err(crate::driver::DriverError::new("capture_failed", "Capture worker panicked")),
+                };
+                (ax_res, cap_res)
+            });
+            let full = match ax_res {
+                Ok(s) => s,
+                Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
+            };
+            if let Err(err_out) = self.validate_visual_snapshot(&target, &full) {
+                return err_out;
+            }
+            let cap = match cap_res {
+                Ok(c) => c,
+                Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
+            };
+            (full, cap)
+        } else {
+            let full = match self.verify_visual_safety(&target) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            let cap = match self.driver.capture_and_ocr(&full.bundle_id, window, ocr_mode, false) {
+                Ok(c) => c,
+                Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
+            };
+            (full, cap)
         };
         let scoped = if window.is_some() {
             match self.driver.inspect_app(&target, window, 150, 12) {
@@ -341,11 +392,6 @@ impl Gateway {
             }
         } else {
             full.clone()
-        };
-
-        let cap = match self.driver.capture_and_ocr(&full.bundle_id, window, true) {
-            Ok(c) => c,
-            Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
         };
         if !self.check_frontmost_permitted(&cap.frontmost_bundle_id) {
             return ToolOutput::json(err_json("invalid_app", "Frontmost application is protected"));
@@ -377,14 +423,15 @@ impl Gateway {
             scoped.elements.clone()
         };
 
-        let marks = fuse_marks(&cap.window_frame, &win_elements, &cap.ocr_boxes, 80);
+        let marks = fuse_marks(&cap.window_frame, &win_elements, &cap.ocr_boxes, max_marks);
         let marks_overlay = JsonValue::Array(marks.iter().map(VisualMark::overlay_json).collect());
 
-        let annotated_b64 = if marks.is_empty() {
+        let annotated_b64 = if marks.is_empty() && !cap.png_base64.is_empty() {
             cap.png_base64.clone()
         } else {
+            let img_ref = cap.capture_id.as_deref().unwrap_or(cap.png_base64.as_str());
             match self.driver.render_som_png(
-                &cap.png_base64,
+                img_ref,
                 &marks_overlay.to_json_string(),
                 &cap.window_frame,
             ) {
@@ -446,7 +493,7 @@ impl Gateway {
             Ok(s) => s,
             Err(e) => return e,
         };
-        let cap = match self.driver.capture_and_ocr(&full.bundle_id, None, false) {
+        let cap = match self.driver.capture_and_ocr(&full.bundle_id, None, OcrMode::Off, true) {
             Ok(c) => c,
             Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
         };
@@ -500,11 +547,11 @@ impl Gateway {
         let Some(app) = self.snapshot_app.clone() else {
             return ToolOutput::json(err_json("stale_ref", "Inspect or visual_inspect an app or 'desktop' first"));
         };
-        if allow_coords && self.snapshot_filtered {
+        if self.snapshot_filtered {
             return ToolOutput::json(err_json("invalid_state", "Visual coordinate clicks require an unfiltered snapshot"));
         }
 
-        if sub_args.get("mark").is_none() && sub_args.get("x").is_none() && sub_args.get("ref").is_some() {
+        if sub_args.get("mark").is_none() && sub_args.get("x").is_none() && sub_args.get("y").is_none() && sub_args.get("ref").is_some() {
             let rid = sub_args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
             let Some(el) = self.elements_by_ref.get(rid).cloned() else {
                 return ToolOutput::json(err_json("stale_ref", "Unknown or stale element ref"));
@@ -531,7 +578,7 @@ impl Gateway {
             Ok(res) => res,
             Err(e) => return e,
         };
-        if sub_args.get("x").is_some() && !allow_coords {
+        if (sub_args.get("x").is_some() || sub_args.get("y").is_some()) && !allow_coords {
             return ToolOutput::json(err_json("invalid_argument", "Use desktop/visual_click or provide ref/mark"));
         }
         let mark_id = sub_args.get("mark").and_then(|v| v.as_str()).map(str::to_string);
@@ -656,6 +703,40 @@ impl Gateway {
                         ("ok", JsonValue::Bool(true)),
                         ("app", JsonValue::String(bundle)),
                         ("hint", JsonValue::String("Inspect the app to verify its updated state.".into())),
+                    ])),
+                    Err(e) => ToolOutput::json(err_json(&e.code, &e.message)),
+                }
+            }
+            "open_url" => {
+                if let Some(blocked) = self.preflight_gate("open_url", true) {
+                    return blocked;
+                }
+                let Some(url) = sub_args.get("url").and_then(|v| v.as_str()) else {
+                    return ToolOutput::json(err_json("invalid_argument", "Missing arguments.url"));
+                };
+                if url.is_empty()
+                    || url.len() > 2048
+                    || !(url.starts_with("https://") || url.starts_with("http://"))
+                    || url.chars().any(|c| c.is_control() || c.is_whitespace())
+                {
+                    return ToolOutput::json(err_json("invalid_argument", "Invalid http/https URL"));
+                }
+                let raw_app = sub_args
+                    .get("app")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("com.google.Chrome");
+                let Some(bundle) = self.resolve_target(raw_app) else {
+                    return ToolOutput::json(err_json("invalid_app", "App is invalid, protected, or not permitted"));
+                };
+                if self.audit.record("open_url", "allow", "requested").is_err() {
+                    return ToolOutput::json(err_json("audit_unavailable", "Audit log write failed"));
+                }
+                self.invalidate_snapshot();
+                match self.driver.open_url(&bundle, url) {
+                    Ok(()) => ToolOutput::json(JsonValue::object(vec![
+                        ("ok", JsonValue::Bool(true)),
+                        ("app", JsonValue::String(bundle)),
+                        ("url", JsonValue::String(url.into())),
                     ])),
                     Err(e) => ToolOutput::json(err_json(&e.code, &e.message)),
                 }
@@ -822,6 +903,8 @@ impl Gateway {
                     &summary,
                 )
             }
+            "run_actions" => self.handle_run_actions(sub_args),
+            "wait_for" => self.handle_wait_for(sub_args),
             "confirm" => {
                 if let Some(blocked) = self.preflight_gate("confirm", true) {
                     return blocked;
@@ -960,22 +1043,60 @@ impl Gateway {
             return ToolOutput::json(err_json("stale_ref", "Snapshot changed before confirmation"));
         }
 
-        let fresh = match self
-            .driver
-            .inspect_app(&app, self.snapshot_window, self.snapshot_max_elements, self.snapshot_max_depth)
-        {
-            Ok(s) => s,
-            Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
-        };
-        if !self.check_frontmost_permitted(&fresh.frontmost_bundle_id)
-            || snapshot_redaction_reason(&fresh).is_some()
-            || !self.snapshot_matches_action(&fresh, &action)
-        {
-            self.invalidate_snapshot();
-            return ToolOutput::json(err_json(
-                "stale_ref",
-                "Target UI changed or became unsafe before input; inspect again",
-            ));
+        let fast_direct = policy_label == "direct" && self.driver.supports_fast_point_verify();
+        if fast_direct {
+            let point_check = match &action {
+                PendingAction::ClickRef { ref_id, .. } => self
+                    .elements_by_ref
+                    .get(ref_id)
+                    .and_then(|el| el.frame.as_ref())
+                    .map(|f| vec![(f.x + f.w * 0.5, f.y + f.h * 0.5)]),
+                PendingAction::VisualClick { x, y, .. }
+                | PendingAction::Hover { x, y, .. }
+                | PendingAction::TypeText { x, y, .. } => Some(vec![(*x, *y)]),
+                PendingAction::Drag { x1, y1, x2, y2, .. } => Some(vec![(*x1, *y1), (*x2, *y2)]),
+                PendingAction::PressKey { .. } | PendingAction::Scroll { .. } => Some(Vec::new()),
+            };
+            let Some(pts) = point_check else {
+                self.invalidate_snapshot();
+                return ToolOutput::json(err_json("stale_ref", "Element ref or frame missing"));
+            };
+            for (px, py) in pts {
+                match self.driver.verify_point_safe(&app, px, py) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json(
+                            "unsafe_target_field",
+                            "Target point became unsafe or left window bounds",
+                        ));
+                    }
+                    Err(e) => {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json(&e.code, &e.message));
+                    }
+                }
+            }
+        } else {
+            let fresh = match self.driver.inspect_app(
+                &app,
+                self.snapshot_window,
+                self.snapshot_max_elements,
+                self.snapshot_max_depth,
+            ) {
+                Ok(s) => s,
+                Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
+            };
+            if !self.check_frontmost_permitted(&fresh.frontmost_bundle_id)
+                || snapshot_redaction_reason(&fresh).is_some()
+                || !self.snapshot_matches_action(&fresh, &action)
+            {
+                self.invalidate_snapshot();
+                return ToolOutput::json(err_json(
+                    "stale_ref",
+                    "Target UI changed or became unsafe before input; inspect again",
+                ));
+            }
         }
 
         let action_name = match &action {
@@ -1192,9 +1313,616 @@ impl Gateway {
                     Err(e) => ToolOutput::json(err_json("memory_error", &e)),
                 }
             }
+            "replay" => self.handle_memory_replay(args),
             _ => ToolOutput::json(err_json("invalid_argument", "Unknown memory action")),
         }
     }
+
+    fn handle_run_actions(&mut self, sub_args: &JsonValue) -> ToolOutput {
+        if let Some(blocked) = self.preflight_gate("run_actions", true) {
+            return blocked;
+        }
+        if self.settings.require_confirmation {
+            return ToolOutput::json(err_json(
+                "confirmation_required",
+                "Batch run_actions requires confirmation: direct policy",
+            ));
+        }
+        let Some(steps) = sub_args.get("steps").and_then(|v| v.as_array()) else {
+            return ToolOutput::json(err_json("invalid_argument", "Missing arguments.steps array"));
+        };
+        if steps.is_empty() || steps.len() > 12 {
+            return ToolOutput::json(err_json("invalid_argument", "steps must contain 1..=12 items"));
+        }
+        let inspect_after = sub_args
+            .get("inspect_after")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut cur_app = if let Some(raw_app) = sub_args.get("app").and_then(|v| v.as_str()) {
+            let Some(resolved) = self.resolve_target(raw_app) else {
+                return ToolOutput::json(err_json("invalid_app", "Target is invalid, protected, or not permitted"));
+            };
+            resolved
+        } else if let Some(existing) = self.snapshot_app.clone() {
+            existing
+        } else {
+            return ToolOutput::json(err_json("stale_ref", "Inspect an app or pass arguments.app first"));
+        };
+
+        if self.audit.record("run_actions", "direct", "requested").is_err() {
+            return ToolOutput::json(err_json("audit_unavailable", "Audit log write failed"));
+        }
+
+        let elements_copy = self.elements_by_ref.clone();
+        let marks_copy = self.marks_by_id.clone();
+        let mut step_results = Vec::with_capacity(steps.len());
+
+        for (idx, step) in steps.iter().enumerate() {
+            if self.stop_file.exists() {
+                self.invalidate_snapshot();
+                return ToolOutput::json(err_json("panic_stop", "STOP file present"));
+            }
+            let Some(act) = step.get("action").and_then(|v| v.as_str()) else {
+                self.invalidate_snapshot();
+                return ToolOutput::json(err_json("invalid_argument", &format!("Step {idx} missing action")));
+            };
+
+            match act {
+                "sleep_ms" => {
+                    let ms = step.get("ms").and_then(|v| v.as_i64()).unwrap_or(200).clamp(10, 3000) as u64;
+                    thread::sleep(Duration::from_millis(ms));
+                    self.driver.tick();
+                    step_results.push(JsonValue::object(vec![
+                        ("step", JsonValue::Number(idx as f64)),
+                        ("action", JsonValue::String("sleep_ms".into())),
+                        ("ok", JsonValue::Bool(true)),
+                    ]));
+                }
+                "activate_application" => {
+                    let Some(raw) = step.get("app").and_then(|v| v.as_str()) else {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json("invalid_argument", &format!("Step {idx} missing app")));
+                    };
+                    let Some(bundle) = self.resolve_target(raw) else {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json("invalid_app", "Target is invalid, protected, or not permitted"));
+                    };
+                    if let Err(e) = self.driver.activate_app(&bundle) {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json(&e.code, &e.message));
+                    }
+                    cur_app = bundle.clone();
+                    step_results.push(JsonValue::object(vec![
+                        ("step", JsonValue::Number(idx as f64)),
+                        ("action", JsonValue::String("activate_application".into())),
+                        ("app", JsonValue::String(bundle)),
+                        ("ok", JsonValue::Bool(true)),
+                    ]));
+                }
+                "click" | "double_click" | "right_click" | "hover" => {
+                    let (x, y, prefer_ax) = match resolve_batch_point(step, &elements_copy, &marks_copy) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.invalidate_snapshot();
+                            return e;
+                        }
+                    };
+                    match self.driver.verify_point_safe(&cur_app, x, y) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.invalidate_snapshot();
+                            return ToolOutput::json(err_json("unsafe_target_field", &format!("Step {idx} target unsafe")));
+                        }
+                        Err(e) => {
+                            self.invalidate_snapshot();
+                            return ToolOutput::json(err_json(&e.code, &e.message));
+                        }
+                    }
+                    let req = if act == "hover" {
+                        ActionRequest::HoverPoint { bundle_id: cur_app.clone(), x, y }
+                    } else {
+                        let click_count = if act == "double_click" { 2 } else { 1 };
+                        let button = if act == "right_click" { "right" } else { "left" };
+                        ActionRequest::ClickPoint {
+                            bundle_id: cur_app.clone(),
+                            x,
+                            y,
+                            prefer_ax: prefer_ax && click_count == 1 && button == "left",
+                            click_count,
+                            button: button.into(),
+                        }
+                    };
+                    match self.driver.perform_action(&req) {
+                        Ok(res) => step_results.push(JsonValue::object(vec![
+                            ("step", JsonValue::Number(idx as f64)),
+                            ("action", JsonValue::String(act.into())),
+                            ("method", JsonValue::String(res.method)),
+                            ("ok", JsonValue::Bool(true)),
+                        ])),
+                        Err(e) => {
+                            self.invalidate_snapshot();
+                            return ToolOutput::json(err_json(&e.code, &e.message));
+                        }
+                    }
+                }
+                "type" => {
+                    let Some(text) = step.get("text").and_then(|v| v.as_str()) else {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json("invalid_argument", &format!("Step {idx} missing text")));
+                    };
+                    if text.is_empty() || text.chars().count() > 2000 || !text.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\t')) {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json("invalid_argument", "Invalid batch text"));
+                    }
+                    let mode = step.get("mode").and_then(|v| v.as_str()).unwrap_or("insert");
+                    if !matches!(mode, "insert" | "replace") {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json("invalid_argument", "mode must be 'insert' or 'replace'"));
+                    }
+                    let (x, y, _) = match resolve_batch_point(step, &elements_copy, &marks_copy) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.invalidate_snapshot();
+                            return e;
+                        }
+                    };
+                    let click_first = step.get("click_first").and_then(|v| v.as_bool()).unwrap_or(true);
+                    match self.driver.verify_point_safe(&cur_app, x, y) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.invalidate_snapshot();
+                            return ToolOutput::json(err_json("unsafe_target_field", &format!("Step {idx} target unsafe")));
+                        }
+                        Err(e) => {
+                            self.invalidate_snapshot();
+                            return ToolOutput::json(err_json(&e.code, &e.message));
+                        }
+                    }
+                    let req = ActionRequest::TypePoint {
+                        bundle_id: cur_app.clone(),
+                        x,
+                        y,
+                        text: text.into(),
+                        mode: mode.into(),
+                        click_first,
+                    };
+                    match self.driver.perform_action(&req) {
+                        Ok(res) => step_results.push(JsonValue::object(vec![
+                            ("step", JsonValue::Number(idx as f64)),
+                            ("action", JsonValue::String("type".into())),
+                            ("method", JsonValue::String(res.method)),
+                            ("ok", JsonValue::Bool(true)),
+                        ])),
+                        Err(e) => {
+                            self.invalidate_snapshot();
+                            return ToolOutput::json(err_json(&e.code, &e.message));
+                        }
+                    }
+                }
+                "press_key" => {
+                    let Some(key) = step.get("key").and_then(|v| v.as_str()) else {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json("invalid_argument", &format!("Step {idx} missing key")));
+                    };
+                    let mods: Vec<String> = step
+                        .get("modifiers")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_ascii_lowercase())).collect())
+                        .unwrap_or_default();
+                    if !valid_key_request(key, &mods) {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json("invalid_argument", "Unsupported key or blocked paste shortcut"));
+                    }
+                    let req = ActionRequest::PressKey {
+                        bundle_id: cur_app.clone(),
+                        key: key.into(),
+                        modifiers: mods,
+                    };
+                    match self.driver.perform_action(&req) {
+                        Ok(res) => step_results.push(JsonValue::object(vec![
+                            ("step", JsonValue::Number(idx as f64)),
+                            ("action", JsonValue::String("press_key".into())),
+                            ("method", JsonValue::String(res.method)),
+                            ("ok", JsonValue::Bool(true)),
+                        ])),
+                        Err(e) => {
+                            self.invalidate_snapshot();
+                            return ToolOutput::json(err_json(&e.code, &e.message));
+                        }
+                    }
+                }
+                "scroll" => {
+                    let Some(dir) = step.get("direction").and_then(|v| v.as_str()) else {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json("invalid_argument", &format!("Step {idx} missing direction")));
+                    };
+                    if !matches!(dir, "up" | "down" | "left" | "right") {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json("invalid_argument", "Invalid scroll direction"));
+                    }
+                    let amount = step.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
+                    if !(1..=100).contains(&amount) {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(err_json("invalid_argument", "Scroll amount must be 1..=100"));
+                    }
+                    let req = ActionRequest::Scroll {
+                        bundle_id: cur_app.clone(),
+                        direction: dir.into(),
+                        amount: amount as i32,
+                    };
+                    match self.driver.perform_action(&req) {
+                        Ok(res) => step_results.push(JsonValue::object(vec![
+                            ("step", JsonValue::Number(idx as f64)),
+                            ("action", JsonValue::String("scroll".into())),
+                            ("method", JsonValue::String(res.method)),
+                            ("ok", JsonValue::Bool(true)),
+                        ])),
+                        Err(e) => {
+                            self.invalidate_snapshot();
+                            return ToolOutput::json(err_json(&e.code, &e.message));
+                        }
+                    }
+                }
+                _ => {
+                    self.invalidate_snapshot();
+                    return ToolOutput::json(err_json("invalid_argument", &format!("Unsupported batch step action: {act}")));
+                }
+            }
+        }
+
+        self.invalidate_snapshot();
+        let mut out = vec![
+            ("ok", JsonValue::Bool(true)),
+            ("policy", JsonValue::String("direct".into())),
+            ("executed", JsonValue::Number(step_results.len() as f64)),
+            ("results", JsonValue::Array(step_results)),
+        ];
+        if inspect_after {
+            if let Ok(snap) = self.driver.inspect_app(&cur_app, None, 150, 12) {
+                if self.check_frontmost_permitted(&snap.frontmost_bundle_id)
+                    && snapshot_redaction_reason(&snap).is_none()
+                {
+                    let outline = snap.render_outline(None);
+                    if !contains_secure_marker(&outline) {
+                        self.record_snapshot_meta(&snap, None, 150, 12, false);
+                        out.push(("content", JsonValue::String(outline)));
+                    }
+                }
+            }
+        }
+        ToolOutput::json(JsonValue::object(out))
+    }
+
+    fn handle_wait_for(&mut self, sub_args: &JsonValue) -> ToolOutput {
+        if let Some(blocked) = self.preflight_gate("wait_for", false) {
+            return blocked;
+        }
+        let Some(raw_app) = sub_args.get("app").and_then(|v| v.as_str()) else {
+            return ToolOutput::json(err_json("invalid_argument", "Missing arguments.app"));
+        };
+        let Some(target) = self.resolve_target(raw_app) else {
+            return ToolOutput::json(err_json("invalid_app", "Target is invalid, protected, or not permitted"));
+        };
+        let Some(query) = sub_args.get("query").and_then(|v| v.as_str()) else {
+            return ToolOutput::json(err_json("invalid_argument", "Missing arguments.query"));
+        };
+        if query.is_empty() || query.len() > 120 || query.chars().any(|c| c.is_control()) {
+            return ToolOutput::json(err_json("invalid_argument", "Invalid arguments.query"));
+        }
+        let timeout_ms = sub_args
+            .get("timeout_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(15_000)
+            .clamp(100, 60_000) as u64;
+        let poll_ms = sub_args
+            .get("poll_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(400)
+            .clamp(100, 2_000) as u64;
+        let absent = sub_args
+            .get("absent")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let use_ocr = sub_args
+            .get("ocr")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if self.audit.record("wait_for", "allow", "requested").is_err() {
+            return ToolOutput::json(err_json("audit_unavailable", "Audit log write failed"));
+        }
+
+        let start = Instant::now();
+        let deadline = Duration::from_millis(timeout_ms);
+        let q_lower = query.to_ascii_lowercase();
+
+        loop {
+            if self.stop_file.exists() {
+                return ToolOutput::json(err_json("panic_stop", "STOP file present"));
+            }
+            self.driver.tick();
+            let snap = match self.driver.inspect_app(&target, None, 150, 12) {
+                Ok(s) => s,
+                Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
+            };
+            if !self.check_frontmost_permitted(&snap.frontmost_bundle_id) {
+                return ToolOutput::json(err_json("invalid_app", "Frontmost application is protected"));
+            }
+            if let Some(reason) = snapshot_redaction_reason(&snap) {
+                return ToolOutput::json(err_json("unsafe_or_incomplete_tree", &reason));
+            }
+            let full_outline = snap.render_outline(None);
+            if contains_secure_marker(&full_outline) {
+                return ToolOutput::json(err_json("unsafe_or_incomplete_tree", "sensitive_text_marker"));
+            }
+
+            let ax_found = full_outline.to_ascii_lowercase().contains(&q_lower);
+            let mut ocr_match_text: Option<String> = None;
+            if use_ocr && !ax_found {
+                if let Ok(cap) = self.driver.capture_and_ocr(&target, None, OcrMode::Fast, false) {
+                    if let Some(bx) = cap
+                        .ocr_boxes
+                        .iter()
+                        .find(|b| b.text.to_ascii_lowercase().contains(&q_lower))
+                    {
+                        ocr_match_text = Some(bx.text.clone());
+                    }
+                }
+            }
+
+            let found = ax_found || ocr_match_text.is_some();
+            if found != absent {
+                let elapsed = start.elapsed().as_millis() as f64;
+                let source = if ax_found { "ax" } else if ocr_match_text.is_some() { "ocr" } else { "absent" };
+                let content = if let Some(txt) = ocr_match_text {
+                    txt
+                } else {
+                    snap.render_outline(if absent { None } else { Some(query) })
+                };
+                self.invalidate_snapshot();
+                self.record_snapshot_meta(&snap, None, 150, 12, !absent && ax_found);
+                return ToolOutput::json(JsonValue::object(vec![
+                    ("ok", JsonValue::Bool(true)),
+                    ("matched", JsonValue::Bool(true)),
+                    ("elapsed_ms", JsonValue::Number(elapsed)),
+                    ("source", JsonValue::String(source.into())),
+                    ("content", JsonValue::String(content)),
+                ]));
+            }
+
+            let elapsed_now = start.elapsed();
+            if elapsed_now >= deadline {
+                return ToolOutput::json(JsonValue::object(vec![
+                    ("ok", JsonValue::Bool(false)),
+                    ("code", JsonValue::String("wait_timeout".into())),
+                    ("message", JsonValue::String(format!("Timed out waiting for {query:?}"))),
+                    ("elapsed_ms", JsonValue::Number(elapsed_now.as_millis() as f64)),
+                ]));
+            }
+            let rem = deadline - elapsed_now;
+            thread::sleep(rem.min(Duration::from_millis(poll_ms)));
+        }
+    }
+
+    fn handle_memory_replay(&mut self, args: &JsonValue) -> ToolOutput {
+        if let Some(blocked) = self.preflight_gate("memory_replay", true) {
+            return blocked;
+        }
+        if self.settings.require_confirmation {
+            return ToolOutput::json(err_json(
+                "confirmation_required",
+                "Workflow replay requires confirmation: direct policy",
+            ));
+        }
+        let all = match self.memory.load_all() {
+            Ok(v) => v,
+            Err(e) => return ToolOutput::json(err_json("memory_error", &e)),
+        };
+        let recipe = if let Some(id) = args.get("id").and_then(|v| v.as_str()) {
+            all.into_iter().find(|r| r.id == id)
+        } else {
+            let Some(raw_app) = args.get("app").and_then(|v| v.as_str()) else {
+                return ToolOutput::json(err_json("invalid_argument", "Provide arguments.id or arguments.app"));
+            };
+            let Some(bundle) = self.resolve_target(raw_app) else {
+                return ToolOutput::json(err_json("invalid_app", "Invalid or protected app"));
+            };
+            let goal_q = args.get("goal").and_then(|v| v.as_str()).map(|s| s.to_ascii_lowercase());
+            all.into_iter().find(|r| {
+                r.app.eq_ignore_ascii_case(&bundle)
+                    && goal_q
+                        .as_ref()
+                        .is_none_or(|g| r.goal.to_ascii_lowercase().contains(g))
+            })
+        };
+        let Some(recipe) = recipe else {
+            return ToolOutput::json(err_json("not_found", "Matching workflow recipe not found"));
+        };
+        let Some(bundle) = self.resolve_target(&recipe.app) else {
+            return ToolOutput::json(err_json("invalid_app", "Recipe app is not permitted"));
+        };
+        if self.audit.record("memory_replay", "direct", "requested").is_err() {
+            return ToolOutput::json(err_json("audit_unavailable", "Audit log write failed"));
+        }
+        if let Err(e) = self.driver.activate_app(&bundle) {
+            return ToolOutput::json(err_json(&e.code, &e.message));
+        }
+        if self.driver.supports_fast_point_verify() {
+            thread::sleep(Duration::from_millis(120));
+        }
+
+        let step_args = args.get("step_args").and_then(|v| v.as_array());
+        let mut results = Vec::new();
+        for (idx, step) in recipe.steps.iter().enumerate() {
+            if self.stop_file.exists() {
+                self.invalidate_snapshot();
+                return ToolOutput::json(err_json("panic_stop", "STOP file present"));
+            }
+            let override_arg = step_args.and_then(|arr| arr.get(idx));
+            let act = step.action.as_str();
+            match act {
+                "click" | "double_click" | "right_click" | "type" => {
+                    let snap = match self.driver.inspect_app(&bundle, None, 250, 14) {
+                        Ok(s) => s,
+                        Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
+                    };
+                    if snapshot_redaction_reason(&snap).is_some() {
+                        return ToolOutput::json(err_json("unsafe_or_incomplete_tree", "Secure field detected during replay"));
+                    }
+                    let Some(el) = find_recipe_element(&snap.elements, step) else {
+                        self.invalidate_snapshot();
+                        return ToolOutput::json(JsonValue::object(vec![
+                            ("ok", JsonValue::Bool(false)),
+                            ("code", JsonValue::String("replay_target_missing".into())),
+                            ("failed_step", JsonValue::Number(idx as f64)),
+                            ("target_label", JsonValue::String(step.target_label.clone())),
+                            ("completed_steps", JsonValue::Number(results.len() as f64)),
+                        ]));
+                    };
+                    let Some(ref f) = el.frame else {
+                        return ToolOutput::json(err_json("target_identity_unverified", "Matched element lacks frame"));
+                    };
+                    let (cx, cy) = (f.x + f.w * 0.5, f.y + f.h * 0.5);
+                    let req = if act == "type" {
+                        let Some(text) = override_arg.and_then(|v| v.get("text")).and_then(|v| v.as_str()) else {
+                            return ToolOutput::json(err_json("invalid_argument", &format!("Replay step {idx} requires step_args[{idx}].text")));
+                        };
+                        if text.is_empty() || text.chars().count() > 2000 || !text.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\t')) {
+                            return ToolOutput::json(err_json("invalid_argument", "Invalid replay text"));
+                        }
+                        let is_native_text = matches!(el.role.as_str(), "TextArea" | "TextField" | "SearchField" | "ComboBox");
+                        ActionRequest::TypePoint {
+                            bundle_id: bundle.clone(),
+                            x: cx,
+                            y: cy,
+                            text: text.into(),
+                            mode: "insert".into(),
+                            click_first: !is_native_text,
+                        }
+                    } else {
+                        let click_count = if act == "double_click" { 2 } else { 1 };
+                        let button = if act == "right_click" { "right" } else { "left" };
+                        ActionRequest::ClickPoint {
+                            bundle_id: bundle.clone(),
+                            x: cx,
+                            y: cy,
+                            prefer_ax: click_count == 1 && button == "left" && supports_ax_press(el),
+                            click_count,
+                            button: button.into(),
+                        }
+                    };
+                    match self.driver.perform_action(&req) {
+                        Ok(res) => results.push(JsonValue::object(vec![
+                            ("step", JsonValue::Number(idx as f64)),
+                            ("action", JsonValue::String(act.into())),
+                            ("method", JsonValue::String(res.method)),
+                        ])),
+                        Err(e) => {
+                            self.invalidate_snapshot();
+                            return ToolOutput::json(err_json(&e.code, &e.message));
+                        }
+                    }
+                }
+                "press_key" => {
+                    let Some(key) = override_arg.and_then(|v| v.get("key")).and_then(|v| v.as_str()) else {
+                        return ToolOutput::json(err_json("invalid_argument", &format!("Replay step {idx} requires step_args[{idx}].key")));
+                    };
+                    let mods: Vec<String> = override_arg
+                        .and_then(|v| v.get("modifiers"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_ascii_lowercase())).collect())
+                        .unwrap_or_default();
+                    if !valid_key_request(key, &mods) {
+                        return ToolOutput::json(err_json("invalid_argument", "Unsupported replay key"));
+                    }
+                    let req = ActionRequest::PressKey {
+                        bundle_id: bundle.clone(),
+                        key: key.into(),
+                        modifiers: mods,
+                    };
+                    match self.driver.perform_action(&req) {
+                        Ok(res) => results.push(JsonValue::object(vec![
+                            ("step", JsonValue::Number(idx as f64)),
+                            ("action", JsonValue::String("press_key".into())),
+                            ("method", JsonValue::String(res.method)),
+                        ])),
+                        Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
+                    }
+                }
+                _ => {
+                    return ToolOutput::json(err_json("invalid_argument", &format!("Unsupported replay action: {act}")));
+                }
+            }
+        }
+        self.invalidate_snapshot();
+        ToolOutput::json(JsonValue::object(vec![
+            ("ok", JsonValue::Bool(true)),
+            ("recipe_id", JsonValue::String(recipe.id)),
+            ("completed_steps", JsonValue::Number(results.len() as f64)),
+            ("results", JsonValue::Array(results)),
+        ]))
+    }
+}
+
+fn resolve_batch_point(
+    step: &JsonValue,
+    elements: &HashMap<String, UiElement>,
+    marks: &HashMap<String, VisualMark>,
+) -> Result<(f64, f64, bool), ToolOutput> {
+    if let Some(mid) = step.get("mark").and_then(|v| v.as_str()) {
+        let Some(m) = marks.get(mid) else {
+            return Err(ToolOutput::json(err_json("stale_ref", &format!("Unknown visual mark {mid}"))));
+        };
+        return Ok((m.center_x, m.center_y, m.prefer_ax));
+    }
+    if let Some(rid) = step.get("ref").and_then(|v| v.as_str()) {
+        let Some(el) = elements.get(rid) else {
+            return Err(ToolOutput::json(err_json("stale_ref", &format!("Unknown element ref {rid}"))));
+        };
+        if el.enabled == Some(false) {
+            return Err(ToolOutput::json(err_json("not_implemented", "Element is disabled")));
+        }
+        let Some(ref f) = el.frame else {
+            return Err(ToolOutput::json(err_json("target_identity_unverified", "Element lacks coordinates")));
+        };
+        return Ok((f.x + f.w * 0.5, f.y + f.h * 0.5, supports_ax_press(el)));
+    }
+    if let (Some(x), Some(y)) = (
+        step.get("x").and_then(|v| v.as_f64()),
+        step.get("y").and_then(|v| v.as_f64()),
+    ) {
+        if !x.is_finite() || !y.is_finite() || x.abs() > 100000.0 || y.abs() > 100000.0 {
+            return Err(ToolOutput::json(err_json("invalid_argument", "Coordinate out of bounds")));
+        }
+        return Ok((x, y, false));
+    }
+    Err(ToolOutput::json(err_json("invalid_argument", "Step missing mark, ref, or x/y")))
+}
+
+fn find_recipe_element<'a>(elements: &'a [UiElement], step: &WorkflowStep) -> Option<&'a UiElement> {
+    let want_role = step.target_role.trim();
+    let want_label = step.target_label.trim().to_ascii_lowercase();
+    let role_matches = |el: &UiElement| {
+        el.enabled != Some(false)
+            && el.frame.is_some()
+            && (want_role.is_empty() || el.role.eq_ignore_ascii_case(want_role))
+    };
+    if !want_label.is_empty() {
+        if let Some(exact) = elements
+            .iter()
+            .find(|el| role_matches(el) && el.label.trim().to_ascii_lowercase() == want_label)
+        {
+            return Some(exact);
+        }
+        if let Some(sub) = elements
+            .iter()
+            .find(|el| role_matches(el) && el.label.to_ascii_lowercase().contains(&want_label))
+        {
+            return Some(sub);
+        }
+        return None;
+    }
+    elements.iter().find(|el| role_matches(el))
 }
 
 fn snapshot_redaction_reason(snap: &AppSnapshot) -> Option<String> {
@@ -1455,12 +2183,27 @@ impl OsDriver for MockDriver {
         &self,
         bundle_id: &str,
         _window: Option<i32>,
-        _run_ocr: bool,
+        ocr_mode: OcrMode,
+        _encode_png: bool,
     ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
         let front = if bundle_id == "desktop" {
             "com.apple.calculator"
         } else {
             bundle_id
+        };
+        let ocr_boxes = if ocr_mode == OcrMode::Off {
+            Vec::new()
+        } else {
+            vec![crate::driver::OcrBox {
+                text: "Canvas Submit".into(),
+                confidence: 0.94,
+                frame: Rect {
+                    x: 210.0,
+                    y: 225.0,
+                    w: 80.0,
+                    h: 28.0,
+                },
+            }]
         };
         Ok(crate::driver::CaptureResult {
             bundle_id: bundle_id.into(),
@@ -1476,16 +2219,8 @@ impl OsDriver for MockDriver {
             image_width: 64,
             image_height: 64,
             png_base64: encode_solid_png_b64(64, 64),
-            ocr_boxes: vec![crate::driver::OcrBox {
-                text: "Canvas Submit".into(),
-                confidence: 0.94,
-                frame: Rect {
-                    x: 210.0,
-                    y: 225.0,
-                    w: 80.0,
-                    h: 28.0,
-                },
-            }],
+            capture_id: None,
+            ocr_boxes,
         })
     }
 
@@ -1496,6 +2231,12 @@ impl OsDriver for MockDriver {
         _win_frame: &Rect,
     ) -> Result<String, crate::driver::DriverError> {
         Ok(png_b64.to_string())
+    }
+
+    fn open_url(&self, bundle_id: &str, url: &str) -> Result<(), crate::driver::DriverError> {
+        let mut guard = self.click_log.lock().unwrap();
+        guard.push(format!("OpenUrl {{ bundle_id: {bundle_id:?}, url: {url:?} }}"));
+        Ok(())
     }
 
     fn perform_action(
@@ -1774,9 +2515,10 @@ mod tests {
             &self,
             bundle_id: &str,
             w: Option<i32>,
-            r: bool,
+            ocr_mode: OcrMode,
+            encode_png: bool,
         ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
-            MockDriver::new().capture_and_ocr(bundle_id, w, r)
+            MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_png)
         }
         fn render_som_png(&self, b: &str, m: &str, wf: &Rect) -> Result<String, crate::driver::DriverError> {
             MockDriver::new().render_som_png(b, m, wf)
@@ -1901,9 +2643,10 @@ mod tests {
             &self,
             bundle_id: &str,
             w: Option<i32>,
-            r: bool,
+            ocr_mode: OcrMode,
+            encode_png: bool,
         ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
-            MockDriver::new().capture_and_ocr(bundle_id, w, r)
+            MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_png)
         }
         fn render_som_png(&self, b: &str, m: &str, wf: &Rect) -> Result<String, crate::driver::DriverError> {
             MockDriver::new().render_som_png(b, m, wf)
@@ -2027,6 +2770,248 @@ mod tests {
             ]),
         );
         assert_eq!(key.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn visual_inspect_ocr_off_and_max_marks_filter_output() {
+        let (mut gw, dir) = test_gateway("vis_opts");
+        let vis_off = gw.dispatch(
+            "visual_inspect",
+            &JsonValue::object(vec![
+                ("app", JsonValue::String("com.apple.calculator".into())),
+                ("ocr", JsonValue::String("off".into())),
+            ]),
+        );
+        assert_eq!(vis_off.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(vis_off.payload.get("marks_count").and_then(|v| v.as_i64()), Some(2));
+
+        let vis_capped = gw.dispatch(
+            "visual_inspect",
+            &JsonValue::object(vec![
+                ("app", JsonValue::String("com.apple.calculator".into())),
+                ("ocr", JsonValue::String("fast".into())),
+                ("max_marks", JsonValue::Number(1.0)),
+            ]),
+        );
+        assert_eq!(vis_capped.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(vis_capped.payload.get("marks_count").and_then(|v| v.as_i64()), Some(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn computer_run_actions_executes_chain_and_blocks_under_strict_confirmation() {
+        let (mut strict_gw, strict_dir) = test_gateway("batch_strict");
+        let _ = strict_gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("com.apple.calculator".into()))]),
+        );
+        let denied = strict_gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("run_actions".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![(
+                        "steps",
+                        JsonValue::Array(vec![JsonValue::object(vec![
+                            ("action", JsonValue::String("click".into())),
+                            ("ref", JsonValue::String("e1".into())),
+                        ])]),
+                    )]),
+                ),
+            ]),
+        );
+        assert_eq!(
+            denied.payload.get("code").and_then(|v| v.as_str()),
+            Some("confirmation_required")
+        );
+        let _ = fs::remove_dir_all(&strict_dir);
+
+        let dir = std::env::temp_dir().join(format!("handsmcp_gw_batch_ok_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut gw = Gateway::new(Box::new(MockDriver::new()), PolicySettings::default(), dir.clone());
+        let _ = gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("com.apple.calculator".into()))]),
+        );
+        let res = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("run_actions".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("inspect_after", JsonValue::Bool(true)),
+                        (
+                            "steps",
+                            JsonValue::Array(vec![
+                                JsonValue::object(vec![
+                                    ("action", JsonValue::String("click".into())),
+                                    ("ref", JsonValue::String("e1".into())),
+                                ]),
+                                JsonValue::object(vec![
+                                    ("action", JsonValue::String("type".into())),
+                                    ("ref", JsonValue::String("e2".into())),
+                                    ("text", JsonValue::String("fast batch".into())),
+                                ]),
+                                JsonValue::object(vec![
+                                    ("action", JsonValue::String("press_key".into())),
+                                    ("key", JsonValue::String("enter".into())),
+                                ]),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(res.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(res.payload.get("executed").and_then(|v| v.as_i64()), Some(3));
+        assert!(res.payload.get("content").and_then(|v| v.as_str()).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn computer_wait_for_matches_immediately_and_times_out_when_missing() {
+        let (mut gw, dir) = test_gateway("waitfor");
+        let hit = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("wait_for".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("app", JsonValue::String("com.apple.calculator".into())),
+                        ("query", JsonValue::String("Notes".into())),
+                        ("timeout_ms", JsonValue::Number(500.0)),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(hit.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(hit.payload.get("source").and_then(|v| v.as_str()), Some("ax"));
+
+        let miss = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("wait_for".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("app", JsonValue::String("com.apple.calculator".into())),
+                        ("query", JsonValue::String("NeverAppears".into())),
+                        ("timeout_ms", JsonValue::Number(120.0)),
+                        ("poll_ms", JsonValue::Number(100.0)),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(miss.payload.get("ok").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(miss.payload.get("code").and_then(|v| v.as_str()), Some("wait_timeout"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn desktop_open_url_validates_urls_and_executes() {
+        let dir = std::env::temp_dir().join(format!("handsmcp_gw_openurl_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut gw = Gateway::new(Box::new(MockDriver::new()), PolicySettings::default(), dir.clone());
+
+        let ok = gw.dispatch(
+            "desktop",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("open_url".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("app", JsonValue::String("com.google.Chrome".into())),
+                        ("url", JsonValue::String("https://example.com/upload".into())),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(ok.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let bad_scheme = gw.dispatch(
+            "desktop",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("open_url".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![("url", JsonValue::String("javascript:alert(1)".into()))]),
+                ),
+            ]),
+        );
+        assert_eq!(bad_scheme.payload.get("code").and_then(|v| v.as_str()), Some("invalid_argument"));
+
+        let protected = gw.dispatch(
+            "desktop",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("open_url".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("app", JsonValue::String("com.1password.1password".into())),
+                        ("url", JsonValue::String("https://example.com".into())),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(protected.payload.get("code").and_then(|v| v.as_str()), Some("invalid_app"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workflow_memory_replay_executes_saved_steps_with_args() {
+        let dir = std::env::temp_dir().join(format!("handsmcp_gw_replay_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut gw = Gateway::new(Box::new(MockDriver::new()), PolicySettings::default(), dir.clone());
+
+        let rec = gw.dispatch(
+            "workflow_memory",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("record".into())),
+                ("app", JsonValue::String("com.apple.calculator".into())),
+                ("goal", JsonValue::String("tap seven and write note".into())),
+                (
+                    "steps",
+                    JsonValue::Array(vec![
+                        JsonValue::object(vec![
+                            ("action", JsonValue::String("click".into())),
+                            ("target_role", JsonValue::String("Button".into())),
+                            ("target_label", JsonValue::String("7".into())),
+                        ]),
+                        JsonValue::object(vec![
+                            ("action", JsonValue::String("type".into())),
+                            ("target_role", JsonValue::String("TextArea".into())),
+                            ("target_label", JsonValue::String("Notes".into())),
+                        ]),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(rec.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let rep = gw.dispatch(
+            "workflow_memory",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("replay".into())),
+                ("app", JsonValue::String("com.apple.calculator".into())),
+                ("goal", JsonValue::String("tap seven".into())),
+                (
+                    "step_args",
+                    JsonValue::Array(vec![
+                        JsonValue::Null,
+                        JsonValue::object(vec![("text", JsonValue::String("hello replay".into()))]),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(rep.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(rep.payload.get("completed_steps").and_then(|v| v.as_i64()), Some(2));
         let _ = fs::remove_dir_all(&dir);
     }
 }

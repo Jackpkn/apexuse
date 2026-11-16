@@ -9,6 +9,7 @@
 #import <Vision/Vision.h>
 
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -642,7 +643,8 @@ char *handsmcp_macos_launch_app(const char *bundle_id) {
 
 char *handsmcp_macos_inspect_app(const char *bundle_id, int window_index,
                                  int max_elements, int max_depth) {
-  if (gCursorWin && gCursorWin.isVisible)
+  ensure_cgs_init();
+  if ([NSThread isMainThread] && gCursorWin && gCursorWin.isVisible)
     touch_agent_cursor_ttl();
   if (!AXIsProcessTrusted()) {
     return dup_json(@{
@@ -766,11 +768,45 @@ static NSString *png_b64_from_cgimage(CGImageRef img) {
   return [pngData base64EncodedStringWithOptions:0];
 }
 
+static pthread_mutex_t gCapMutex = PTHREAD_MUTEX_INITIALIZER;
+static CGImageRef gCachedCapImg = NULL;
+static NSString *gCachedCapId = nil;
+static uint64_t gCapSeq = 0;
+
+static NSString *store_cached_capture(CGImageRef img) {
+  if (!img)
+    return nil;
+  pthread_mutex_lock(&gCapMutex);
+  if (gCachedCapImg) {
+    CGImageRelease(gCachedCapImg);
+    gCachedCapImg = NULL;
+  }
+  gCachedCapImg = CGImageRetain(img);
+  gCapSeq++;
+  gCachedCapId = [NSString stringWithFormat:@"cap_%llu", (unsigned long long)gCapSeq];
+  NSString *cid = [gCachedCapId copy];
+  pthread_mutex_unlock(&gCapMutex);
+  return cid;
+}
+
+static CGImageRef take_cached_capture(NSString *capId) {
+  if (!capId)
+    return NULL;
+  pthread_mutex_lock(&gCapMutex);
+  CGImageRef out = NULL;
+  if (gCachedCapImg && gCachedCapId && [gCachedCapId isEqualToString:capId]) {
+    out = CGImageRetain(gCachedCapImg);
+  }
+  pthread_mutex_unlock(&gCapMutex);
+  return out;
+}
+
 char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
-                                     int run_ocr) {
-  ensure_cgs_init();
+                                     int ocr_mode, int encode_png) {
+  if ([NSThread isMainThread])
+    ensure_cgs_init();
   BOOL restoreCursorAfterCapture = NO;
-  if (gCursorWin && gCursorWin.isVisible) {
+  if ([NSThread isMainThread] && gCursorWin && gCursorWin.isVisible) {
     touch_agent_cursor_ttl();
     if (bundle_id && strcasecmp(bundle_id, "desktop") == 0) {
       restoreCursorAfterCapture = YES;
@@ -806,6 +842,7 @@ char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
     id winsObj = ax_copy(appEl, kAXWindowsAttribute);
     NSArray *axWins =
         [winsObj isKindOfClass:[NSArray class]] ? (NSArray *)winsObj : @[];
+
     int axIdx = (window_index >= 0) ? window_index : 0;
     if (window_index < 0 && axWins.count > 1) {
       for (int wi = 0; wi < (int)axWins.count; wi++) {
@@ -987,12 +1024,15 @@ char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
     });
   }
 
-  NSString *b64 = png_b64_from_cgimage(captured);
+  NSString *capId = store_cached_capture(captured);
+  NSString *b64 = encode_png ? png_b64_from_cgimage(captured) : @"";
   NSMutableArray *ocrBoxes = [NSMutableArray array];
 
-  if (run_ocr) {
+  if (ocr_mode > 0) {
     VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] init];
-    req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+    req.recognitionLevel = (ocr_mode == 1)
+                               ? VNRequestTextRecognitionLevelFast
+                               : VNRequestTextRecognitionLevelAccurate;
     req.usesLanguageCorrection = NO;
     VNImageRequestHandler *handler =
         [[VNImageRequestHandler alloc] initWithCGImage:captured options:@{}];
@@ -1027,7 +1067,7 @@ char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
   size_t imgH = CGImageGetHeight(captured);
   CGImageRelease(captured);
 
-  if (!b64)
+  if (encode_png && !b64)
     return dup_json(@{@"ok" : @NO, @"code" : @"png_encode_failed"});
 
   return dup_json(@{
@@ -1036,6 +1076,7 @@ char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
     @"frontmost_bundle_id" : frontApp.bundleIdentifier ?: @"",
     @"pid" : @(pid),
     @"window_id" : @(capturedWid),
+    @"capture_id" : capId ?: @"",
     @"window_frame" : @{
       @"x" : @(winFrame.origin.x),
       @"y" : @(winFrame.origin.y),
@@ -1044,24 +1085,23 @@ char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
     },
     @"image_width" : @(imgW),
     @"image_height" : @(imgH),
-    @"png_base64" : b64,
+    @"png_base64" : b64 ?: @"",
     @"ocr_boxes" : ocrBoxes,
   });
 }
 
-char *handsmcp_macos_render_som(const char *png_b64, const char *marks_json,
-                                double win_x, double win_y, double win_w,
-                                double win_h) {
-  ensure_cgs_init();
-  if (!png_b64 || !marks_json || win_w <= 0 || win_h <= 0) {
+char *handsmcp_macos_render_som(const char *png_b64_or_cap_id,
+                                const char *marks_json, double win_x,
+                                double win_y, double win_w, double win_h) {
+  if ([NSThread isMainThread])
+    ensure_cgs_init();
+  if (!png_b64_or_cap_id || !marks_json || win_w <= 0 || win_h <= 0) {
     return dup_json(@{@"ok" : @NO, @"code" : @"invalid_argument"});
   }
-  NSData *imgData = [[NSData alloc]
-      initWithBase64EncodedString:[NSString stringWithUTF8String:png_b64]
-                          options:0];
+  NSString *inputStr = [NSString stringWithUTF8String:png_b64_or_cap_id];
   NSData *marksData = [[NSString stringWithUTF8String:marks_json]
       dataUsingEncoding:NSUTF8StringEncoding];
-  if (!imgData || !marksData)
+  if (!inputStr || !marksData)
     return dup_json(@{@"ok" : @NO, @"code" : @"invalid_argument"});
 
   NSArray *marks = [NSJSONSerialization JSONObjectWithData:marksData
@@ -1070,17 +1110,34 @@ char *handsmcp_macos_render_som(const char *png_b64, const char *marks_json,
   if (![marks isKindOfClass:[NSArray class]])
     return dup_json(@{@"ok" : @NO, @"code" : @"invalid_marks"});
 
-  CGImageSourceRef src =
-      CGImageSourceCreateWithData((__bridge CFDataRef)imgData, NULL);
-  if (!src)
-    return dup_json(@{@"ok" : @NO, @"code" : @"invalid_png"});
-  CGImageRef baseImg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
-  CFRelease(src);
-  if (!baseImg)
-    return dup_json(@{@"ok" : @NO, @"code" : @"invalid_png"});
+  CGImageRef baseImg = NULL;
+  if ([inputStr hasPrefix:@"cap_"]) {
+    baseImg = take_cached_capture(inputStr);
+    if (!baseImg)
+      return dup_json(@{@"ok" : @NO, @"code" : @"capture_cache_miss"});
+  } else {
+    NSData *imgData =
+        [[NSData alloc] initWithBase64EncodedString:inputStr options:0];
+    if (!imgData)
+      return dup_json(@{@"ok" : @NO, @"code" : @"invalid_argument"});
+    CGImageSourceRef src =
+        CGImageSourceCreateWithData((__bridge CFDataRef)imgData, NULL);
+    if (!src)
+      return dup_json(@{@"ok" : @NO, @"code" : @"invalid_png"});
+    baseImg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    CFRelease(src);
+    if (!baseImg)
+      return dup_json(@{@"ok" : @NO, @"code" : @"invalid_png"});
+  }
 
-  size_t imgW = CGImageGetWidth(baseImg);
-  size_t imgH = CGImageGetHeight(baseImg);
+  size_t srcW = CGImageGetWidth(baseImg);
+  size_t srcH = CGImageGetHeight(baseImg);
+  size_t imgW = srcW;
+  size_t imgH = srcH;
+  if ([inputStr hasPrefix:@"cap_"] && srcW > 1440) {
+    imgW = 1440;
+    imgH = (size_t)MAX(1.0, round((double)srcH * (1440.0 / (double)srcW)));
+  }
   CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
   CGContextRef ctx = CGBitmapContextCreate(NULL, imgW, imgH, 8, imgW * 4, cs,
                                            kCGImageAlphaPremultipliedLast);
@@ -1089,7 +1146,7 @@ char *handsmcp_macos_render_som(const char *png_b64, const char *marks_json,
     CGImageRelease(baseImg);
     return dup_json(@{@"ok" : @NO, @"code" : @"context_failed"});
   }
-
+  CGContextSetInterpolationQuality(ctx, kCGInterpolationMedium);
   CGContextDrawImage(ctx, CGRectMake(0, 0, imgW, imgH), baseImg);
   CGImageRelease(baseImg);
 
@@ -2136,4 +2193,71 @@ char *handsmcp_macos_perform_action(const char *req_json) {
   }
 
   return dup_json(@{@"ok" : @NO, @"code" : @"unsupported_action"});
+}
+
+char *handsmcp_macos_check_point(const char *bundle_id, double x, double y) {
+  if (!AXIsProcessTrusted()) {
+    return dup_json(@{@"ok" : @NO, @"code" : @"accessibility_denied"});
+  }
+  if (!bundle_id)
+    return dup_json(@{@"ok" : @NO, @"code" : @"invalid_argument"});
+  NSString *bid = [NSString stringWithUTF8String:bundle_id];
+  BOOL isDesktop = [bid.lowercaseString isEqualToString:@"desktop"];
+  NSRunningApplication *app =
+      isDesktop ? [NSWorkspace sharedWorkspace].frontmostApplication
+                : resolve_app(bid);
+  if (!isDesktop && !app)
+    return dup_json(@{@"ok" : @NO, @"code" : @"app_not_running"});
+  pid_t pid = app ? app.processIdentifier : 0;
+  BOOL isChrome = is_chromium_or_electron(app.bundleIdentifier);
+  CGPoint pt = CGPointMake(x, y);
+  if (!point_in_target_bounds(isDesktop, pid, pt)) {
+    return dup_json(@{@"ok" : @NO, @"code" : @"coordinate_outside_window"});
+  }
+  pid_t targetPid = pid;
+  if (isDesktop) {
+    find_window_at_point(0, pt, &targetPid, NULL);
+  }
+  NSString *role = nil;
+  if (!check_hit_safe(targetPid, isChrome, x, y, NULL, &role)) {
+    return dup_json(@{@"ok" : @NO, @"code" : @"unsafe_target_field"});
+  }
+  return dup_json(@{
+    @"ok" : @YES,
+    @"frontmost_bundle_id" :
+        [NSWorkspace sharedWorkspace].frontmostApplication.bundleIdentifier
+        ?: @"",
+    @"role" : role ?: @"",
+  });
+}
+
+char *handsmcp_macos_open_url(const char *bundle_id, const char *url) {
+  if (!url)
+    return dup_json(@{@"ok" : @NO, @"code" : @"invalid_argument"});
+  NSString *u = [NSString stringWithUTF8String:url];
+  NSString *bid = bundle_id ? [NSString stringWithUTF8String:bundle_id] : @"";
+  NSTask *task = [[NSTask alloc] init];
+  task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/open"];
+  if (bid.length > 0 && ![bid.lowercaseString isEqualToString:@"desktop"]) {
+    task.arguments = @[ @"-b", bid, u ];
+  } else {
+    task.arguments = @[ u ];
+  }
+  NSError *err = nil;
+  if (![task launchAndReturnError:&err]) {
+    return dup_json(@{
+      @"ok" : @NO,
+      @"code" : @"open_url_failed",
+      @"message" : err.localizedDescription ?: @"open failed"
+    });
+  }
+  [task waitUntilExit];
+  if (task.terminationStatus != 0) {
+    return dup_json(@{
+      @"ok" : @NO,
+      @"code" : @"open_url_failed",
+      @"message" : @"open exited nonzero"
+    });
+  }
+  return dup_json(@{@"ok" : @YES, @"url" : u, @"bundle_id" : bid});
 }

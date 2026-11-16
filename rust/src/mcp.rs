@@ -35,7 +35,7 @@ fn tool_defs() -> Vec<JsonValue> {
         ]),
         JsonValue::object(vec![
             ("name", JsonValue::String("visual_inspect".into())),
-            ("description", JsonValue::String("Set-of-Mark (SoM) visual indexing for an app bundle ID or 'desktop' (full screen): captures via ScreenCaptureKit, fuses Accessibility + Vision OCR boxes, overlays [m1]..[mN] badges, and returns annotated PNG + clickable Mark IDs.".into())),
+            ("description", JsonValue::String("Set-of-Mark (SoM) visual indexing for an app bundle ID or 'desktop' (full screen): captures via ScreenCaptureKit, fuses Accessibility + Vision OCR boxes, overlays [m1]..[mN] badges, and returns annotated PNG + clickable Mark IDs. Pass ocr='auto'|'fast'|'accurate'|'off' (default 'auto') and max_marks (1..=150, default 80).".into())),
             (
                 "annotations",
                 JsonValue::object(vec![
@@ -53,6 +53,8 @@ fn tool_defs() -> Vec<JsonValue> {
                         JsonValue::object(vec![
                             ("app", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
                             ("window", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
+                            ("ocr", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
+                            ("max_marks", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
                         ]),
                     ),
                     ("required", JsonValue::Array(vec![JsonValue::String("app".into())])),
@@ -61,7 +63,7 @@ fn tool_defs() -> Vec<JsonValue> {
         ]),
         JsonValue::object(vec![
             ("name", JsonValue::String("computer".into())),
-            ("description", JsonValue::String("Semantic & Set-of-Mark interaction: action=inspect, click, double_click, right_click, hover (accepts ref or mark), drag (from_ref/from_mark -> to_ref/to_mark), type (ref or mark), press_key, scroll, or confirm (token).".into())),
+            ("description", JsonValue::String("Semantic & Set-of-Mark interaction: action=inspect, click, double_click, right_click, hover (accepts ref or mark), drag (from_ref/from_mark -> to_ref/to_mark), type (ref or mark), press_key, scroll, run_actions (up to 12 chained steps without intermediate LLM round-trips), wait_for (local AX/OCR poll up to 60s), or confirm (token).".into())),
             (
                 "inputSchema",
                 JsonValue::object(vec![
@@ -85,7 +87,7 @@ fn tool_defs() -> Vec<JsonValue> {
         ]),
         JsonValue::object(vec![
             ("name", JsonValue::String("desktop".into())),
-            ("description", JsonValue::String("Desktop-level operations: action=list_applications, launch_application, activate_application, visual_click, double_click, right_click, hover, or drag (using mark, ref, or x/y coordinates).".into())),
+            ("description", JsonValue::String("Desktop-level operations: action=list_applications, launch_application, activate_application, open_url (instant http/https URL open in permitted browser/app), visual_click, double_click, right_click, hover, or drag (using mark, ref, or x/y coordinates).".into())),
             (
                 "inputSchema",
                 JsonValue::object(vec![
@@ -144,7 +146,7 @@ fn tool_defs() -> Vec<JsonValue> {
             (
                 "description",
                 JsonValue::String(
-                    "Local structural app-workflow memory (never stores passwords or typed text): action=list, lookup, record, or clear."
+                    "Local structural app-workflow memory (never stores passwords or typed text): action=list, lookup, record, replay (executable macro replay with optional step_args), or clear."
                         .into(),
                 ),
             ),
@@ -157,9 +159,11 @@ fn tool_defs() -> Vec<JsonValue> {
                         JsonValue::object(vec![
                             ("action", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
                             ("app", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
+                            ("id", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
                             ("query", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
                             ("goal", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
                             ("steps", JsonValue::object(vec![("type", JsonValue::String("array".into()))])),
+                            ("step_args", JsonValue::object(vec![("type", JsonValue::String("array".into()))])),
                         ]),
                     ),
                     ("required", JsonValue::Array(vec![JsonValue::String("action".into())])),

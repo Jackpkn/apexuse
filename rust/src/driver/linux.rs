@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use super::{
-    ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError, OsDriver,
-    Rect, RunningApp,
+    ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError, OcrMode,
+    OsDriver, Rect, RunningApp,
 };
 
 /// Linux OS backend placeholder implementing the shared `OsDriver` boundary.
@@ -35,7 +35,7 @@ impl OsDriver for LinuxDriver {
         Err(DriverError::new("unsupported_on_platform", "Linux AT-SPI2 driver is not implemented yet."))
     }
 
-    fn capture_and_ocr(&self, _bundle_id: &str, _window: Option<i32>, _run_ocr: bool) -> Result<CaptureResult, DriverError> {
+    fn capture_and_ocr(&self, _bundle_id: &str, _window: Option<i32>, _ocr_mode: OcrMode, _encode_png: bool) -> Result<CaptureResult, DriverError> {
         Err(DriverError::new("unsupported_on_platform", "Linux AT-SPI2 driver is not implemented yet."))
     }
 

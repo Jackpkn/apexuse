@@ -156,12 +156,30 @@ pub struct OcrBox {
     pub frame: Rect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OcrMode {
+    Off,
+    Fast,
+    Accurate,
+}
+
+impl OcrMode {
+    pub fn as_int(self) -> i32 {
+        match self {
+            OcrMode::Off => 0,
+            OcrMode::Fast => 1,
+            OcrMode::Accurate => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CaptureResult {
     pub bundle_id: String,
     pub frontmost_bundle_id: String,
     pub pid: i64,
     pub window_id: u64,
+    pub capture_id: Option<String>,
     pub window_frame: Rect,
     pub image_width: usize,
     pub image_height: usize,
@@ -247,15 +265,28 @@ pub trait OsDriver: Send + Sync {
         &self,
         bundle_id: &str,
         window: Option<i32>,
-        run_ocr: bool,
+        ocr_mode: OcrMode,
+        encode_png: bool,
     ) -> Result<CaptureResult, DriverError>;
     fn render_som_png(
         &self,
-        png_b64: &str,
+        png_b64_or_cap_id: &str,
         marks_json: &str,
         win_frame: &Rect,
     ) -> Result<String, DriverError>;
     fn perform_action(&self, req: &ActionRequest) -> Result<ActionResult, DriverError>;
+    fn supports_fast_point_verify(&self) -> bool {
+        false
+    }
+    fn verify_point_safe(&self, _bundle_id: &str, _x: f64, _y: f64) -> Result<bool, DriverError> {
+        Ok(true)
+    }
+    fn open_url(&self, _bundle_id: &str, _url: &str) -> Result<(), DriverError> {
+        Err(DriverError::new(
+            "unsupported_on_platform",
+            "open_url is not supported on this platform",
+        ))
+    }
     fn tick(&self) {}
 }
 
