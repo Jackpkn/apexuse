@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn memory_records_queries_and_rejects_secrets() {
-        let dir = std::env::temp_dir().join(format!("handsmcp_mem_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_mem_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mem = WorkflowMemory::new(dir.join("memory.json"));
 

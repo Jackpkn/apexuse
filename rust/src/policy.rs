@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn secure_marker_detection_allows_spaced_static_bullet() {
         assert!(!contains_secure_marker("StaticText \"Today • 10:30\""));
-        assert!(!contains_secure_marker("  [e25] Group \"~/handsmcp/docs • Untracked\""));
+        assert!(!contains_secure_marker("  [e25] Group \"~/apexuse/docs • Untracked\""));
         assert!(!contains_secure_marker("  [e26] StaticText value=\"Workspace • Ready\""));
         assert!(!contains_secure_marker("  [e27] ListMarker value=\"• \""));
         assert!(!contains_secure_marker("  [e28] StaticText value=\"Uses copyright protected content\""));
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn policy_yaml_parses_repo_policy() {
-        let dir = std::env::temp_dir().join(format!("handsmcp_pol_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_pol_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("policy.yaml");
         fs::write(

@@ -29,7 +29,7 @@ static char *dup_json(NSDictionary *obj) {
   return buf;
 }
 
-void handsmcp_free_cstr(char *ptr) {
+void apexuse_free_cstr(char *ptr) {
   if (ptr)
     free(ptr);
 }
@@ -47,7 +47,7 @@ static void ensure_cgs_init(void) {
 
 // MARK: - Independent Agent Cursor Overlay (never moves user's hardware cursor)
 
-@interface HandsmcpCursorView : NSView
+@interface ApexUseCursorView : NSView
 @property(nonatomic, assign) double rippleProgress;
 @end
 
@@ -56,7 +56,7 @@ static double ease_out_cubic(double t) {
   return 1.0 - (u * u * u);
 }
 
-@implementation HandsmcpCursorView
+@implementation ApexUseCursorView
 - (void)drawRect:(NSRect)dirtyRect {
   [[NSColor clearColor] set];
   NSRectFill(dirtyRect);
@@ -158,7 +158,7 @@ static double ease_out_cubic(double t) {
 @end
 
 static NSWindow *gCursorWin = nil;
-static HandsmcpCursorView *gCursorView = nil;
+static ApexUseCursorView *gCursorView = nil;
 static CGPoint gLastAgentPt = {0, 0};
 static BOOL gHaveLastAgentPt = NO;
 static CFAbsoluteTime gCursorExpiresAt = 0;
@@ -194,7 +194,7 @@ static void show_agent_cursor_at(CGPoint cgPt, BOOL isClick) {
     gCursorWin.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                     NSWindowCollectionBehaviorTransient;
     gCursorView =
-        [[HandsmcpCursorView alloc] initWithFrame:NSMakeRect(0, 0, 88, 88)];
+        [[ApexUseCursorView alloc] initWithFrame:NSMakeRect(0, 0, 88, 88)];
     gCursorWin.contentView = gCursorView;
   }
 
@@ -258,7 +258,7 @@ static void hide_agent_cursor(void) {
   pump_ui_ms(10);
 }
 
-void handsmcp_macos_tick(void) {
+void apexuse_macos_tick(void) {
   if (![NSThread isMainThread])
     return;
   pump_ui_ms(15);
@@ -654,7 +654,7 @@ static void walk_ax_node(AXUIElementRef el, int depth, int maxDepth,
   }
 }
 
-char *handsmcp_macos_doctor(void) {
+char *apexuse_macos_doctor(void) {
   BOOL ax = AXIsProcessTrusted();
   BOOL sr = NO;
   if (@available(macOS 10.15, *)) {
@@ -668,7 +668,7 @@ char *handsmcp_macos_doctor(void) {
   });
 }
 
-char *handsmcp_macos_list_apps(void) {
+char *apexuse_macos_list_apps(void) {
   NSMutableArray *apps = [NSMutableArray array];
   for (NSRunningApplication *app in [NSWorkspace sharedWorkspace]
            .runningApplications) {
@@ -687,7 +687,7 @@ char *handsmcp_macos_list_apps(void) {
   return dup_json(@{@"ok" : @YES, @"apps" : apps});
 }
 
-char *handsmcp_macos_activate_app(const char *bundle_id) {
+char *apexuse_macos_activate_app(const char *bundle_id) {
   if (!bundle_id)
     return dup_json(@{@"ok" : @NO, @"code" : @"invalid_argument"});
   NSString *bid = [NSString stringWithUTF8String:bundle_id];
@@ -705,7 +705,7 @@ char *handsmcp_macos_activate_app(const char *bundle_id) {
   });
 }
 
-char *handsmcp_macos_launch_app(const char *bundle_id) {
+char *apexuse_macos_launch_app(const char *bundle_id) {
   if (!bundle_id)
     return dup_json(@{@"ok" : @NO, @"code" : @"invalid_argument"});
   NSString *bid = [NSString stringWithUTF8String:bundle_id];
@@ -731,7 +731,7 @@ char *handsmcp_macos_launch_app(const char *bundle_id) {
   return dup_json(@{@"ok" : @YES, @"bundle_id" : bid});
 }
 
-char *handsmcp_macos_inspect_app(const char *bundle_id, int window_index,
+char *apexuse_macos_inspect_app(const char *bundle_id, int window_index,
                                  int max_elements, int max_depth) {
   ensure_cgs_init();
   if ([NSThread isMainThread] && gCursorWin && gCursorWin.isVisible)
@@ -915,7 +915,7 @@ static NSString *compute_pixel_digest(CGImageRef img) {
   return hex;
 }
 
-char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
+char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
                                      int ocr_mode, int encode_png) {
   if ([NSThread isMainThread])
     ensure_cgs_init();
@@ -1245,7 +1245,7 @@ char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
   });
 }
 
-char *handsmcp_macos_render_som(const char *png_b64_or_cap_id,
+char *apexuse_macos_render_som(const char *png_b64_or_cap_id,
                                 const char *marks_json, double win_x,
                                 double win_y, double win_w, double win_h) {
   if ([NSThread isMainThread])
@@ -2098,7 +2098,7 @@ static void post_key_chord_to_pid(pid_t pid, int code, CGEventFlags flags) {
     CFRelease(src);
 }
 
-char *handsmcp_macos_perform_action(const char *req_json) {
+char *apexuse_macos_perform_action(const char *req_json) {
   ensure_cgs_init();
   if (!AXIsProcessTrusted()) {
     return dup_json(@{@"ok" : @NO, @"code" : @"accessibility_denied"});
@@ -2463,7 +2463,7 @@ char *handsmcp_macos_perform_action(const char *req_json) {
   return dup_json(@{@"ok" : @NO, @"code" : @"unsupported_action"});
 }
 
-char *handsmcp_macos_check_point(const char *bundle_id, double x, double y) {
+char *apexuse_macos_check_point(const char *bundle_id, double x, double y) {
   if (!AXIsProcessTrusted()) {
     return dup_json(@{@"ok" : @NO, @"code" : @"accessibility_denied"});
   }
@@ -2499,7 +2499,7 @@ char *handsmcp_macos_check_point(const char *bundle_id, double x, double y) {
   });
 }
 
-char *handsmcp_macos_open_url(const char *bundle_id, const char *url) {
+char *apexuse_macos_open_url(const char *bundle_id, const char *url) {
   if (!url)
     return dup_json(@{@"ok" : @NO, @"code" : @"invalid_argument"});
   NSString *u = [NSString stringWithUTF8String:url];

@@ -1,6 +1,6 @@
 # Direct Computer-Use Policy (no per-click confirmation prompts).
 # Protected apps (password managers/wallets/banks), secure/unverified fields,
-# clipboard paste, rate limits, audit logging, and ~/.handsmcp/STOP remain strictly enforced.
+# clipboard paste, rate limits, audit logging, and ~/.apexuse/STOP remain strictly enforced.
 mode: normal
 confirmation: direct
 rate_limit_per_minute: 1200

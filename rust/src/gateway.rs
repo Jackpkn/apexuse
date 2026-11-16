@@ -2723,7 +2723,7 @@ mod tests {
     use std::fs;
 
     fn test_gateway(tag: &str) -> (Gateway, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_{}_{}", tag, std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_{}_{}", tag, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let settings = PolicySettings {
@@ -2907,7 +2907,7 @@ mod tests {
 
     #[test]
     fn read_only_mode_and_stop_file_and_workflow_memory_work() {
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_ro_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_ro_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let settings = PolicySettings {
@@ -2996,7 +2996,7 @@ mod tests {
 
     #[test]
     fn visual_inspect_allows_truncated_outline_when_safety_scan_complete_and_refuses_incomplete() {
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_trunc_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_trunc_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let settings = PolicySettings {
@@ -3034,7 +3034,7 @@ mod tests {
 
     #[test]
     fn direct_confirmation_policy_executes_without_token_and_still_blocks_protected_apps() {
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_direct_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_direct_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let settings = PolicySettings {
@@ -3124,7 +3124,7 @@ mod tests {
 
     #[test]
     fn unrelated_static_text_tick_allows_click_while_missing_target_fails_closed() {
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_tick_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_tick_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let settings = PolicySettings {
@@ -3179,7 +3179,7 @@ mod tests {
 
     #[test]
     fn default_policy_is_direct_unrestricted_and_allows_web_elements_and_keys() {
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_unres_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_unres_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let settings = PolicySettings::default();
@@ -3294,7 +3294,7 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&strict_dir);
 
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_batch_ok_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_batch_ok_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mut gw = Gateway::new(Box::new(MockDriver::new()), PolicySettings::default(), dir.clone());
@@ -3380,7 +3380,7 @@ mod tests {
 
     #[test]
     fn desktop_open_url_validates_urls_and_executes() {
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_openurl_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_openurl_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mut gw = Gateway::new(Box::new(MockDriver::new()), PolicySettings::default(), dir.clone());
@@ -3431,7 +3431,7 @@ mod tests {
 
     #[test]
     fn workflow_memory_replay_executes_saved_steps_with_args() {
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_replay_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_replay_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mut gw = Gateway::new(Box::new(MockDriver::new()), PolicySettings::default(), dir.clone());
@@ -3483,7 +3483,7 @@ mod tests {
 
     #[test]
     fn computer_click_accepts_coords_on_unfiltered_and_rejects_on_filtered_while_keeping_ref() {
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_clk_coord_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_clk_coord_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mut gw = Gateway::new(Box::new(MockDriver::new()), PolicySettings::default(), dir.clone());
@@ -3590,7 +3590,7 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_wait_win_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_wait_win_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let drv = TransientStartupDriver {
@@ -3664,7 +3664,7 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_scroll_tgt_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_scroll_tgt_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3816,7 +3816,7 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir().join(format!("handsmcp_gw_verify_retry_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_verify_retry_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 

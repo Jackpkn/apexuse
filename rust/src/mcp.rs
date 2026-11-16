@@ -219,7 +219,7 @@ pub fn handle_rpc_line(gw: &mut Gateway, line: &str) -> Option<String> {
                 (
                     "serverInfo",
                     JsonValue::object(vec![
-                        ("name", JsonValue::String("handsmcp-mcp".into())),
+                        ("name", JsonValue::String("apexuse-mcp".into())),
                         ("version", JsonValue::String("0.2.0".into())),
                     ]),
                 ),
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn mcp_protocol_initialize_list_and_visual_call() {
-        let dir = std::env::temp_dir().join(format!("handsmcp_mcp_unit_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apexuse_mcp_unit_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let settings = PolicySettings {

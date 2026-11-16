@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "handsmcp-mcp"
+name = "apexuse-mcp"
 version = "0.2.0"

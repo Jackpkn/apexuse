@@ -10,7 +10,7 @@ fn main() {
 
         let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
         let obj_path = out_dir.join("macos_bridge.o");
-        let lib_path = out_dir.join("libhandsmcp_macos.a");
+        let lib_path = out_dir.join("libapexuse_macos.a");
 
         let status = Command::new("clang")
             .args([
@@ -34,10 +34,10 @@ fn main() {
             .arg(&obj_path)
             .status()
             .expect("failed to invoke ar");
-        assert!(ar_status.success(), "ar failed creating libhandsmcp_macos.a");
+        assert!(ar_status.success(), "ar failed creating libapexuse_macos.a");
 
         println!("cargo:rustc-link-search=native={}", out_dir.display());
-        println!("cargo:rustc-link-lib=static=handsmcp_macos");
+        println!("cargo:rustc-link-lib=static=apexuse_macos");
         println!("cargo:rustc-link-arg=-mmacosx-version-min=14.0");
         for fw in [
             "Foundation",

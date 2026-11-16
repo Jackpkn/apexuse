@@ -5,7 +5,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
-RUST_BIN = ROOT / "rust/target/release/handsmcp-mcp"
+RUST_BIN = ROOT / "rust/target/release/apexuse-mcp"
 
 
 @pytest.fixture
@@ -19,11 +19,12 @@ async def test_rust_mcp_stdio_end_to_end(tmp_path):
         pytest.skip("Rust release binary not built")
     confirm_policy = tmp_path / "confirm_policy.yaml"
     confirm_policy.write_text("mode: normal\nconfirmation: required\nallowed_apps: [\"*\"]\n")
-    env = dict(os.environ, HANDSMCP_STATE_DIR=str(tmp_path / "state"), HANDSMCP_POLICY=str(confirm_policy))
+    env = dict(os.environ, APEXUSE_STATE_DIR=str(tmp_path / "state"), APEXUSE_POLICY=str(confirm_policy))
     params = StdioServerParameters(command=str(RUST_BIN), args=["--mock"], env=env)
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
-            await session.initialize()
+            init = await session.initialize()
+            assert init.serverInfo.name == "apexuse-mcp"
             tools = await session.list_tools()
             names = {t.name for t in tools.tools}
             assert names == {
@@ -104,11 +105,11 @@ async def test_rust_mcp_stdio_end_to_end(tmp_path):
 async def test_rust_mcp_direct_policy_executes_without_confirmation_loop(tmp_path, policy_name):
     if not RUST_BIN.is_file():
         pytest.skip("Rust release binary not built")
-    env = dict(
-        os.environ,
-        HANDSMCP_STATE_DIR=str(tmp_path / f"state_{policy_name}"),
-        HANDSMCP_POLICY=str(ROOT / policy_name),
-    )
+    state_key = "APEXUSE_STATE_DIR" if policy_name == "policy.autonomous.yaml" else "HANDSMCP_STATE_DIR"
+    policy_key = "APEXUSE_POLICY" if policy_name == "policy.autonomous.yaml" else "HANDSMCP_POLICY"
+    env = dict(os.environ)
+    env[state_key] = str(tmp_path / f"state_{policy_name}")
+    env[policy_key] = str(ROOT / policy_name)
     params = StdioServerParameters(command=str(RUST_BIN), args=["--mock"], env=env)
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:

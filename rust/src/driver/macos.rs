@@ -10,24 +10,24 @@ use std::os::raw::{c_char, c_double, c_int};
 
 #[cfg(target_os = "macos")]
 extern "C" {
-    fn handsmcp_free_cstr(ptr: *mut c_char);
-    fn handsmcp_macos_doctor() -> *mut c_char;
-    fn handsmcp_macos_list_apps() -> *mut c_char;
-    fn handsmcp_macos_activate_app(bundle_id: *const c_char) -> *mut c_char;
-    fn handsmcp_macos_launch_app(bundle_id: *const c_char) -> *mut c_char;
-    fn handsmcp_macos_inspect_app(
+    fn apexuse_free_cstr(ptr: *mut c_char);
+    fn apexuse_macos_doctor() -> *mut c_char;
+    fn apexuse_macos_list_apps() -> *mut c_char;
+    fn apexuse_macos_activate_app(bundle_id: *const c_char) -> *mut c_char;
+    fn apexuse_macos_launch_app(bundle_id: *const c_char) -> *mut c_char;
+    fn apexuse_macos_inspect_app(
         bundle_id: *const c_char,
         window_index: c_int,
         max_elements: c_int,
         max_depth: c_int,
     ) -> *mut c_char;
-    fn handsmcp_macos_capture_and_ocr(
+    fn apexuse_macos_capture_and_ocr(
         bundle_id: *const c_char,
         window_index: c_int,
         ocr_mode: c_int,
         encode_png: c_int,
     ) -> *mut c_char;
-    fn handsmcp_macos_render_som(
+    fn apexuse_macos_render_som(
         png_b64_or_cap_id: *const c_char,
         marks_json: *const c_char,
         win_x: c_double,
@@ -35,14 +35,14 @@ extern "C" {
         win_w: c_double,
         win_h: c_double,
     ) -> *mut c_char;
-    fn handsmcp_macos_perform_action(req_json: *const c_char) -> *mut c_char;
-    fn handsmcp_macos_check_point(
+    fn apexuse_macos_perform_action(req_json: *const c_char) -> *mut c_char;
+    fn apexuse_macos_check_point(
         bundle_id: *const c_char,
         x: c_double,
         y: c_double,
     ) -> *mut c_char;
-    fn handsmcp_macos_open_url(bundle_id: *const c_char, url: *const c_char) -> *mut c_char;
-    fn handsmcp_macos_tick();
+    fn apexuse_macos_open_url(bundle_id: *const c_char, url: *const c_char) -> *mut c_char;
+    fn apexuse_macos_tick();
 }
 
 pub struct MacosDriver;
@@ -54,7 +54,7 @@ fn take_json(ptr: *mut c_char) -> Result<JsonValue, DriverError> {
     }
     let text = unsafe {
         let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
-        handsmcp_free_cstr(ptr);
+        apexuse_free_cstr(ptr);
         s
     };
     let val = parse_json(&text).map_err(|e| DriverError::new("native_json_error", e))?;
@@ -89,7 +89,7 @@ fn parse_rect(v: &JsonValue) -> Option<Rect> {
 #[cfg(target_os = "macos")]
 impl OsDriver for MacosDriver {
     fn doctor(&self) -> Result<DoctorStatus, DriverError> {
-        let val = take_json(unsafe { handsmcp_macos_doctor() })?;
+        let val = take_json(unsafe { apexuse_macos_doctor() })?;
         Ok(DoctorStatus {
             os: "macos".into(),
             accessibility: val
@@ -105,7 +105,7 @@ impl OsDriver for MacosDriver {
     }
 
     fn list_apps(&self) -> Result<Vec<RunningApp>, DriverError> {
-        let val = take_json(unsafe { handsmcp_macos_list_apps() })?;
+        let val = take_json(unsafe { apexuse_macos_list_apps() })?;
         let arr = val
             .get("apps")
             .and_then(|v| v.as_array())
@@ -132,13 +132,13 @@ impl OsDriver for MacosDriver {
 
     fn activate_app(&self, bundle_id: &str) -> Result<(), DriverError> {
         let c = to_cstr(bundle_id)?;
-        take_json(unsafe { handsmcp_macos_activate_app(c.as_ptr()) })?;
+        take_json(unsafe { apexuse_macos_activate_app(c.as_ptr()) })?;
         Ok(())
     }
 
     fn launch_app(&self, bundle_id: &str) -> Result<(), DriverError> {
         let c = to_cstr(bundle_id)?;
-        take_json(unsafe { handsmcp_macos_launch_app(c.as_ptr()) })?;
+        take_json(unsafe { apexuse_macos_launch_app(c.as_ptr()) })?;
         Ok(())
     }
 
@@ -152,7 +152,7 @@ impl OsDriver for MacosDriver {
         let c = to_cstr(bundle_id)?;
         let win_idx = window.unwrap_or(-1);
         let val = take_json(unsafe {
-            handsmcp_macos_inspect_app(c.as_ptr(), win_idx, max_elements, max_depth)
+            apexuse_macos_inspect_app(c.as_ptr(), win_idx, max_elements, max_depth)
         })?;
 
         let mut windows = Vec::new();
@@ -271,7 +271,7 @@ impl OsDriver for MacosDriver {
         let c = to_cstr(bundle_id)?;
         let win_idx = window.unwrap_or(-1);
         let val = take_json(unsafe {
-            handsmcp_macos_capture_and_ocr(
+            apexuse_macos_capture_and_ocr(
                 c.as_ptr(),
                 win_idx,
                 ocr_mode.as_int(),
@@ -349,7 +349,7 @@ impl OsDriver for MacosDriver {
         let cb64 = to_cstr(png_b64)?;
         let cmarks = to_cstr(marks_json)?;
         let val = take_json(unsafe {
-            handsmcp_macos_render_som(
+            apexuse_macos_render_som(
                 cb64.as_ptr(),
                 cmarks.as_ptr(),
                 win_frame.x,
@@ -452,7 +452,7 @@ impl OsDriver for MacosDriver {
             }
         };
         let creq = to_cstr(&payload.to_json_string())?;
-        let val = take_json(unsafe { handsmcp_macos_perform_action(creq.as_ptr()) })?;
+        let val = take_json(unsafe { apexuse_macos_perform_action(creq.as_ptr()) })?;
         let method = val
             .get("method")
             .and_then(|v| v.as_str())
@@ -467,20 +467,20 @@ impl OsDriver for MacosDriver {
 
     fn verify_point_safe(&self, bundle_id: &str, x: f64, y: f64) -> Result<bool, DriverError> {
         let c = to_cstr(bundle_id)?;
-        let val = take_json(unsafe { handsmcp_macos_check_point(c.as_ptr(), x, y) })?;
+        let val = take_json(unsafe { apexuse_macos_check_point(c.as_ptr(), x, y) })?;
         Ok(val.get("ok").and_then(|v| v.as_bool()) == Some(true))
     }
 
     fn open_url(&self, bundle_id: &str, url: &str) -> Result<(), DriverError> {
         let cb = to_cstr(bundle_id)?;
         let cu = to_cstr(url)?;
-        take_json(unsafe { handsmcp_macos_open_url(cb.as_ptr(), cu.as_ptr()) })?;
+        take_json(unsafe { apexuse_macos_open_url(cb.as_ptr(), cu.as_ptr()) })?;
         Ok(())
     }
 
     fn tick(&self) {
         unsafe {
-            handsmcp_macos_tick();
+            apexuse_macos_tick();
         }
     }
 }
