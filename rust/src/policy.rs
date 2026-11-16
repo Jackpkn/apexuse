@@ -100,7 +100,6 @@ pub fn contains_secure_marker(content: &str) -> bool {
             || lower.contains("password field")
             || lower.contains("protectedcontent")
             || lower.contains("protected_content")
-            || lower.contains("protected content")
             || sanitized.contains('\u{f79a}')
         {
             return true;
@@ -455,6 +454,9 @@ mod tests {
         assert!(!contains_secure_marker("  [e25] Group \"~/handsmcp/docs • Untracked\""));
         assert!(!contains_secure_marker("  [e26] StaticText value=\"Workspace • Ready\""));
         assert!(!contains_secure_marker("  [e27] ListMarker value=\"• \""));
+        assert!(!contains_secure_marker("  [e28] StaticText value=\"Uses copyright protected content\""));
+        assert!(contains_secure_marker("AXProtectedContent"));
+        assert!(contains_secure_marker("TextField \"protected_content\""));
         assert!(contains_secure_marker("TextField \"••••\""));
         assert!(contains_secure_marker("TextField \"•\""));
         assert!(contains_secure_marker("StaticText value=\"•••\""));
