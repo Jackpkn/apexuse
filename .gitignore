@@ -1,0 +1,15 @@
+.venv/
+runtime/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+.DS_Store
+
+.agents/mcp_config.json
+
+*.egg-info/
+
+.gemini/settings.json
+rust/target/
+/main
