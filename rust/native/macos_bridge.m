@@ -48,8 +48,13 @@ static void ensure_cgs_init(void) {
 // MARK: - Independent Agent Cursor Overlay (never moves user's hardware cursor)
 
 @interface HandsmcpCursorView : NSView
-@property(nonatomic, assign) BOOL clicking;
+@property(nonatomic, assign) double rippleProgress;
 @end
+
+static double ease_out_cubic(double t) {
+  double u = 1.0 - MAX(0.0, MIN(1.0, t));
+  return 1.0 - (u * u * u);
+}
 
 @implementation HandsmcpCursorView
 - (void)drawRect:(NSRect)dirtyRect {
@@ -59,35 +64,94 @@ static void ensure_cgs_init(void) {
   NSGraphicsContext *ctx = [NSGraphicsContext currentContext];
   [ctx saveGraphicsState];
 
-  if (self.clicking) {
-    NSRect ring = NSMakeRect(4, 4, 24, 24);
-    [[NSColor colorWithCalibratedRed:0.06 green:0.78 blue:0.65
-                               alpha:0.35] setFill];
-    [[NSBezierPath bezierPathWithOvalInRect:ring] fill];
-    [[NSColor colorWithCalibratedRed:0.06 green:0.78 blue:0.65
-                               alpha:0.95] setStroke];
-    NSBezierPath *rp = [NSBezierPath bezierPathWithOvalInRect:ring];
-    rp.lineWidth = 2.0;
-    [rp stroke];
+  const CGFloat cx = 44.0;
+  const CGFloat cy = 44.0;
+  double p = self.rippleProgress;
+
+  // Expanding click ripple centered right at the pointer hotspot
+  if (p > 0.0 && p <= 1.0) {
+    double e = ease_out_cubic(p);
+    CGFloat r = 5.0 + 27.0 * e;
+    NSRect outerRect = NSMakeRect(cx - r, cy - r, r * 2.0, r * 2.0);
+    NSBezierPath *ripple = [NSBezierPath bezierPathWithOvalInRect:outerRect];
+    [[NSColor colorWithCalibratedRed:0.05
+                               green:0.65
+                                blue:0.91
+                               alpha:0.22 * (1.0 - p)] setFill];
+    [ripple fill];
+    [[NSColor colorWithCalibratedRed:0.08
+                               green:0.78
+                                blue:0.72
+                               alpha:0.88 * pow(1.0 - p, 1.25)] setStroke];
+    ripple.lineWidth = MAX(0.8, 2.2 - 1.1 * p);
+    [ripple stroke];
+
+    CGFloat dotR = MAX(0.5, 4.0 * (1.0 - p));
+    NSRect dotRect = NSMakeRect(cx - dotR, cy - dotR, dotR * 2.0, dotR * 2.0);
+    [[NSColor colorWithCalibratedRed:0.22
+                               green:0.89
+                                blue:0.84
+                               alpha:0.9 * (1.0 - p)] setFill];
+    [[NSBezierPath bezierPathWithOvalInRect:dotRect] fill];
+  } else {
+    // Subtle ambient tip halo so the agent hotspot reads cleanly on light/dark UIs
+    NSRect haloRect = NSMakeRect(cx - 6.0, cy - 6.0, 12.0, 12.0);
+    [[NSColor colorWithCalibratedRed:0.06
+                               green:0.72
+                                blue:0.86
+                               alpha:0.14] setFill];
+    [[NSBezierPath bezierPathWithOvalInRect:haloRect] fill];
   }
 
-  // Sleek AI pointer arrow anchored near center (16, 16)
-  NSBezierPath *arrow = [NSBezierPath bezierPath];
-  [arrow moveToPoint:NSMakePoint(16, 16)];
-  [arrow lineToPoint:NSMakePoint(16, 2)];
-  [arrow lineToPoint:NSMakePoint(20, 6)];
-  [arrow lineToPoint:NSMakePoint(25, 4)];
-  [arrow lineToPoint:NSMakePoint(27, 6)];
-  [arrow lineToPoint:NSMakePoint(22, 9)];
-  [arrow lineToPoint:NSMakePoint(26, 11)];
-  [arrow closePath];
+  // Subtle physical press scale anchored at tip (cx, cy) during clicks
+  if (p > 0.0 && p < 1.0) {
+    CGFloat s = 1.0 - 0.13 * sin(p * M_PI);
+    NSAffineTransform *xf = [NSAffineTransform transform];
+    [xf translateXBy:cx yBy:cy];
+    [xf scaleBy:s];
+    [xf translateXBy:-cx yBy:-cy];
+    [xf concat];
+  }
 
-  [[NSColor colorWithCalibratedRed:0.06 green:0.78 blue:0.65
-                             alpha:0.96] setFill];
-  [arrow fill];
-  [[NSColor whiteColor] setStroke];
-  arrow.lineWidth = 1.4;
+  // Classic macOS-proportioned slanted pointer with tip anchored cleanly at (cx, cy)
+  NSBezierPath *arrow = [NSBezierPath bezierPath];
+  [arrow moveToPoint:NSMakePoint(cx, cy)];
+  [arrow lineToPoint:NSMakePoint(cx, cy - 21.0)];
+  [arrow lineToPoint:NSMakePoint(cx + 5.2, cy - 16.2)];
+  [arrow lineToPoint:NSMakePoint(cx + 9.1, cy - 24.2)];
+  [arrow lineToPoint:NSMakePoint(cx + 12.2, cy - 22.7)];
+  [arrow lineToPoint:NSMakePoint(cx + 8.4, cy - 14.7)];
+  [arrow lineToPoint:NSMakePoint(cx + 15.2, cy - 14.6)];
+  [arrow closePath];
+  arrow.lineJoinStyle = NSLineJoinStyleRound;
+  arrow.lineCapStyle = NSLineCapStyleRound;
+
+  // Outer crisp white border + soft drop shadow
+  [ctx saveGraphicsState];
+  NSShadow *shadow = [[NSShadow alloc] init];
+  shadow.shadowColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.38];
+  shadow.shadowOffset = NSMakeSize(0.0, -2.5);
+  shadow.shadowBlurRadius = 5.5;
+  [shadow set];
+  [[NSColor colorWithCalibratedWhite:1.0 alpha:0.98] setStroke];
+  arrow.lineWidth = 3.2;
   [arrow stroke];
+  [ctx restoreGraphicsState];
+
+  // Smooth vibrant sky-cyan -> emerald-teal gradient fill inside the pointer
+  [ctx saveGraphicsState];
+  [arrow addClip];
+  NSGradient *grad = [[NSGradient alloc]
+      initWithStartingColor:[NSColor colorWithCalibratedRed:0.05
+                                                      green:0.65
+                                                       blue:0.92
+                                                      alpha:1.0]
+                endingColor:[NSColor colorWithCalibratedRed:0.06
+                                                      green:0.78
+                                                       blue:0.58
+                                                      alpha:1.0]];
+  [grad drawInRect:arrow.bounds angle:-50.0];
+  [ctx restoreGraphicsState];
 
   [ctx restoreGraphicsState];
 }
@@ -117,7 +181,7 @@ static void show_agent_cursor_at(CGPoint cgPt, BOOL isClick) {
                       : (CGFloat)CGDisplayPixelsHigh(CGMainDisplayID());
   if (!gCursorWin) {
     gCursorWin =
-        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 32, 32)
+        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 88, 88)
                                     styleMask:NSWindowStyleMaskBorderless
                                       backing:NSBackingStoreBuffered
                                         defer:NO];
@@ -125,37 +189,56 @@ static void show_agent_cursor_at(CGPoint cgPt, BOOL isClick) {
     gCursorWin.backgroundColor = [NSColor clearColor];
     gCursorWin.ignoresMouseEvents = YES;
     gCursorWin.hasShadow = NO;
+    gCursorWin.alphaValue = 0.0;
     gCursorWin.level = NSScreenSaverWindowLevel;
     gCursorWin.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                     NSWindowCollectionBehaviorTransient;
     gCursorView =
-        [[HandsmcpCursorView alloc] initWithFrame:NSMakeRect(0, 0, 32, 32)];
+        [[HandsmcpCursorView alloc] initWithFrame:NSMakeRect(0, 0, 88, 88)];
     gCursorWin.contentView = gCursorView;
   }
 
+  BOOL wasHidden = !gCursorWin.isVisible || gCursorWin.alphaValue < 0.05;
   CGPoint startPt = gHaveLastAgentPt ? gLastAgentPt : cgPt;
-  int glideSteps = gHaveLastAgentPt ? 5 : 1;
-  gCursorView.clicking = NO;
+  double dist = hypot(cgPt.x - startPt.x, cgPt.y - startPt.y);
+  int glideSteps = (!gHaveLastAgentPt || dist < 3.0)
+                       ? (wasHidden ? 4 : 1)
+                       : MAX(10, MIN(22, (int)round(dist / 36.0) + 8));
+
+  gCursorView.rippleProgress = 0.0;
   [gCursorWin orderFrontRegardless];
 
   for (int i = 1; i <= glideSteps; i++) {
     double t = (double)i / (double)glideSteps;
-    CGFloat x = startPt.x + (cgPt.x - startPt.x) * t;
-    CGFloat y = startPt.y + (cgPt.y - startPt.y) * t;
-    NSPoint origin = NSMakePoint(x - 16.0, mainH - y - 16.0);
+    double e = ease_out_cubic(t);
+    CGFloat x = startPt.x + (cgPt.x - startPt.x) * e;
+    CGFloat y = startPt.y + (cgPt.y - startPt.y) * e;
+    NSPoint origin = NSMakePoint(x - 44.0, mainH - y - 44.0);
     [gCursorWin setFrameOrigin:origin];
+    if (wasHidden) {
+      gCursorWin.alphaValue = MIN(1.0, (double)i / (double)MIN(4, glideSteps));
+    } else if (gCursorWin.alphaValue < 1.0) {
+      gCursorWin.alphaValue = 1.0;
+    }
     [gCursorView setNeedsDisplay:YES];
-    pump_ui_ms(14);
+    [gCursorView displayIfNeeded];
+    pump_ui_ms(8);
   }
+  gCursorWin.alphaValue = 1.0;
   gLastAgentPt = cgPt;
   gHaveLastAgentPt = YES;
 
   if (isClick) {
-    gCursorView.clicking = YES;
+    const int rippleFrames = 11;
+    for (int f = 1; f <= rippleFrames; f++) {
+      gCursorView.rippleProgress = (double)f / (double)rippleFrames;
+      [gCursorView setNeedsDisplay:YES];
+      [gCursorView displayIfNeeded];
+      pump_ui_ms(10);
+    }
+    gCursorView.rippleProgress = 0.0;
     [gCursorView setNeedsDisplay:YES];
-    pump_ui_ms(75);
-    gCursorView.clicking = NO;
-    [gCursorView setNeedsDisplay:YES];
+    [gCursorView displayIfNeeded];
   }
   touch_agent_cursor_ttl();
 }
@@ -164,7 +247,14 @@ static void hide_agent_cursor(void) {
   gCursorExpiresAt = 0;
   if (![NSThread isMainThread] || !gCursorWin)
     return;
+  if (gCursorWin.isVisible && gCursorWin.alphaValue > 0.05) {
+    for (int i = 4; i >= 0; i--) {
+      gCursorWin.alphaValue = (CGFloat)i / 5.0;
+      pump_ui_ms(12);
+    }
+  }
   [gCursorWin orderOut:nil];
+  gCursorWin.alphaValue = 0.0;
   pump_ui_ms(10);
 }
 
