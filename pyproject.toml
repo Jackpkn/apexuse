@@ -1,0 +1,16 @@
+[project]
+name = "handsmcp"
+version = "0.0.0"
+description = "Work-in-progress local computer-use MCP server"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.30,<2", "PyYAML>=6,<7"]
+
+[project.scripts]
+handsmcp = "handsmcp.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest>=9,<10"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
