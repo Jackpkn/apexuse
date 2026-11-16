@@ -13,6 +13,36 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone)]
+struct ActionVerifyOptions {
+    verify_change: bool,
+    max_retries: u8,
+    settle_ms: u64,
+    retry_delay_ms: u64,
+    require_change: bool,
+}
+
+impl Default for ActionVerifyOptions {
+    fn default() -> Self {
+        Self {
+            verify_change: false,
+            max_retries: 0,
+            settle_ms: 220,
+            retry_delay_ms: 250,
+            require_change: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifyTelemetry {
+    verified_change: bool,
+    ax_changed: bool,
+    visual_changed: bool,
+    attempts: u8,
+    retried: u8,
+}
+
 pub struct ToolOutput {
     pub payload: JsonValue,
     pub image_png_b64: Option<String>,
@@ -37,6 +67,7 @@ pub struct Gateway {
     stop_file: PathBuf,
     rate_limiter: RateLimiter,
     confirmations: ConfirmationStore,
+    pending_verify: HashMap<String, ActionVerifyOptions>,
     epoch: u64,
     snapshot_app: Option<String>,
     snapshot_window: Option<i32>,
@@ -70,6 +101,7 @@ impl Gateway {
             stop_file,
             rate_limiter,
             confirmations,
+            pending_verify: HashMap::new(),
             epoch: 0,
             snapshot_app: None,
             snapshot_window: None,
@@ -514,30 +546,16 @@ impl Gateway {
     }
 
     fn resolve_point(&self, args: &JsonValue, ref_key: &str, mark_key: &str, x_key: &str, y_key: &str) -> Result<(f64, f64, bool, String), ToolOutput> {
-        if let Some(mid) = args.get(mark_key).and_then(|v| v.as_str()) {
-            let Some(mark) = self.marks_by_id.get(mid) else {
-                return Err(ToolOutput::json(err_json("stale_ref", "Unknown or stale visual mark ID")));
-            };
-            return Ok((mark.center_x, mark.center_y, mark.prefer_ax, format!("mark {mid} ({} \"{}\")", mark.role, mark.label)));
-        }
-        if let Some(rid) = args.get(ref_key).and_then(|v| v.as_str()) {
-            let Some(el) = self.elements_by_ref.get(rid) else {
-                return Err(ToolOutput::json(err_json("stale_ref", "Unknown or stale element ref")));
-            };
-            let Some(ref f) = el.frame else {
-                return Err(ToolOutput::json(err_json("target_identity_unverified", "Element lacks coordinates")));
-            };
-            let prefer_ax = supports_ax_press(el);
-            let label = if el.label.is_empty() { el.role.clone() } else { el.label.clone() };
-            return Ok((f.x + f.w * 0.5, f.y + f.h * 0.5, prefer_ax, format!("{} '{}' ({rid})", el.role, label)));
-        }
-        if let (Some(x), Some(y)) = (args.get(x_key).and_then(|v| v.as_f64()), args.get(y_key).and_then(|v| v.as_f64())) {
-            if !x.is_finite() || !y.is_finite() || x.abs() > 100000.0 || y.abs() > 100000.0 {
-                return Err(ToolOutput::json(err_json("invalid_argument", "Coordinate out of bounds")));
-            }
-            return Ok((x, y, false, format!("({x:.0}, {y:.0})")));
-        }
-        Err(ToolOutput::json(err_json("invalid_argument", "Missing target ref, mark, or coordinates")))
+        resolve_point_from_maps(
+            args,
+            &self.elements_by_ref,
+            &self.marks_by_id,
+            ref_key,
+            mark_key,
+            x_key,
+            y_key,
+            false,
+        )
     }
 
     fn request_pointer_click(&mut self, action_name: &str, sub_args: &JsonValue, click_count: u8, button: &str, allow_coords: bool) -> ToolOutput {
@@ -551,6 +569,10 @@ impl Gateway {
         if has_coords && self.snapshot_filtered {
             return ToolOutput::json(err_json("invalid_state", "Visual coordinate clicks require an unfiltered snapshot"));
         }
+        let verify_opts = match parse_verify_options(sub_args) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
 
         if sub_args.get("mark").is_none() && !has_coords && sub_args.get("ref").is_some() {
             let rid = sub_args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
@@ -572,7 +594,7 @@ impl Gateway {
                 click_count,
                 button: button.to_string(),
             };
-            return self.dispatch_pending(action_name, pending, &summary);
+            return self.dispatch_pending(action_name, pending, &summary, verify_opts);
         }
 
         let (x, y, prefer_ax, target_desc) = match self.resolve_point(sub_args, "ref", "mark", "x", "y") {
@@ -593,7 +615,7 @@ impl Gateway {
             click_count,
             button: button.to_string(),
         };
-        self.dispatch_pending(action_name, pending, &summary)
+        self.dispatch_pending(action_name, pending, &summary, verify_opts)
     }
 
     fn request_hover(&mut self, sub_args: &JsonValue) -> ToolOutput {
@@ -611,6 +633,7 @@ impl Gateway {
             "hover",
             PendingAction::Hover { epoch: self.epoch, x, y },
             &format!("Hover over {desc} in {app}. Ask the user before confirming."),
+            ActionVerifyOptions::default(),
         )
     }
 
@@ -620,6 +643,10 @@ impl Gateway {
         }
         let Some(app) = self.snapshot_app.clone() else {
             return ToolOutput::json(err_json("stale_ref", "Inspect first"));
+        };
+        let verify_opts = match parse_verify_options(sub_args) {
+            Ok(v) => v,
+            Err(e) => return e,
         };
         let (x1, y1, _, desc1) = match self.resolve_point(sub_args, "from_ref", "from_mark", "x1", "y1") {
             Ok(r) => r,
@@ -639,6 +666,7 @@ impl Gateway {
                 y2,
             },
             &format!("Drag from {desc1} to {desc2} in {app}. Ask the user before confirming."),
+            verify_opts,
         )
     }
 
@@ -813,6 +841,10 @@ impl Gateway {
                     return ToolOutput::json(err_json("invalid_argument", "Provide arguments.ref or arguments.mark"));
                 };
 
+                let verify_opts = match parse_verify_options(sub_args) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
                 let summary = if mode == "insert" {
                     format!("Type {text:?} into {app}. Ask the user before confirming.")
                 } else {
@@ -830,6 +862,7 @@ impl Gateway {
                         click_first,
                     },
                     &summary,
+                    verify_opts,
                 )
             }
             "press_key" => {
@@ -842,6 +875,10 @@ impl Gateway {
                 if self.snapshot_filtered {
                     return ToolOutput::json(err_json("invalid_state", "press_key requires an unfiltered snapshot"));
                 }
+                let verify_opts = match parse_verify_options(sub_args) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
                 let Some(key) = sub_args.get("key").and_then(|v| v.as_str()) else {
                     return ToolOutput::json(err_json("invalid_argument", "Missing arguments.key"));
                 };
@@ -871,6 +908,7 @@ impl Gateway {
                         modifiers: mods,
                     },
                     &summary,
+                    verify_opts,
                 )
             }
             "scroll" => {
@@ -880,28 +918,39 @@ impl Gateway {
                 let Some(app) = self.snapshot_app.clone() else {
                     return ToolOutput::json(err_json("stale_ref", "Inspect an app first"));
                 };
-                if self.snapshot_filtered {
-                    return ToolOutput::json(err_json("invalid_state", "scroll requires an unfiltered snapshot"));
-                }
-                let Some(direction) = sub_args.get("direction").and_then(|v| v.as_str()) else {
-                    return ToolOutput::json(err_json("invalid_argument", "Missing arguments.direction"));
+                let verify_opts = match parse_verify_options(sub_args) {
+                    Ok(v) => v,
+                    Err(e) => return e,
                 };
-                if !matches!(direction, "up" | "down" | "left" | "right") {
-                    return ToolOutput::json(err_json("invalid_argument", "Invalid scroll direction"));
-                }
-                let amount = sub_args.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
-                if !(1..=100).contains(&amount) {
-                    return ToolOutput::json(err_json("invalid_argument", "Scroll amount must be 1..=100"));
-                }
-                let summary = format!("Scroll {direction} {amount} lines in {app}. Ask the user before confirming.");
+                let (direction, amount, target_pt, desc) = match resolve_scroll_args(
+                    sub_args,
+                    &self.elements_by_ref,
+                    &self.marks_by_id,
+                    self.snapshot_filtered,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                let (x, y) = match target_pt {
+                    Some((px, py)) => (Some(px), Some(py)),
+                    None => (None, None),
+                };
+                let summary = if desc.is_empty() {
+                    format!("Scroll {direction} {amount} lines in {app}. Ask the user before confirming.")
+                } else {
+                    format!("Scroll {direction} {amount} lines at {desc} in {app}. Ask the user before confirming.")
+                };
                 self.dispatch_pending(
                     "scroll",
                     PendingAction::Scroll {
                         epoch: self.epoch,
-                        direction: direction.to_string(),
-                        amount: amount as i32,
+                        direction,
+                        amount,
+                        x,
+                        y,
                     },
                     &summary,
+                    verify_opts,
                 )
             }
             "run_actions" => self.handle_run_actions(sub_args),
@@ -916,20 +965,33 @@ impl Gateway {
                 let Some(approved) = self.confirmations.consume(token) else {
                     return ToolOutput::json(err_json("invalid_confirmation", "Invalid or expired confirmation token"));
                 };
-                self.execute_action(approved, "confirmed")
+                let verify_opts = self.pending_verify.remove(token).unwrap_or_default();
+                self.execute_action(approved, "confirmed", verify_opts)
             }
             _ => ToolOutput::json(err_json("not_implemented", "Operation disabled")),
         }
     }
 
-    fn dispatch_pending(&mut self, action_name: &str, action: PendingAction, summary: &str) -> ToolOutput {
+    fn dispatch_pending(
+        &mut self,
+        action_name: &str,
+        action: PendingAction,
+        summary: &str,
+        verify_opts: ActionVerifyOptions,
+    ) -> ToolOutput {
         if !self.settings.require_confirmation {
-            return self.execute_action(action, "direct");
+            return self.execute_action(action, "direct", verify_opts);
         }
         if self.audit.record(action_name, "confirm", "confirmation_required").is_err() {
             return ToolOutput::json(err_json("audit_unavailable", "Audit log write failed"));
         }
         let token = self.confirmations.issue(action);
+        if verify_opts.verify_change {
+            if self.pending_verify.len() > 256 {
+                self.pending_verify.clear();
+            }
+            self.pending_verify.insert(token.clone(), verify_opts);
+        }
         ToolOutput::json(confirmation_json(&token, summary))
     }
 
@@ -1027,7 +1089,137 @@ impl Gateway {
         }
     }
 
-    fn execute_action(&mut self, action: PendingAction, policy_label: &str) -> ToolOutput {
+    fn verify_points_safe(&self, app: &str, pts: &[(f64, f64)]) -> Result<(), ToolOutput> {
+        if !self.driver.supports_fast_point_verify() {
+            return Ok(());
+        }
+        for &(px, py) in pts {
+            match self.driver.verify_point_safe(app, px, py) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(ToolOutput::json(err_json(
+                        "unsafe_target_field",
+                        "Target point became unsafe or left window bounds",
+                    )));
+                }
+                Err(e) => return Err(ToolOutput::json(err_json(&e.code, &e.message))),
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_verify_baseline(&self, app: &str, cached_ax: Option<&str>) -> (Option<String>, Option<String>) {
+        let ax = cached_ax.map(str::to_string).or_else(|| {
+            self.driver.inspect_app(app, None, 150, 12).ok().and_then(|s| {
+                if self.check_frontmost_permitted(&s.frontmost_bundle_id)
+                    && snapshot_redaction_reason(&s).is_none()
+                {
+                    let out = s.render_outline(None);
+                    if !contains_secure_marker(&out) {
+                        return Some(s.comparable_text());
+                    }
+                }
+                None
+            })
+        });
+        let digest = self
+            .driver
+            .capture_and_ocr(app, None, OcrMode::Off, false)
+            .ok()
+            .and_then(|c| c.pixel_digest);
+        (ax, digest)
+    }
+
+    fn capture_verify_after(&self, app: &str) -> Result<(Option<String>, Option<String>), ToolOutput> {
+        let ax = match self.driver.inspect_app(app, None, 150, 12) {
+            Ok(s) => {
+                if !self.check_frontmost_permitted(&s.frontmost_bundle_id) {
+                    return Err(ToolOutput::json(err_json("invalid_app", "Frontmost application is protected")));
+                }
+                if let Some(reason) = snapshot_redaction_reason(&s) {
+                    return Err(ToolOutput::json(err_json("unsafe_or_incomplete_tree", &reason)));
+                }
+                let out = s.render_outline(None);
+                if contains_secure_marker(&out) {
+                    return Err(ToolOutput::json(err_json("unsafe_or_incomplete_tree", "sensitive_text_marker")));
+                }
+                Some(s.comparable_text())
+            }
+            Err(_) => None,
+        };
+        let digest = self
+            .driver
+            .capture_and_ocr(app, None, OcrMode::Off, false)
+            .ok()
+            .and_then(|c| c.pixel_digest);
+        Ok((ax, digest))
+    }
+
+    fn execute_verified_request(
+        &self,
+        app: &str,
+        recheck_fast_points: bool,
+        cached_ax: Option<&str>,
+        safety_pts: &[(f64, f64)],
+        req: &ActionRequest,
+        opts: &ActionVerifyOptions,
+    ) -> Result<(String, Option<VerifyTelemetry>), ToolOutput> {
+        if !opts.verify_change {
+            let res = self
+                .driver
+                .perform_action(req)
+                .map_err(|e| ToolOutput::json(err_json(&e.code, &e.message)))?;
+            return Ok((res.method, None));
+        }
+
+        let (before_ax, before_digest) = self.capture_verify_baseline(app, cached_ax);
+        for attempt in 0..=opts.max_retries {
+            if self.stop_file.exists() {
+                return Err(ToolOutput::json(err_json("panic_stop", "STOP file present")));
+            }
+            if attempt > 0 {
+                thread::sleep(Duration::from_millis(opts.retry_delay_ms));
+                self.driver.tick();
+                if recheck_fast_points {
+                    self.verify_points_safe(app, safety_pts)?;
+                }
+            }
+            let res = self
+                .driver
+                .perform_action(req)
+                .map_err(|e| ToolOutput::json(err_json(&e.code, &e.message)))?;
+            thread::sleep(Duration::from_millis(opts.settle_ms));
+            self.driver.tick();
+
+            let (after_ax, after_digest) = self.capture_verify_after(app)?;
+            let ax_changed = matches!((&before_ax, &after_ax), (Some(b), Some(a)) if b != a);
+            let visual_changed = matches!(
+                (&before_digest, &after_digest),
+                (Some(b), Some(a)) if visual_digest_changed(b, a)
+            );
+            let changed = ax_changed || visual_changed;
+            if changed || attempt == opts.max_retries {
+                return Ok((
+                    res.method,
+                    Some(VerifyTelemetry {
+                        verified_change: changed,
+                        ax_changed,
+                        visual_changed,
+                        attempts: attempt + 1,
+                        retried: attempt,
+                    }),
+                ));
+            }
+        }
+        unreachable!("loop terminates at attempt == max_retries")
+    }
+
+    fn execute_action(
+        &mut self,
+        action: PendingAction,
+        policy_label: &str,
+        verify_opts: ActionVerifyOptions,
+    ) -> ToolOutput {
         let Some(app) = self.snapshot_app.clone() else {
             return ToolOutput::json(err_json("stale_ref", "No active snapshot"));
         };
@@ -1044,39 +1236,33 @@ impl Gateway {
             return ToolOutput::json(err_json("stale_ref", "Snapshot changed before confirmation"));
         }
 
-        let fast_direct = policy_label == "direct" && self.driver.supports_fast_point_verify();
-        if fast_direct {
-            let point_check = match &action {
-                PendingAction::ClickRef { ref_id, .. } => self
+        let safety_pts = match &action {
+            PendingAction::ClickRef { ref_id, .. } => {
+                let Some(pts) = self
                     .elements_by_ref
                     .get(ref_id)
                     .and_then(|el| el.frame.as_ref())
-                    .map(|f| vec![(f.x + f.w * 0.5, f.y + f.h * 0.5)]),
-                PendingAction::VisualClick { x, y, .. }
-                | PendingAction::Hover { x, y, .. }
-                | PendingAction::TypeText { x, y, .. } => Some(vec![(*x, *y)]),
-                PendingAction::Drag { x1, y1, x2, y2, .. } => Some(vec![(*x1, *y1), (*x2, *y2)]),
-                PendingAction::PressKey { .. } | PendingAction::Scroll { .. } => Some(Vec::new()),
-            };
-            let Some(pts) = point_check else {
+                    .map(|f| vec![(f.x + f.w * 0.5, f.y + f.h * 0.5)])
+                else {
+                    self.invalidate_snapshot();
+                    return ToolOutput::json(err_json("stale_ref", "Element ref or frame missing"));
+                };
+                pts
+            }
+            PendingAction::VisualClick { x, y, .. }
+            | PendingAction::Hover { x, y, .. }
+            | PendingAction::TypeText { x, y, .. } => vec![(*x, *y)],
+            PendingAction::Drag { x1, y1, x2, y2, .. } => vec![(*x1, *y1), (*x2, *y2)],
+            PendingAction::PressKey { .. } => Vec::new(),
+            PendingAction::Scroll { x: Some(px), y: Some(py), .. } => vec![(*px, *py)],
+            PendingAction::Scroll { .. } => Vec::new(),
+        };
+
+        let fast_direct = policy_label == "direct" && self.driver.supports_fast_point_verify();
+        if fast_direct {
+            if let Err(err_out) = self.verify_points_safe(&app, &safety_pts) {
                 self.invalidate_snapshot();
-                return ToolOutput::json(err_json("stale_ref", "Element ref or frame missing"));
-            };
-            for (px, py) in pts {
-                match self.driver.verify_point_safe(&app, px, py) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        self.invalidate_snapshot();
-                        return ToolOutput::json(err_json(
-                            "unsafe_target_field",
-                            "Target point became unsafe or left window bounds",
-                        ));
-                    }
-                    Err(e) => {
-                        self.invalidate_snapshot();
-                        return ToolOutput::json(err_json(&e.code, &e.message));
-                    }
-                }
+                return err_out;
             }
         } else {
             let fresh = match self.driver.inspect_app(
@@ -1194,38 +1380,67 @@ impl Gateway {
                 modifiers,
             },
             PendingAction::Scroll {
-                direction, amount, ..
+                direction,
+                amount,
+                x,
+                y,
+                ..
             } => ActionRequest::Scroll {
                 bundle_id: app.clone(),
                 direction,
                 amount,
+                x,
+                y,
             },
         };
 
+        let cached_ax = if self.snapshot_window.is_none() {
+            self.snapshot_comparable.clone()
+        } else {
+            None
+        };
         self.invalidate_snapshot();
-        match self.driver.perform_action(&driver_req) {
-            Ok(res) => ToolOutput::json(JsonValue::object(vec![
-                ("ok", JsonValue::Bool(true)),
-                ("policy", JsonValue::String(policy_label.into())),
-                ("completed", JsonValue::Bool(false)),
-                ("method", JsonValue::String(res.method)),
-                (
-                    "hint",
-                    JsonValue::String(
-                        "Verify the resulting state via inspect_app or visual_inspect.".into(),
-                    ),
-                ),
-            ])),
-            Err(e) => ToolOutput::json(JsonValue::object(vec![
-                ("ok", JsonValue::Bool(false)),
-                ("code", JsonValue::String(e.code)),
-                ("message", JsonValue::String(e.message)),
-                ("completed", JsonValue::Bool(false)),
-                (
-                    "hint",
-                    JsonValue::String("Inspect state before retrying.".into()),
-                ),
-            ])),
+        match self.execute_verified_request(
+            &app,
+            fast_direct,
+            cached_ax.as_deref(),
+            &safety_pts,
+            &driver_req,
+            &verify_opts,
+        ) {
+            Ok((method, telemetry)) => {
+                if verify_opts.require_change && telemetry.is_some_and(|t| !t.verified_change) {
+                    let mut fields = vec![
+                        ("ok", JsonValue::Bool(false)),
+                        ("code", JsonValue::String("no_change_detected".into())),
+                        ("message", JsonValue::String("Action produced no detectable Accessibility or pixel change".into())),
+                        ("policy", JsonValue::String(policy_label.into())),
+                        ("completed", JsonValue::Bool(false)),
+                        ("method", JsonValue::String(method)),
+                    ];
+                    if let Some(t) = telemetry {
+                        append_verify_fields(&mut fields, &t);
+                    }
+                    return ToolOutput::json(JsonValue::object(fields));
+                }
+                let hint = match telemetry {
+                    Some(t) if t.verified_change => "UI change verified via Accessibility or visual digest.",
+                    Some(_) => "No AX or visual change detected after retrying; verify target or inspect state.",
+                    None => "Verify the resulting state via inspect_app or visual_inspect.",
+                };
+                let mut fields = vec![
+                    ("ok", JsonValue::Bool(true)),
+                    ("policy", JsonValue::String(policy_label.into())),
+                    ("completed", JsonValue::Bool(false)),
+                    ("method", JsonValue::String(method)),
+                    ("hint", JsonValue::String(hint.into())),
+                ];
+                if let Some(t) = telemetry {
+                    append_verify_fields(&mut fields, &t);
+                }
+                ToolOutput::json(JsonValue::object(fields))
+            }
+            Err(err_out) => err_out,
         }
     }
 
@@ -1356,6 +1571,10 @@ impl Gateway {
 
         let elements_copy = self.elements_by_ref.clone();
         let marks_copy = self.marks_by_id.clone();
+        let initial_ax = self.snapshot_comparable.clone();
+        let initial_app = self.snapshot_app.clone();
+        let initial_filtered = self.snapshot_filtered;
+        let initial_window_unscoped = self.snapshot_window.is_none();
         let mut step_results = Vec::with_capacity(steps.len());
 
         for (idx, step) in steps.iter().enumerate() {
@@ -1368,38 +1587,49 @@ impl Gateway {
                 return ToolOutput::json(err_json("invalid_argument", &format!("Step {idx} missing action")));
             };
 
-            match act {
-                "sleep_ms" => {
-                    let ms = step.get("ms").and_then(|v| v.as_i64()).unwrap_or(200).clamp(10, 3000) as u64;
-                    thread::sleep(Duration::from_millis(ms));
-                    self.driver.tick();
-                    step_results.push(JsonValue::object(vec![
-                        ("step", JsonValue::Number(idx as f64)),
-                        ("action", JsonValue::String("sleep_ms".into())),
-                        ("ok", JsonValue::Bool(true)),
-                    ]));
+            if act == "sleep_ms" {
+                let ms = step.get("ms").and_then(|v| v.as_i64()).unwrap_or(200).clamp(10, 3000) as u64;
+                thread::sleep(Duration::from_millis(ms));
+                self.driver.tick();
+                step_results.push(JsonValue::object(vec![
+                    ("step", JsonValue::Number(idx as f64)),
+                    ("action", JsonValue::String("sleep_ms".into())),
+                    ("ok", JsonValue::Bool(true)),
+                ]));
+                continue;
+            }
+            if act == "activate_application" {
+                let Some(raw) = step.get("app").and_then(|v| v.as_str()) else {
+                    self.invalidate_snapshot();
+                    return ToolOutput::json(err_json("invalid_argument", &format!("Step {idx} missing app")));
+                };
+                let Some(bundle) = self.resolve_target(raw) else {
+                    self.invalidate_snapshot();
+                    return ToolOutput::json(err_json("invalid_app", "Target is invalid, protected, or not permitted"));
+                };
+                if let Err(e) = self.driver.activate_app(&bundle) {
+                    self.invalidate_snapshot();
+                    return ToolOutput::json(err_json(&e.code, &e.message));
                 }
-                "activate_application" => {
-                    let Some(raw) = step.get("app").and_then(|v| v.as_str()) else {
-                        self.invalidate_snapshot();
-                        return ToolOutput::json(err_json("invalid_argument", &format!("Step {idx} missing app")));
-                    };
-                    let Some(bundle) = self.resolve_target(raw) else {
-                        self.invalidate_snapshot();
-                        return ToolOutput::json(err_json("invalid_app", "Target is invalid, protected, or not permitted"));
-                    };
-                    if let Err(e) = self.driver.activate_app(&bundle) {
-                        self.invalidate_snapshot();
-                        return ToolOutput::json(err_json(&e.code, &e.message));
-                    }
-                    cur_app = bundle.clone();
-                    step_results.push(JsonValue::object(vec![
-                        ("step", JsonValue::Number(idx as f64)),
-                        ("action", JsonValue::String("activate_application".into())),
-                        ("app", JsonValue::String(bundle)),
-                        ("ok", JsonValue::Bool(true)),
-                    ]));
+                cur_app = bundle.clone();
+                step_results.push(JsonValue::object(vec![
+                    ("step", JsonValue::Number(idx as f64)),
+                    ("action", JsonValue::String("activate_application".into())),
+                    ("app", JsonValue::String(bundle)),
+                    ("ok", JsonValue::Bool(true)),
+                ]));
+                continue;
+            }
+
+            let verify_opts = match parse_verify_options(step) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.invalidate_snapshot();
+                    return e;
                 }
+            };
+
+            let (req, safety_pts) = match act {
                 "click" | "double_click" | "right_click" | "hover" => {
                     let (x, y, prefer_ax) = match resolve_batch_point(step, &elements_copy, &marks_copy) {
                         Ok(v) => v,
@@ -1408,17 +1638,6 @@ impl Gateway {
                             return e;
                         }
                     };
-                    match self.driver.verify_point_safe(&cur_app, x, y) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            self.invalidate_snapshot();
-                            return ToolOutput::json(err_json("unsafe_target_field", &format!("Step {idx} target unsafe")));
-                        }
-                        Err(e) => {
-                            self.invalidate_snapshot();
-                            return ToolOutput::json(err_json(&e.code, &e.message));
-                        }
-                    }
                     let req = if act == "hover" {
                         ActionRequest::HoverPoint { bundle_id: cur_app.clone(), x, y }
                     } else {
@@ -1433,18 +1652,51 @@ impl Gateway {
                             button: button.into(),
                         }
                     };
-                    match self.driver.perform_action(&req) {
-                        Ok(res) => step_results.push(JsonValue::object(vec![
-                            ("step", JsonValue::Number(idx as f64)),
-                            ("action", JsonValue::String(act.into())),
-                            ("method", JsonValue::String(res.method)),
-                            ("ok", JsonValue::Bool(true)),
-                        ])),
+                    (req, vec![(x, y)])
+                }
+                "drag" => {
+                    let (x1, y1, _, _) = match resolve_point_from_maps(
+                        step,
+                        &elements_copy,
+                        &marks_copy,
+                        "from_ref",
+                        "from_mark",
+                        "x1",
+                        "y1",
+                        false,
+                    ) {
+                        Ok(v) => v,
                         Err(e) => {
                             self.invalidate_snapshot();
-                            return ToolOutput::json(err_json(&e.code, &e.message));
+                            return e;
                         }
-                    }
+                    };
+                    let (x2, y2, _, _) = match resolve_point_from_maps(
+                        step,
+                        &elements_copy,
+                        &marks_copy,
+                        "to_ref",
+                        "to_mark",
+                        "x2",
+                        "y2",
+                        false,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.invalidate_snapshot();
+                            return e;
+                        }
+                    };
+                    (
+                        ActionRequest::DragPoints {
+                            bundle_id: cur_app.clone(),
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                        },
+                        vec![(x1, y1), (x2, y2)],
+                    )
                 }
                 "type" => {
                     let Some(text) = step.get("text").and_then(|v| v.as_str()) else {
@@ -1468,37 +1720,17 @@ impl Gateway {
                         }
                     };
                     let click_first = step.get("click_first").and_then(|v| v.as_bool()).unwrap_or(true);
-                    match self.driver.verify_point_safe(&cur_app, x, y) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            self.invalidate_snapshot();
-                            return ToolOutput::json(err_json("unsafe_target_field", &format!("Step {idx} target unsafe")));
-                        }
-                        Err(e) => {
-                            self.invalidate_snapshot();
-                            return ToolOutput::json(err_json(&e.code, &e.message));
-                        }
-                    }
-                    let req = ActionRequest::TypePoint {
-                        bundle_id: cur_app.clone(),
-                        x,
-                        y,
-                        text: text.into(),
-                        mode: mode.into(),
-                        click_first,
-                    };
-                    match self.driver.perform_action(&req) {
-                        Ok(res) => step_results.push(JsonValue::object(vec![
-                            ("step", JsonValue::Number(idx as f64)),
-                            ("action", JsonValue::String("type".into())),
-                            ("method", JsonValue::String(res.method)),
-                            ("ok", JsonValue::Bool(true)),
-                        ])),
-                        Err(e) => {
-                            self.invalidate_snapshot();
-                            return ToolOutput::json(err_json(&e.code, &e.message));
-                        }
-                    }
+                    (
+                        ActionRequest::TypePoint {
+                            bundle_id: cur_app.clone(),
+                            x,
+                            y,
+                            text: text.into(),
+                            mode: mode.into(),
+                            click_first,
+                        },
+                        vec![(x, y)],
+                    )
                 }
                 "press_key" => {
                     let Some(key) = step.get("key").and_then(|v| v.as_str()) else {
@@ -1514,60 +1746,101 @@ impl Gateway {
                         self.invalidate_snapshot();
                         return ToolOutput::json(err_json("invalid_argument", "Unsupported key or blocked paste shortcut"));
                     }
-                    let req = ActionRequest::PressKey {
-                        bundle_id: cur_app.clone(),
-                        key: key.into(),
-                        modifiers: mods,
-                    };
-                    match self.driver.perform_action(&req) {
-                        Ok(res) => step_results.push(JsonValue::object(vec![
-                            ("step", JsonValue::Number(idx as f64)),
-                            ("action", JsonValue::String("press_key".into())),
-                            ("method", JsonValue::String(res.method)),
-                            ("ok", JsonValue::Bool(true)),
-                        ])),
-                        Err(e) => {
-                            self.invalidate_snapshot();
-                            return ToolOutput::json(err_json(&e.code, &e.message));
-                        }
-                    }
+                    (
+                        ActionRequest::PressKey {
+                            bundle_id: cur_app.clone(),
+                            key: key.into(),
+                            modifiers: mods,
+                        },
+                        Vec::new(),
+                    )
                 }
                 "scroll" => {
-                    let Some(dir) = step.get("direction").and_then(|v| v.as_str()) else {
-                        self.invalidate_snapshot();
-                        return ToolOutput::json(err_json("invalid_argument", &format!("Step {idx} missing direction")));
-                    };
-                    if !matches!(dir, "up" | "down" | "left" | "right") {
-                        self.invalidate_snapshot();
-                        return ToolOutput::json(err_json("invalid_argument", "Invalid scroll direction"));
-                    }
-                    let amount = step.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
-                    if !(1..=100).contains(&amount) {
-                        self.invalidate_snapshot();
-                        return ToolOutput::json(err_json("invalid_argument", "Scroll amount must be 1..=100"));
-                    }
-                    let req = ActionRequest::Scroll {
-                        bundle_id: cur_app.clone(),
-                        direction: dir.into(),
-                        amount: amount as i32,
-                    };
-                    match self.driver.perform_action(&req) {
-                        Ok(res) => step_results.push(JsonValue::object(vec![
-                            ("step", JsonValue::Number(idx as f64)),
-                            ("action", JsonValue::String("scroll".into())),
-                            ("method", JsonValue::String(res.method)),
-                            ("ok", JsonValue::Bool(true)),
-                        ])),
+                    let (dir, amount, target_pt, _) = match resolve_scroll_args(
+                        step,
+                        &elements_copy,
+                        &marks_copy,
+                        initial_filtered && idx == 0,
+                    ) {
+                        Ok(v) => v,
                         Err(e) => {
                             self.invalidate_snapshot();
-                            return ToolOutput::json(err_json(&e.code, &e.message));
+                            return e;
                         }
-                    }
+                    };
+                    let (x, y, pts) = match target_pt {
+                        Some((px, py)) => (Some(px), Some(py), vec![(px, py)]),
+                        None => (None, None, Vec::new()),
+                    };
+                    (
+                        ActionRequest::Scroll {
+                            bundle_id: cur_app.clone(),
+                            direction: dir,
+                            amount,
+                            x,
+                            y,
+                        },
+                        pts,
+                    )
                 }
                 _ => {
                     self.invalidate_snapshot();
                     return ToolOutput::json(err_json("invalid_argument", &format!("Unsupported batch step action: {act}")));
                 }
+            };
+
+            if let Err(err_out) = self.verify_points_safe(&cur_app, &safety_pts) {
+                self.invalidate_snapshot();
+                return err_out;
+            }
+            let cached_ax = if idx == 0
+                && initial_window_unscoped
+                && initial_app.as_deref() == Some(cur_app.as_str())
+            {
+                initial_ax.as_deref()
+            } else {
+                None
+            };
+            let recheck_fast = self.driver.supports_fast_point_verify();
+            let (method, telemetry) = match self.execute_verified_request(
+                &cur_app,
+                recheck_fast,
+                cached_ax,
+                &safety_pts,
+                &req,
+                &verify_opts,
+            ) {
+                Ok(v) => v,
+                Err(err_out) => {
+                    self.invalidate_snapshot();
+                    return err_out;
+                }
+            };
+            let step_failed_change =
+                verify_opts.require_change && telemetry.is_some_and(|t| !t.verified_change);
+            let mut item = vec![
+                ("step", JsonValue::Number(idx as f64)),
+                ("action", JsonValue::String(act.into())),
+                ("method", JsonValue::String(method)),
+                ("ok", JsonValue::Bool(!step_failed_change)),
+            ];
+            if let Some(t) = telemetry {
+                append_verify_fields(&mut item, &t);
+            }
+            step_results.push(JsonValue::object(item));
+            if step_failed_change {
+                self.invalidate_snapshot();
+                return ToolOutput::json(JsonValue::object(vec![
+                    ("ok", JsonValue::Bool(false)),
+                    ("code", JsonValue::String("no_change_detected".into())),
+                    (
+                        "message",
+                        JsonValue::String(format!("Batch step {idx} ({act}) produced no detectable AX or visual change")),
+                    ),
+                    ("failed_step", JsonValue::Number(idx as f64)),
+                    ("executed", JsonValue::Number(step_results.len() as f64)),
+                    ("results", JsonValue::Array(step_results)),
+                ]));
             }
         }
 
@@ -1881,39 +2154,214 @@ impl Gateway {
     }
 }
 
-fn resolve_batch_point(
-    step: &JsonValue,
+fn parse_verify_options(args: &JsonValue) -> Result<ActionVerifyOptions, ToolOutput> {
+    let require_change = match args.get("require_change") {
+        None | Some(JsonValue::Null) => false,
+        Some(v) => match v.as_bool() {
+            Some(b) => b,
+            None => {
+                return Err(ToolOutput::json(err_json(
+                    "invalid_argument",
+                    "'require_change' must be a boolean",
+                )))
+            }
+        },
+    };
+    let max_retries = match args.get("max_retries") {
+        None | Some(JsonValue::Null) => 0u8,
+        Some(v) => match v.as_i64() {
+            Some(n) if (0..=3).contains(&n) => n as u8,
+            _ => {
+                return Err(ToolOutput::json(err_json(
+                    "invalid_argument",
+                    "'max_retries' must be an integer between 0 and 3",
+                )))
+            }
+        },
+    };
+    let explicit_verify = match args.get("verify_change") {
+        None | Some(JsonValue::Null) => false,
+        Some(v) => match v.as_bool() {
+            Some(b) => b,
+            None => {
+                return Err(ToolOutput::json(err_json(
+                    "invalid_argument",
+                    "'verify_change' must be a boolean",
+                )))
+            }
+        },
+    };
+    let settle_ms = match args.get("settle_ms") {
+        None | Some(JsonValue::Null) => 220,
+        Some(v) => match v.as_i64() {
+            Some(n) if (10..=3000).contains(&n) => n as u64,
+            _ => {
+                return Err(ToolOutput::json(err_json(
+                    "invalid_argument",
+                    "'settle_ms' must be an integer between 10 and 3000",
+                )))
+            }
+        },
+    };
+    let retry_delay_ms = match args.get("retry_delay_ms") {
+        None | Some(JsonValue::Null) => 250,
+        Some(v) => match v.as_i64() {
+            Some(n) if (10..=3000).contains(&n) => n as u64,
+            _ => {
+                return Err(ToolOutput::json(err_json(
+                    "invalid_argument",
+                    "'retry_delay_ms' must be an integer between 10 and 3000",
+                )))
+            }
+        },
+    };
+    Ok(ActionVerifyOptions {
+        verify_change: explicit_verify || max_retries > 0 || require_change,
+        max_retries,
+        settle_ms,
+        retry_delay_ms,
+        require_change,
+    })
+}
+
+fn append_verify_fields(fields: &mut Vec<(&'static str, JsonValue)>, t: &VerifyTelemetry) {
+    fields.push(("verified_change", JsonValue::Bool(t.verified_change)));
+    fields.push(("ax_changed", JsonValue::Bool(t.ax_changed)));
+    fields.push(("visual_changed", JsonValue::Bool(t.visual_changed)));
+    fields.push(("attempts", JsonValue::Number(t.attempts as f64)));
+    fields.push(("retried", JsonValue::Number(t.retried as f64)));
+}
+
+fn decode_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let hex_val = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let hi = hex_val(chunk[0])?;
+        let lo = hex_val(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+fn visual_digest_changed(before: &str, after: &str) -> bool {
+    if before.len() != after.len() {
+        return true;
+    }
+    if before.len() >= 32 {
+        if let (Some(a), Some(b)) = (decode_hex_bytes(before), decode_hex_bytes(after)) {
+            let mut changed_blocks = 0usize;
+            let mut sum_abs = 0u64;
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                let d = x.abs_diff(y);
+                sum_abs += d as u64;
+                if d >= 10 {
+                    changed_blocks += 1;
+                }
+            }
+            let mean_abs = sum_abs as f64 / a.len() as f64;
+            return changed_blocks >= 1 || mean_abs >= 1.5;
+        }
+    }
+    before != after
+}
+
+fn resolve_point_from_maps(
+    args: &JsonValue,
     elements: &HashMap<String, UiElement>,
     marks: &HashMap<String, VisualMark>,
-) -> Result<(f64, f64, bool), ToolOutput> {
-    if let Some(mid) = step.get("mark").and_then(|v| v.as_str()) {
-        let Some(m) = marks.get(mid) else {
-            return Err(ToolOutput::json(err_json("stale_ref", &format!("Unknown visual mark {mid}"))));
+    ref_key: &str,
+    mark_key: &str,
+    x_key: &str,
+    y_key: &str,
+    check_enabled: bool,
+) -> Result<(f64, f64, bool, String), ToolOutput> {
+    if let Some(mid) = args.get(mark_key).and_then(|v| v.as_str()) {
+        let Some(mark) = marks.get(mid) else {
+            return Err(ToolOutput::json(err_json("stale_ref", "Unknown or stale visual mark ID")));
         };
-        return Ok((m.center_x, m.center_y, m.prefer_ax));
+        return Ok((
+            mark.center_x,
+            mark.center_y,
+            mark.prefer_ax,
+            format!("mark {mid} ({} \"{}\")", mark.role, mark.label),
+        ));
     }
-    if let Some(rid) = step.get("ref").and_then(|v| v.as_str()) {
+    if let Some(rid) = args.get(ref_key).and_then(|v| v.as_str()) {
         let Some(el) = elements.get(rid) else {
-            return Err(ToolOutput::json(err_json("stale_ref", &format!("Unknown element ref {rid}"))));
+            return Err(ToolOutput::json(err_json("stale_ref", "Unknown or stale element ref")));
         };
-        if el.enabled == Some(false) {
+        if check_enabled && el.enabled == Some(false) {
             return Err(ToolOutput::json(err_json("not_implemented", "Element is disabled")));
         }
         let Some(ref f) = el.frame else {
             return Err(ToolOutput::json(err_json("target_identity_unverified", "Element lacks coordinates")));
         };
-        return Ok((f.x + f.w * 0.5, f.y + f.h * 0.5, supports_ax_press(el)));
+        let label = if el.label.is_empty() { el.role.clone() } else { el.label.clone() };
+        return Ok((
+            f.x + f.w * 0.5,
+            f.y + f.h * 0.5,
+            supports_ax_press(el),
+            format!("{} '{}' ({rid})", el.role, label),
+        ));
     }
     if let (Some(x), Some(y)) = (
-        step.get("x").and_then(|v| v.as_f64()),
-        step.get("y").and_then(|v| v.as_f64()),
+        args.get(x_key).and_then(|v| v.as_f64()),
+        args.get(y_key).and_then(|v| v.as_f64()),
     ) {
         if !x.is_finite() || !y.is_finite() || x.abs() > 100000.0 || y.abs() > 100000.0 {
             return Err(ToolOutput::json(err_json("invalid_argument", "Coordinate out of bounds")));
         }
-        return Ok((x, y, false));
+        return Ok((x, y, false, format!("({x:.0}, {y:.0})")));
     }
-    Err(ToolOutput::json(err_json("invalid_argument", "Step missing mark, ref, or x/y")))
+    Err(ToolOutput::json(err_json("invalid_argument", "Missing target ref, mark, or coordinates")))
+}
+
+fn resolve_batch_point(
+    step: &JsonValue,
+    elements: &HashMap<String, UiElement>,
+    marks: &HashMap<String, VisualMark>,
+) -> Result<(f64, f64, bool), ToolOutput> {
+    let (x, y, prefer_ax, _) =
+        resolve_point_from_maps(step, elements, marks, "ref", "mark", "x", "y", true)?;
+    Ok((x, y, prefer_ax))
+}
+
+fn resolve_scroll_args(
+    args: &JsonValue,
+    elements: &HashMap<String, UiElement>,
+    marks: &HashMap<String, VisualMark>,
+    snapshot_filtered: bool,
+) -> Result<(String, i32, Option<(f64, f64)>, String), ToolOutput> {
+    let Some(direction) = args.get("direction").and_then(|v| v.as_str()) else {
+        return Err(ToolOutput::json(err_json("invalid_argument", "Missing arguments.direction")));
+    };
+    if !matches!(direction, "up" | "down" | "left" | "right") {
+        return Err(ToolOutput::json(err_json("invalid_argument", "Invalid scroll direction")));
+    }
+    let amount = args.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
+    if !(1..=100).contains(&amount) {
+        return Err(ToolOutput::json(err_json("invalid_argument", "Scroll amount must be 1..=100")));
+    }
+    let has_ref_or_mark = args.get("mark").is_some() || args.get("ref").is_some();
+    let has_coords = args.get("x").is_some() || args.get("y").is_some();
+    if snapshot_filtered && !has_ref_or_mark {
+        return Err(ToolOutput::json(err_json("invalid_state", "scroll requires an unfiltered snapshot")));
+    }
+    if has_ref_or_mark || has_coords {
+        let (x, y, _, desc) =
+            resolve_point_from_maps(args, elements, marks, "ref", "mark", "x", "y", false)?;
+        return Ok((direction.to_string(), amount as i32, Some((x, y)), desc));
+    }
+    Ok((direction.to_string(), amount as i32, None, String::new()))
 }
 
 fn find_recipe_element<'a>(elements: &'a [UiElement], step: &WorkflowStep) -> Option<&'a UiElement> {
@@ -2237,6 +2685,7 @@ impl OsDriver for MockDriver {
             image_height: 64,
             png_base64: encode_solid_png_b64(64, 64),
             capture_id: None,
+            pixel_digest: None,
             ocr_boxes,
         })
     }
@@ -3167,6 +3616,286 @@ mod tests {
         );
         assert_eq!(res.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(res.payload.get("source").and_then(|v| v.as_str()), Some("ax"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn computer_scroll_supports_ref_mark_and_coords_and_blocks_blind_filtered_scroll() {
+        struct ScrollRecordingDriver {
+            log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        impl OsDriver for ScrollRecordingDriver {
+            fn doctor(&self) -> Result<DoctorStatus, crate::driver::DriverError> {
+                MockDriver::new().doctor()
+            }
+            fn list_apps(&self) -> Result<Vec<crate::driver::RunningApp>, crate::driver::DriverError> {
+                MockDriver::new().list_apps()
+            }
+            fn activate_app(&self, b: &str) -> Result<(), crate::driver::DriverError> {
+                MockDriver::new().activate_app(b)
+            }
+            fn launch_app(&self, b: &str) -> Result<(), crate::driver::DriverError> {
+                MockDriver::new().launch_app(b)
+            }
+            fn inspect_app(
+                &self,
+                bundle_id: &str,
+                w: Option<i32>,
+                me: i32,
+                md: i32,
+            ) -> Result<AppSnapshot, crate::driver::DriverError> {
+                MockDriver::new().inspect_app(bundle_id, w, me, md)
+            }
+            fn capture_and_ocr(
+                &self,
+                bundle_id: &str,
+                w: Option<i32>,
+                ocr_mode: OcrMode,
+                encode_png: bool,
+            ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
+                MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_png)
+            }
+            fn render_som_png(&self, b: &str, m: &str, wf: &Rect) -> Result<String, crate::driver::DriverError> {
+                MockDriver::new().render_som_png(b, m, wf)
+            }
+            fn perform_action(&self, req: &ActionRequest) -> Result<crate::driver::ActionResult, crate::driver::DriverError> {
+                self.log.lock().unwrap().push(format!("{req:?}"));
+                MockDriver::new().perform_action(req)
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("handsmcp_gw_scroll_tgt_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut gw = Gateway::new(
+            Box::new(ScrollRecordingDriver { log: log.clone() }),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+
+        let _ = gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("com.apple.calculator".into()))]),
+        );
+        let sc_ref = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("scroll".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("direction", JsonValue::String("down".into())),
+                        ("amount", JsonValue::Number(12.0)),
+                        ("ref", JsonValue::String("e2".into())),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(sc_ref.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let _ = gw.dispatch(
+            "visual_inspect",
+            &JsonValue::object(vec![
+                ("app", JsonValue::String("Calculator".into())),
+                ("ocr", JsonValue::String("off".into())),
+            ]),
+        );
+        let sc_coord = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("scroll".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("direction", JsonValue::String("up".into())),
+                        ("amount", JsonValue::Number(5.0)),
+                        ("x", JsonValue::Number(210.0)),
+                        ("y", JsonValue::Number(240.0)),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(sc_coord.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let _ = gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![
+                ("app", JsonValue::String("com.apple.calculator".into())),
+                ("query", JsonValue::String("7".into())),
+            ]),
+        );
+        let blind_filtered = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("scroll".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("direction", JsonValue::String("down".into())),
+                        ("amount", JsonValue::Number(4.0)),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(
+            blind_filtered.payload.get("code").and_then(|v| v.as_str()),
+            Some("invalid_state")
+        );
+
+        let ref_filtered = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("scroll".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("direction", JsonValue::String("down".into())),
+                        ("amount", JsonValue::Number(4.0)),
+                        ("ref", JsonValue::String("e1".into())),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(ref_filtered.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let entries = log.lock().unwrap();
+        assert!(entries[0].contains("x: Some(230.0), y: Some(340.0)"));
+        assert!(entries[1].contains("x: Some(210.0), y: Some(240.0)"));
+        assert!(entries[2].contains("x: Some(145.0), y: Some(240.0)"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn action_verify_change_and_auto_retry_handles_pixel_and_strict_failure() {
+        struct PixelFlakyDriver {
+            actions: std::sync::atomic::AtomicUsize,
+            succeed_on_attempt: usize,
+        }
+        impl OsDriver for PixelFlakyDriver {
+            fn doctor(&self) -> Result<DoctorStatus, crate::driver::DriverError> {
+                MockDriver::new().doctor()
+            }
+            fn list_apps(&self) -> Result<Vec<crate::driver::RunningApp>, crate::driver::DriverError> {
+                MockDriver::new().list_apps()
+            }
+            fn activate_app(&self, b: &str) -> Result<(), crate::driver::DriverError> {
+                MockDriver::new().activate_app(b)
+            }
+            fn launch_app(&self, b: &str) -> Result<(), crate::driver::DriverError> {
+                MockDriver::new().launch_app(b)
+            }
+            fn inspect_app(
+                &self,
+                bundle_id: &str,
+                w: Option<i32>,
+                me: i32,
+                md: i32,
+            ) -> Result<AppSnapshot, crate::driver::DriverError> {
+                MockDriver::new().inspect_app(bundle_id, w, me, md)
+            }
+            fn capture_and_ocr(
+                &self,
+                bundle_id: &str,
+                w: Option<i32>,
+                ocr_mode: OcrMode,
+                encode_png: bool,
+            ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
+                let mut cap = MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_png)?;
+                let count = self.actions.load(std::sync::atomic::Ordering::SeqCst);
+                let byte = if count >= self.succeed_on_attempt { "ff" } else { "10" };
+                cap.pixel_digest = Some(byte.repeat(256));
+                Ok(cap)
+            }
+            fn render_som_png(&self, b: &str, m: &str, wf: &Rect) -> Result<String, crate::driver::DriverError> {
+                MockDriver::new().render_som_png(b, m, wf)
+            }
+            fn perform_action(&self, req: &ActionRequest) -> Result<crate::driver::ActionResult, crate::driver::DriverError> {
+                self.actions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                MockDriver::new().perform_action(req)
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("handsmcp_gw_verify_retry_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut gw_retry = Gateway::new(
+            Box::new(PixelFlakyDriver {
+                actions: std::sync::atomic::AtomicUsize::new(0),
+                succeed_on_attempt: 2,
+            }),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+        let _ = gw_retry.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("com.apple.calculator".into()))]),
+        );
+        let res = gw_retry.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("ref", JsonValue::String("e1".into())),
+                        ("verify_change", JsonValue::Bool(true)),
+                        ("max_retries", JsonValue::Number(2.0)),
+                        ("settle_ms", JsonValue::Number(10.0)),
+                        ("retry_delay_ms", JsonValue::Number(10.0)),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(res.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(res.payload.get("verified_change").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(res.payload.get("visual_changed").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(res.payload.get("ax_changed").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(res.payload.get("attempts").and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(res.payload.get("retried").and_then(|v| v.as_i64()), Some(1));
+
+        // Strict require_change fails cleanly when neither AX nor pixels ever change
+        let mut gw_strict = Gateway::new(
+            Box::new(PixelFlakyDriver {
+                actions: std::sync::atomic::AtomicUsize::new(0),
+                succeed_on_attempt: 99,
+            }),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+        let _ = gw_strict.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("com.apple.calculator".into()))]),
+        );
+        let batch_fail = gw_strict.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("run_actions".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![(
+                        "steps",
+                        JsonValue::Array(vec![JsonValue::object(vec![
+                            ("action", JsonValue::String("scroll".into())),
+                            ("direction", JsonValue::String("down".into())),
+                            ("amount", JsonValue::Number(5.0)),
+                            ("ref", JsonValue::String("e2".into())),
+                            ("max_retries", JsonValue::Number(1.0)),
+                            ("settle_ms", JsonValue::Number(10.0)),
+                            ("retry_delay_ms", JsonValue::Number(10.0)),
+                            ("require_change", JsonValue::Bool(true)),
+                        ])]),
+                    )]),
+                ),
+            ]),
+        );
+        assert_eq!(batch_fail.payload.get("ok").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            batch_fail.payload.get("code").and_then(|v| v.as_str()),
+            Some("no_change_detected")
+        );
+        assert_eq!(batch_fail.payload.get("failed_step").and_then(|v| v.as_i64()), Some(0));
         let _ = fs::remove_dir_all(&dir);
     }
 }

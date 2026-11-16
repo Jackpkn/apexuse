@@ -891,6 +891,30 @@ static CGImageRef take_cached_capture(NSString *capId) {
   return out;
 }
 
+static NSString *compute_pixel_digest(CGImageRef img) {
+  if (!img)
+    return nil;
+  const size_t grid = 16;
+  uint8_t buf[16 * 16];
+  memset(buf, 0, sizeof(buf));
+  CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
+  if (!cs)
+    return nil;
+  CGContextRef ctx = CGBitmapContextCreate(
+      buf, grid, grid, 8, grid, cs, (CGBitmapInfo)kCGImageAlphaNone);
+  CGColorSpaceRelease(cs);
+  if (!ctx)
+    return nil;
+  CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+  CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)grid, (CGFloat)grid), img);
+  CGContextRelease(ctx);
+  NSMutableString *hex = [NSMutableString stringWithCapacity:grid * grid * 2];
+  for (size_t i = 0; i < grid * grid; i++) {
+    [hex appendFormat:@"%02x", buf[i]];
+  }
+  return hex;
+}
+
 char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
                                      int ocr_mode, int encode_png) {
   if ([NSThread isMainThread])
@@ -1154,6 +1178,7 @@ char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
   }
 
   NSString *capId = store_cached_capture(captured);
+  NSString *pixelDigest = compute_pixel_digest(captured);
   NSString *b64 = encode_png ? png_b64_from_cgimage(captured) : @"";
   NSMutableArray *ocrBoxes = [NSMutableArray array];
 
@@ -1206,6 +1231,7 @@ char *handsmcp_macos_capture_and_ocr(const char *bundle_id, int window_index,
     @"pid" : @(pid),
     @"window_id" : @(capturedWid),
     @"capture_id" : capId ?: @"",
+    @"pixel_digest" : pixelDigest ?: @"",
     @"window_frame" : @{
       @"x" : @(winFrame.origin.x),
       @"y" : @(winFrame.origin.y),
@@ -2380,6 +2406,9 @@ char *handsmcp_macos_perform_action(const char *req_json) {
                      : CGPointZero;
     if (req[@"x"] && req[@"y"]) {
       pt = CGPointMake([req[@"x"] doubleValue], [req[@"y"] doubleValue]);
+      if (!point_in_target_bounds(isDesktop, pid, pt)) {
+        return dup_json(@{@"ok" : @NO, @"code" : @"coordinate_outside_window"});
+      }
       pid_t pTmp = pid;
       CGWindowID hitWid = find_window_at_point(
           isDesktop ? 0 : pid, pt, isDesktop ? &pTmp : NULL, &wf);

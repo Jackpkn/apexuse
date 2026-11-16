@@ -351,6 +351,8 @@ pub enum PendingAction {
         epoch: u64,
         direction: String,
         amount: i32,
+        x: Option<f64>,
+        y: Option<f64>,
     },
 }
 
@@ -505,6 +507,8 @@ mod tests {
             epoch: 1,
             direction: "down".into(),
             amount: 4,
+            x: None,
+            y: None,
         });
         assert!(store.consume(&tok).is_some());
         assert!(store.consume(&tok).is_none());

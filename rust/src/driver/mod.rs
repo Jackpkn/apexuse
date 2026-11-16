@@ -180,6 +180,7 @@ pub struct CaptureResult {
     pub pid: i64,
     pub window_id: u64,
     pub capture_id: Option<String>,
+    pub pixel_digest: Option<String>,
     pub window_frame: Rect,
     pub image_width: usize,
     pub image_height: usize,
@@ -226,6 +227,8 @@ pub enum ActionRequest {
         bundle_id: String,
         direction: String,
         amount: i32,
+        x: Option<f64>,
+        y: Option<f64>,
     },
 }
 

@@ -63,7 +63,7 @@ fn tool_defs() -> Vec<JsonValue> {
         ]),
         JsonValue::object(vec![
             ("name", JsonValue::String("computer".into())),
-            ("description", JsonValue::String("Semantic & Set-of-Mark interaction: action=inspect, click, double_click, right_click, hover (accepts ref, mark, or x/y after unfiltered snapshot), drag (from_ref/from_mark/x1,y1 -> to_ref/to_mark/x2,y2), type (ref or mark), press_key, scroll, run_actions (up to 12 chained steps without intermediate LLM round-trips), wait_for (local AX/OCR poll up to 60s, optional window), or confirm (token).".into())),
+            ("description", JsonValue::String("Semantic & Set-of-Mark interaction: action=inspect, click, double_click, right_click, hover (accepts ref, mark, or x/y after unfiltered snapshot), drag (from_ref/from_mark/x1,y1 -> to_ref/to_mark/x2,y2), type (ref or mark), press_key, scroll (direction, amount, optional target ref/mark/x,y), run_actions (up to 12 chained steps without intermediate LLM round-trips), wait_for (local AX/OCR poll up to 60s, optional window), or confirm (token). Actions & steps support optional verify_change, max_retries (0..=3), settle_ms, retry_delay_ms, and require_change.".into())),
             (
                 "inputSchema",
                 JsonValue::object(vec![
@@ -87,7 +87,7 @@ fn tool_defs() -> Vec<JsonValue> {
         ]),
         JsonValue::object(vec![
             ("name", JsonValue::String("desktop".into())),
-            ("description", JsonValue::String("Desktop-level operations: action=list_applications, launch_application, activate_application, open_url (instant http/https URL open in permitted browser/app), visual_click, double_click, right_click, hover, or drag (using mark, ref, or x/y coordinates).".into())),
+            ("description", JsonValue::String("Desktop-level operations: action=list_applications, launch_application, activate_application, open_url (instant http/https URL open in permitted browser/app), visual_click, double_click, right_click, hover, or drag (using mark, ref, or x/y coordinates; supports optional verify_change, max_retries, settle_ms, retry_delay_ms, require_change).".into())),
             (
                 "inputSchema",
                 JsonValue::object(vec![

@@ -316,12 +316,18 @@ impl OsDriver for MacosDriver {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let pixel_digest = val
+            .get("pixel_digest")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         Ok(CaptureResult {
             bundle_id: cap_bundle,
             frontmost_bundle_id: cap_front,
             pid: val.get("pid").and_then(|v| v.as_i64()).unwrap_or(0),
             window_id: val.get("window_id").and_then(|v| v.as_i64()).unwrap_or(0) as u64,
             capture_id,
+            pixel_digest,
             window_frame: wf,
             image_width: val.get("image_width").and_then(|v| v.as_i64()).unwrap_or(0) as usize,
             image_height: val.get("image_height").and_then(|v| v.as_i64()).unwrap_or(0) as usize,
@@ -429,12 +435,21 @@ impl OsDriver for MacosDriver {
                 bundle_id,
                 direction,
                 amount,
-            } => JsonValue::object(vec![
-                ("kind", JsonValue::String("scroll".into())),
-                ("bundle_id", JsonValue::String(bundle_id.clone())),
-                ("direction", JsonValue::String(direction.clone())),
-                ("amount", JsonValue::Number(*amount as f64)),
-            ]),
+                x,
+                y,
+            } => {
+                let mut fields = vec![
+                    ("kind", JsonValue::String("scroll".into())),
+                    ("bundle_id", JsonValue::String(bundle_id.clone())),
+                    ("direction", JsonValue::String(direction.clone())),
+                    ("amount", JsonValue::Number(*amount as f64)),
+                ];
+                if let (Some(px), Some(py)) = (x, y) {
+                    fields.push(("x", JsonValue::Number(*px)));
+                    fields.push(("y", JsonValue::Number(*py)));
+                }
+                JsonValue::object(fields)
+            }
         };
         let creq = to_cstr(&payload.to_json_string())?;
         let val = take_json(unsafe { handsmcp_macos_perform_action(creq.as_ptr()) })?;
