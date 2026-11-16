@@ -1,0 +1,9 @@
+# Current architecture
+
+An MCP client starts the Python `handsmcp` process over stdio. The server starts one pinned Munim child over stdio using the official MCP SDK. There is no network listener or model inference in handsmcp.
+
+The gateway serializes calls within a process and takes a cooperative file lock across handsmcp processes. A shared generation counter invalidates pending confirmations after another cooperating server sends input. Inspect calls obtain a compact Munim accessibility outline. The current implementation inspects only explicitly allowlisted bundle IDs (TextEdit and Calculator by default); input is limited to those two Apple apps at their system paths. Inventory returns allowlisted bundle IDs and PIDs without app names or window titles; custom app bundle IDs are app-declared, not authenticated signatures; it suppresses a response when known secure-field markers occur. This text-based check is not a complete secure-field guarantee.
+
+Calculator button clicks and printable TextEdit text require a token tied to the current snapshot. On confirmation the gateway re-reads the target and compares its rendered state before issuing a single input. This is a conservative stale-state check, not an atomic operating-system identity check: a change by another app or person can race the action. The returned action is marked completion unconfirmed; the caller must inspect the state. An unsuccessful transport after input is reported as uncertain, not safe to retry.
+
+`policy.yaml` controls the currently supported modes, in-process request rate and token TTL. The server reads it at startup. Audit records contain only allowlisted action, decision and event codes, never typed text. A STOP file blocks calls. The confirmation token is held by the requesting MCP client; as required by the brief, the agent must ask the user and must not confirm on its own. The server alone cannot enforce the human step.
