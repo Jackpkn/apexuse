@@ -1,11 +1,15 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
+#[cfg(target_os = "macos")]
 use super::{
     ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError, OcrBox,
     OcrMode, OsDriver, Rect, RunningApp, UiElement, WindowMeta,
 };
+#[cfg(target_os = "macos")]
 use crate::json::{parse_json, JsonValue};
+#[cfg(target_os = "macos")]
 use std::ffi::{CStr, CString};
+#[cfg(target_os = "macos")]
 use std::os::raw::{c_char, c_double, c_int};
 
 #[cfg(target_os = "macos")]
@@ -77,6 +81,7 @@ fn to_cstr(s: &str) -> Result<CString, DriverError> {
     CString::new(s).map_err(|_| DriverError::new("invalid_argument", "Unexpected NUL byte"))
 }
 
+#[cfg(target_os = "macos")]
 fn parse_rect(v: &JsonValue) -> Option<Rect> {
     Some(Rect {
         x: v.get("x")?.as_f64()?,

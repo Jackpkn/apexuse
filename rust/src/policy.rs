@@ -43,6 +43,39 @@ pub fn valid_bundle_id(bundle: &str) -> bool {
     })
 }
 
+/// Validates application identifiers across macOS bundle IDs, Windows executables/AUMIDs,
+/// Linux desktop IDs / process names, and explicit `pid:<N>` targets.
+pub fn valid_app_id(app: &str) -> bool {
+    if app.is_empty() || app.len() > 200 || is_protected_app(app) || app.eq_ignore_ascii_case("desktop") {
+        return false;
+    }
+    if valid_bundle_id(app) {
+        return true;
+    }
+    if let Some(pid_str) = app.strip_prefix("pid:") {
+        return !pid_str.is_empty()
+            && pid_str.chars().all(|c| c.is_ascii_digit())
+            && pid_str.parse::<i64>().map(|p| p > 0).unwrap_or(false);
+    }
+    if let Some((pkg, entry)) = app.split_once('!') {
+        let ok_seg = |s: &str| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        };
+        return ok_seg(pkg) && ok_seg(entry) && pkg.contains('.');
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut chars = app.chars();
+        if let Some(first) = chars.next() {
+            return first.is_ascii_alphanumeric()
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        }
+    }
+    false
+}
+
 fn extract_outline_role(trimmed_line: &str) -> Option<&str> {
     let after_ref = if trimmed_line.starts_with("[e") {
         let idx = trimmed_line.find("] ")?;
@@ -155,7 +188,7 @@ impl Default for PolicySettings {
 
 impl PolicySettings {
     pub fn permits_app(&self, bundle: &str) -> bool {
-        valid_bundle_id(bundle)
+        valid_app_id(bundle)
             && self
                 .allowed_apps
                 .iter()
@@ -222,8 +255,8 @@ impl PolicySettings {
                         return Err("too many allowed_apps".into());
                     }
                     for item in &list {
-                        if item != "*" && !valid_bundle_id(item) {
-                            return Err(format!("invalid or protected bundle id: {item}"));
+                        if item != "*" && !valid_app_id(item) {
+                            return Err(format!("invalid or protected app id: {item}"));
                         }
                     }
                     settings.allowed_apps = list;
@@ -445,6 +478,12 @@ mod tests {
         assert!(valid_bundle_id("com.apple.TextEdit"));
         assert!(valid_bundle_id("com.google.Chrome"));
         assert!(!valid_bundle_id("Calculator"));
+        assert!(valid_app_id("chrome.exe"));
+        assert!(valid_app_id("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"));
+        assert!(valid_app_id("pid:4242"));
+        assert!(!valid_app_id("com.agilebits.onepassword7"));
+        assert!(!valid_app_id("keepass"));
+        assert!(!valid_app_id("/usr/bin/bash"));
         assert!(!valid_bundle_id("com.agilebits.onepassword7"));
         assert!(!valid_bundle_id("com.bank.app"));
         assert!(!valid_bundle_id("com.example.keychain"));

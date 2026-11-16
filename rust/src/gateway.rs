@@ -4,7 +4,7 @@ use crate::driver::{
 use crate::json::JsonValue;
 use crate::memory::{WorkflowMemory, WorkflowStep};
 use crate::policy::{
-    contains_secure_marker, valid_bundle_id, AuditLog, ConfirmationStore, Mode, PendingAction,
+    contains_secure_marker, valid_app_id, AuditLog, ConfirmationStore, Mode, PendingAction,
     PolicySettings, RateLimiter,
 };
 use crate::som::{format_mark_index, fuse_marks, supports_ax_press, VisualMark};
@@ -1518,8 +1518,8 @@ impl Gateway {
                 let Some(raw_app) = args.get("app").and_then(|v| v.as_str()) else {
                     return ToolOutput::json(err_json("invalid_argument", "Missing 'app'"));
                 };
-                if !valid_bundle_id(raw_app) {
-                    return ToolOutput::json(err_json("invalid_app", "Invalid bundle ID"));
+                if !valid_app_id(raw_app) {
+                    return ToolOutput::json(err_json("invalid_app", "Invalid app ID"));
                 }
                 match self.memory.clear_app(raw_app) {
                     Ok(removed) => ToolOutput::json(JsonValue::object(vec![
@@ -2407,7 +2407,7 @@ fn valid_key_request(key: &str, mods: &[String]) -> bool {
         "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
         "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20",
     ];
-    const ALLOWED_MODS: &[&str] = &["cmd", "ctrl", "alt", "shift"];
+    const ALLOWED_MODS: &[&str] = &["cmd", "ctrl", "alt", "shift", "super", "win", "meta"];
     if mods.iter().any(|m| !ALLOWED_MODS.contains(&m.as_str())) {
         return false;
     }
@@ -2441,87 +2441,19 @@ fn confirmation_json(token: &str, summary: &str) -> JsonValue {
 
 /// Pure-Rust minimal RGBA PNG encoder for test fixtures and headless verification.
 pub fn encode_solid_png_b64(w: usize, h: usize) -> String {
-    let mut raw = Vec::with_capacity(h * (1 + w * 4));
+    let mut rgba = Vec::with_capacity(w * h * 4);
     for y in 0..h {
-        raw.push(0);
         for x in 0..w {
             let r = ((x * 2) % 255) as u8;
             let g = ((y * 2) % 255) as u8;
-            raw.extend_from_slice(&[r, g, 180, 255]);
+            rgba.extend_from_slice(&[r, g, 180, 255]);
         }
     }
-    let mut zlib = Vec::with_capacity(raw.len() + 64);
-    zlib.extend_from_slice(&[0x78, 0x01]);
-    let mut pos = 0;
-    while pos < raw.len() {
-        let chunk = (raw.len() - pos).min(65535);
-        let is_last = if pos + chunk == raw.len() { 1u8 } else { 0u8 };
-        zlib.push(is_last);
-        zlib.extend_from_slice(&(chunk as u16).to_le_bytes());
-        zlib.extend_from_slice(&(!(chunk as u16)).to_le_bytes());
-        zlib.extend_from_slice(&raw[pos..pos + chunk]);
-        pos += chunk;
-    }
-    let adler = adler32(&raw);
-    zlib.extend_from_slice(&adler.to_be_bytes());
-
-    let mut png = Vec::new();
-    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&(w as u32).to_be_bytes());
-    ihdr.extend_from_slice(&(h as u32).to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-    push_png_chunk(&mut png, b"IHDR", &ihdr);
-    push_png_chunk(&mut png, b"IDAT", &zlib);
-    push_png_chunk(&mut png, b"IEND", &[]);
-    base64_encode(&png)
-}
-
-fn push_png_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(tag);
-    out.extend_from_slice(data);
-    let mut crc_in = Vec::with_capacity(4 + data.len());
-    crc_in.extend_from_slice(tag);
-    crc_in.extend_from_slice(data);
-    out.extend_from_slice(&crc32(&crc_in).to_be_bytes());
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}
-
-fn adler32(data: &[u8]) -> u32 {
-    let (mut a, mut b) = (1u32, 0u32);
-    for &byte in data {
-        a = (a + byte as u32) % 65521;
-        b = (b + a) % 65521;
-    }
-    (b << 16) | a
+    crate::som_png::encode_rgba_png_b64(w, h, &rgba)
 }
 
 pub fn base64_encode(bytes: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(T[((n >> 18) & 63) as usize] as char);
-        out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
-    }
-    out
+    crate::som_png::base64_encode(bytes)
 }
 
 /// Deterministic mock driver used by Rust unit tests and `--mock` MCP smoke tests.

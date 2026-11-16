@@ -5,3 +5,4 @@ pub mod mcp;
 pub mod memory;
 pub mod policy;
 pub mod som;
+pub mod som_png;
