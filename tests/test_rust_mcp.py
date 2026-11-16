@@ -189,6 +189,27 @@ async def test_rust_mcp_direct_policy_executes_without_confirmation_loop(tmp_pat
             )
             assert coord_click.structuredContent["ok"] is True
 
+            await session.call_tool("inspect_app", {"app": "Calculator"})
+            targeted_scroll = await session.call_tool(
+                "computer",
+                {
+                    "action": "scroll",
+                    "arguments": {
+                        "direction": "down",
+                        "amount": 10,
+                        "ref": "e2",
+                        "verify_change": True,
+                        "max_retries": 1,
+                        "settle_ms": 10,
+                        "retry_delay_ms": 10,
+                    },
+                },
+            )
+            assert targeted_scroll.structuredContent["ok"] is True
+            assert targeted_scroll.structuredContent["attempts"] == 2
+            assert targeted_scroll.structuredContent["retried"] == 1
+            assert targeted_scroll.structuredContent["verified_change"] is False
+
             # Executable workflow_memory replay with step_args
             rec = await session.call_tool(
                 "workflow_memory",
