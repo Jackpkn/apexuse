@@ -1,0 +1,6 @@
+# Restart the server after editing. Use exact bundle IDs or "*" for unrestricted app control.
+mode: normal # normal | read_only | dry_run
+confirmation: direct # direct | required
+rate_limit_per_minute: 1200
+confirmation_ttl_seconds: 120
+allowed_apps: ["*"] # all non-protected bundle IDs may be controlled without confirmation loops
