@@ -3,7 +3,7 @@
   "name": "io.github.Jackpkn/apexuse",
   "title": "ApexUse — Computer Use MCP Server",
   "description": "Computer Use MCP server for AI agents (macOS, Windows & Linux) in Rust combining native Accessibility, Set-of-Mark visual grounding, OCR, batched actions, and workflow memory.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "repository": {
     "url": "https://github.com/Jackpkn/apexuse",
     "source": "github"
@@ -12,7 +12,7 @@
     {
       "registryType": "cargo",
       "identifier": "apexuse-mcp",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "transport": {
         "type": "stdio"
       }

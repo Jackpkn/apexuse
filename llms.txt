@@ -5,6 +5,7 @@
 ## Repository & Links
 
 - Source: https://github.com/Jackpkn/apexuse
+- Crates.io: https://crates.io/crates/apexuse-mcp
 - README: https://github.com/Jackpkn/apexuse/blob/main/README.md
 - Agent Config Guide: https://github.com/Jackpkn/apexuse/blob/main/agent-configs/README.md
 - Agent Skill: https://github.com/Jackpkn/apexuse/blob/main/.agents/skills/apexuse/SKILL.md
@@ -29,6 +30,7 @@
 ## Build & Verify
 
 ```sh
+cargo install apexuse-mcp
 cargo build --release --manifest-path rust/Cargo.toml
 cargo test --manifest-path rust/Cargo.toml
 ./rust/target/release/apexuse-mcp doctor

@@ -1,6 +1,6 @@
 [project]
 name = "apexuse-tests"
-version = "0.2.0"
+version = "0.2.1"
 description = "End-to-end MCP client test harness for ApexUse"
 requires-python = ">=3.11"
 dependencies = ["mcp>=1.30,<2"]

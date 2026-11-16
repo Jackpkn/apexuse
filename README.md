@@ -1,6 +1,7 @@
 # ApexUse — Computer Use MCP Server for AI Agents (macOS, Windows & Linux)
 
 [![CI](https://github.com/Jackpkn/apexuse/actions/workflows/ci.yml/badge.svg)](https://github.com/Jackpkn/apexuse/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/apexuse-mcp.svg)](https://crates.io/crates/apexuse-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Rust Zero Dependencies](https://img.shields.io/badge/Rust-0%20external%20crates-orange.svg)](./rust/Cargo.toml)
 [![MCP](https://img.shields.io/badge/MCP-stdio%20server-teal.svg)](./server.json)
@@ -39,10 +40,10 @@ Zero external LLM keys. Zero external Rust crate dependencies. Zero cloud relay.
 
 ### 1. Install or build from source
 
-Download prebuilt binaries for **macOS (`arm64`)**, **Linux (`x86_64`)**, or **Windows (`x86_64`)** from [GitHub Releases](https://github.com/Jackpkn/apexuse/releases), install via Cargo:
+Download prebuilt binaries for **macOS (`arm64`)**, **Linux (`x86_64`)**, or **Windows (`x86_64`)** from [GitHub Releases](https://github.com/Jackpkn/apexuse/releases), or install directly from [crates.io](https://crates.io/crates/apexuse-mcp):
 
 ```sh
-cargo install --git https://github.com/Jackpkn/apexuse apexuse-mcp
+cargo install apexuse-mcp
 ```
 
 Or clone and build directly (requires only the Rust toolchain, plus Xcode Command Line Tools on macOS):
@@ -197,3 +198,8 @@ cargo test --manifest-path rust/Cargo.toml
 │       └── som_png.rs               # Pure-Rust PNG codec, inflate, pixel digest & SoM renderer
 └── tests/test_rust_mcp.py           # End-to-end MCP stdio integration tests
 ```
+
+## Registry & License
+
+- MIT License — see [LICENSE](./LICENSE)
+- Official MCP Registry: mcp-name: io.github.Jackpkn/apexuse
