@@ -214,6 +214,11 @@ impl OsDriver for MacosDriver {
                         .unwrap_or("")
                         .to_string(),
                     value: e.get("value").and_then(|v| v.as_str()).map(str::to_string),
+                    url: e
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
                     window: e.get("window").and_then(|v| v.as_i64()).unwrap_or(0) as usize,
                     depth: e.get("depth").and_then(|v| v.as_i64()).unwrap_or(0) as usize,
                     interactive: e

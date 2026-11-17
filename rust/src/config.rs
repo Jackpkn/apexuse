@@ -64,13 +64,31 @@ impl Default for TimingConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotConfig {
     pub reuse_form_refs: bool,
+    pub ax_diff: bool,
+    pub include_bounds: bool,
 }
 
 impl Default for SnapshotConfig {
     fn default() -> Self {
         Self {
             reuse_form_refs: true,
+            ax_diff: true,
+            include_bounds: false,
         }
+    }
+}
+
+const SNAPSHOT_BOOL_KEYS: [(&str, &str); 3] = [
+    ("reuse_form_refs", "snapshot.reuse_form_refs"),
+    ("ax_diff", "snapshot.ax_diff"),
+    ("include_bounds", "snapshot.include_bounds"),
+];
+
+fn parse_bool_flag(key: &str, val: &str) -> Result<bool, String> {
+    match val.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => Err(format!("invalid boolean for {key}: '{val}'")),
     }
 }
 
@@ -184,18 +202,22 @@ impl AppConfig {
             let s_obj = snap_val
                 .as_object()
                 .ok_or_else(|| "field 'snapshot' must be an object".to_string())?;
-            if let Some(v) = s_obj.get("reuse_form_refs") {
-                let b = v
-                    .as_bool()
-                    .ok_or_else(|| "snapshot.reuse_form_refs must be a boolean".to_string())?;
-                config.set_key("snapshot.reuse_form_refs", if b { "true" } else { "false" })?;
+            for &(short_key, full_key) in &SNAPSHOT_BOOL_KEYS {
+                if let Some(v) = s_obj.get(short_key) {
+                    let b = v
+                        .as_bool()
+                        .ok_or_else(|| format!("{full_key} must be a boolean"))?;
+                    config.set_key(full_key, if b { "true" } else { "false" })?;
+                }
             }
         }
-        if let Some(v) = map.get("snapshot.reuse_form_refs") {
-            let b = v
-                .as_bool()
-                .ok_or_else(|| "snapshot.reuse_form_refs must be a boolean".to_string())?;
-            config.set_key("snapshot.reuse_form_refs", if b { "true" } else { "false" })?;
+        for &(_, full_key) in &SNAPSHOT_BOOL_KEYS {
+            if let Some(v) = map.get(full_key) {
+                let b = v
+                    .as_bool()
+                    .ok_or_else(|| format!("{full_key} must be a boolean"))?;
+                config.set_key(full_key, if b { "true" } else { "false" })?;
+            }
         }
 
         Ok(config)
@@ -239,6 +261,14 @@ impl AppConfig {
         Ok(())
     }
 
+    fn snapshot_json(&self) -> JsonValue {
+        JsonValue::object(vec![
+            ("reuse_form_refs", JsonValue::Bool(self.snapshot.reuse_form_refs)),
+            ("ax_diff", JsonValue::Bool(self.snapshot.ax_diff)),
+            ("include_bounds", JsonValue::Bool(self.snapshot.include_bounds)),
+        ])
+    }
+
     pub fn to_json(&self) -> JsonValue {
         JsonValue::object(vec![
             (
@@ -257,12 +287,7 @@ impl AppConfig {
                     ("key_delay_us", JsonValue::Number(self.timing.key_delay_us as f64)),
                 ]),
             ),
-            (
-                "snapshot",
-                JsonValue::object(vec![
-                    ("reuse_form_refs", JsonValue::Bool(self.snapshot.reuse_form_refs)),
-                ]),
-            ),
+            ("snapshot", self.snapshot_json()),
         ])
     }
 
@@ -275,6 +300,8 @@ impl AppConfig {
             "timing.poll_interval_ms" => Ok(JsonValue::Number(self.timing.poll_interval_ms as f64)),
             "timing.key_delay_us" => Ok(JsonValue::Number(self.timing.key_delay_us as f64)),
             "snapshot.reuse_form_refs" => Ok(JsonValue::Bool(self.snapshot.reuse_form_refs)),
+            "snapshot.ax_diff" => Ok(JsonValue::Bool(self.snapshot.ax_diff)),
+            "snapshot.include_bounds" => Ok(JsonValue::Bool(self.snapshot.include_bounds)),
             "image" => Ok(JsonValue::object(vec![
                 ("format", JsonValue::String(self.image.format.as_str().to_string())),
                 ("quality", JsonValue::Number(self.image.quality as f64)),
@@ -285,9 +312,7 @@ impl AppConfig {
                 ("poll_interval_ms", JsonValue::Number(self.timing.poll_interval_ms as f64)),
                 ("key_delay_us", JsonValue::Number(self.timing.key_delay_us as f64)),
             ])),
-            "snapshot" => Ok(JsonValue::object(vec![
-                ("reuse_form_refs", JsonValue::Bool(self.snapshot.reuse_form_refs)),
-            ])),
+            "snapshot" => Ok(self.snapshot_json()),
             _ => Err(format!("unknown config key: {key}")),
         }
     }
@@ -349,11 +374,15 @@ impl AppConfig {
                 }
                 self.timing.key_delay_us = us;
             }
-            "snapshot.reuse_form_refs" => match val.to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" => self.snapshot.reuse_form_refs = true,
-                "false" | "0" | "no" => self.snapshot.reuse_form_refs = false,
-                _ => return Err(format!("invalid boolean for snapshot.reuse_form_refs: '{val}'")),
-            },
+            "snapshot.reuse_form_refs" => {
+                self.snapshot.reuse_form_refs = parse_bool_flag(key, val)?;
+            }
+            "snapshot.ax_diff" => {
+                self.snapshot.ax_diff = parse_bool_flag(key, val)?;
+            }
+            "snapshot.include_bounds" => {
+                self.snapshot.include_bounds = parse_bool_flag(key, val)?;
+            }
             _ => return Err(format!("unknown config key: {key}")),
         }
         Ok(())
@@ -397,6 +426,8 @@ mod tests {
         assert_eq!(cfg.timing.poll_interval_ms, 30);
         assert_eq!(cfg.timing.key_delay_us, 500);
         assert_eq!(cfg.snapshot.reuse_form_refs, true);
+        assert_eq!(cfg.snapshot.ax_diff, true);
+        assert_eq!(cfg.snapshot.include_bounds, false);
     }
 
     #[test]
@@ -445,6 +476,24 @@ mod tests {
         assert_eq!(loaded.timing.poll_interval_ms, 30);
         assert_eq!(loaded.timing.key_delay_us, 500);
         assert_eq!(loaded.snapshot.reuse_form_refs, true);
+        assert_eq!(loaded.snapshot.ax_diff, true);
+        assert_eq!(loaded.snapshot.include_bounds, false);
+
+        // Partial snapshot object preserves defaults for omitted keys
+        let partial_snap = dir.join("partial_snap.json");
+        fs::write(
+            &partial_snap,
+            r#"{
+                "snapshot": {
+                    "reuse_form_refs": false
+                }
+            }"#,
+        )
+        .unwrap();
+        let loaded_snap = AppConfig::load_or_default(&partial_snap).expect("load should succeed");
+        assert_eq!(loaded_snap.snapshot.reuse_form_refs, false);
+        assert_eq!(loaded_snap.snapshot.ax_diff, true);
+        assert_eq!(loaded_snap.snapshot.include_bounds, false);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -491,10 +540,29 @@ mod tests {
             Some(false)
         );
 
+        cfg.set_key("snapshot.ax_diff", "false").unwrap();
+        assert_eq!(cfg.snapshot.ax_diff, false);
+        assert_eq!(cfg.get_key("snapshot.ax_diff").unwrap().as_bool(), Some(false));
+        cfg.set_key("snapshot.ax_diff", "yes").unwrap();
+        assert_eq!(cfg.snapshot.ax_diff, true);
+
+        cfg.set_key("snapshot.include_bounds", "true").unwrap();
+        assert_eq!(cfg.snapshot.include_bounds, true);
+        assert_eq!(
+            cfg.get_key("snapshot.include_bounds").unwrap().as_bool(),
+            Some(true)
+        );
+        cfg.set_key("snapshot.include_bounds", "0").unwrap();
+        assert_eq!(cfg.snapshot.include_bounds, false);
+
         // Subtree queries
         assert!(cfg.get_key("image").unwrap().as_object().is_some());
         assert!(cfg.get_key("timing").unwrap().as_object().is_some());
-        assert!(cfg.get_key("snapshot").unwrap().as_object().is_some());
+        let snap_obj = cfg.get_key("snapshot").unwrap();
+        let snap_map = snap_obj.as_object().unwrap();
+        assert!(snap_map.contains_key("reuse_form_refs"));
+        assert!(snap_map.contains_key("ax_diff"));
+        assert!(snap_map.contains_key("include_bounds"));
 
         // Validation bounds
         // quality: 1..=100
@@ -520,6 +588,8 @@ mod tests {
         // invalid booleans / formats
         assert!(cfg.set_key("image.format", "gif").is_err());
         assert!(cfg.set_key("snapshot.reuse_form_refs", "notabool").is_err());
+        assert!(cfg.set_key("snapshot.ax_diff", "maybe").is_err());
+        assert!(cfg.set_key("snapshot.include_bounds", "2").is_err());
 
         // unknown keys
         assert!(cfg.set_key("invalid.key", "val").is_err());
@@ -541,6 +611,8 @@ mod tests {
         original.set_key("timing.poll_interval_ms", "45").unwrap();
         original.set_key("timing.key_delay_us", "1000").unwrap();
         original.set_key("snapshot.reuse_form_refs", "false").unwrap();
+        original.set_key("snapshot.ax_diff", "false").unwrap();
+        original.set_key("snapshot.include_bounds", "true").unwrap();
 
         original.save(&path).expect("save should succeed");
         let loaded = AppConfig::load_or_default(&path).expect("load should succeed");

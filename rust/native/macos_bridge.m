@@ -382,6 +382,35 @@ static BOOL is_chromium_or_electron(NSString *bundleId) {
          [b containsString:@"electron"] || [b containsString:@"chromium"];
 }
 
+static NSString *eval_role_security(NSString *role, AXError rErr,
+                                    NSString *subrole, AXError sErr,
+                                    BOOL *outSecure, BOOL *outUnverified) {
+  NSString *effective = role ?: @"AXUnknown";
+  BOOL sec = [effective isEqualToString:@"AXSecureTextField"] ||
+             [subrole isEqualToString:@"AXSecureTextField"];
+  // Only mark as unverified when AX attribute lookup itself fails unexpectedly
+  // (e.g. IPC failure), not when native/web fields simply omit AXSubrole.
+  BOOL unv = !sec && ((rErr != kAXErrorSuccess && rErr != kAXErrorNoValue &&
+                       rErr != kAXErrorAttributeUnsupported) ||
+                      ([effective isEqualToString:@"AXTextField"] &&
+                       sErr != kAXErrorSuccess && sErr != kAXErrorNoValue &&
+                       sErr != kAXErrorAttributeUnsupported));
+
+  if (sec) {
+    *outSecure = YES;
+    *outUnverified = NO;
+    return @"AXSecureTextField";
+  }
+  if (unv) {
+    *outSecure = NO;
+    *outUnverified = YES;
+    return @"AXUnverifiedTextField";
+  }
+  *outSecure = NO;
+  *outUnverified = NO;
+  return effective;
+}
+
 static NSString *classify_role(AXUIElementRef el, BOOL isChromium,
                                BOOL *outSecure, BOOL *outUnverified) {
   (void)isChromium;
@@ -399,35 +428,79 @@ static NSString *classify_role(AXUIElementRef el, BOOL isChromium,
                           ? (__bridge NSString *)subroleRef
                           : nil;
 
-  NSString *effective = role ?: @"AXUnknown";
-  BOOL sec = [effective isEqualToString:@"AXSecureTextField"] ||
-             [subrole isEqualToString:@"AXSecureTextField"];
-  // Only mark as unverified when AX attribute lookup itself fails unexpectedly
-  // (e.g. IPC failure), not when native/web fields simply omit AXSubrole.
-  BOOL unv = !sec && ((rErr != kAXErrorSuccess && rErr != kAXErrorNoValue &&
-                       rErr != kAXErrorAttributeUnsupported) ||
-                      ([effective isEqualToString:@"AXTextField"] &&
-                       sErr != kAXErrorSuccess && sErr != kAXErrorNoValue &&
-                       sErr != kAXErrorAttributeUnsupported));
+  NSString *res =
+      eval_role_security(role, rErr, subrole, sErr, outSecure, outUnverified);
 
   if (roleRef)
     CFRelease(roleRef);
   if (subroleRef)
     CFRelease(subroleRef);
 
-  if (sec) {
-    *outSecure = YES;
-    *outUnverified = NO;
-    return @"AXSecureTextField";
+  return res;
+}
+
+static CFArrayRef ax_walk_batch_attrs(void) {
+  static CFArrayRef attrs = NULL;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    NSArray *list = @[
+      (__bridge NSString *)kAXRoleAttribute,
+      (__bridge NSString *)kAXSubroleAttribute,
+      (__bridge NSString *)kAXPositionAttribute,
+      (__bridge NSString *)kAXSizeAttribute,
+      (__bridge NSString *)kAXTitleAttribute,
+      (__bridge NSString *)kAXDescriptionAttribute,
+      (__bridge NSString *)kAXFilenameAttribute,
+      (__bridge NSString *)kAXValueAttribute,
+      (__bridge NSString *)kAXEnabledAttribute,
+      (__bridge NSString *)kAXFocusedAttribute,
+      (__bridge NSString *)kAXURLAttribute,
+    ];
+    attrs = CFBridgingRetain(list);
+  });
+  return attrs;
+}
+
+static id unpack_ax_slot(id item, AXError *outErr) {
+  if (!item || item == (id)[NSNull null]) {
+    if (outErr)
+      *outErr = kAXErrorNoValue;
+    return nil;
   }
-  if (unv) {
-    *outSecure = NO;
-    *outUnverified = YES;
-    return @"AXUnverifiedTextField";
+  CFTypeRef cfItem = (__bridge CFTypeRef)item;
+  if (CFGetTypeID(cfItem) == AXValueGetTypeID() &&
+      AXValueGetType((AXValueRef)cfItem) == kAXValueTypeAXError) {
+    AXError slotErr = kAXErrorSuccess;
+    if (outErr) {
+      *outErr =
+          AXValueGetValue((AXValueRef)cfItem, kAXValueTypeAXError, &slotErr)
+              ? slotErr
+              : kAXErrorFailure;
+    }
+    return nil;
   }
-  *outSecure = NO;
-  *outUnverified = NO;
-  return effective;
+  if (outErr)
+    *outErr = kAXErrorSuccess;
+  return item;
+}
+
+static BOOL ax_frame_from_values(id posObj, id sizeObj, CGRect *outRect) {
+  if (!posObj || !sizeObj)
+    return NO;
+  CFTypeRef posRef = (__bridge CFTypeRef)posObj;
+  CFTypeRef sizeRef = (__bridge CFTypeRef)sizeObj;
+  if (CFGetTypeID(posRef) != AXValueGetTypeID() ||
+      CFGetTypeID(sizeRef) != AXValueGetTypeID())
+    return NO;
+  CGPoint pt = CGPointZero;
+  CGSize sz = CGSizeZero;
+  if (!AXValueGetValue((AXValueRef)posRef, kAXValueTypeCGPoint, &pt) ||
+      !AXValueGetValue((AXValueRef)sizeRef, kAXValueTypeCGSize, &sz))
+    return NO;
+  if (sz.width <= 0 || sz.height <= 0)
+    return NO;
+  *outRect = CGRectMake(pt.x, pt.y, sz.width, sz.height);
+  return YES;
 }
 
 static NSString *truncate_str(NSString *s, NSUInteger maxLen) {
@@ -475,9 +548,30 @@ static void walk_ax_node(AXUIElementRef el, int depth, int maxDepth,
   }
   (*scannedNodes)++;
 
+  CFArrayRef rawValues = NULL;
+  AXError batchErr = AXUIElementCopyMultipleAttributeValues(
+      el, ax_walk_batch_attrs(), 0, &rawValues);
+  NSArray *values = rawValues ? CFBridgingRelease(rawValues) : nil;
+  BOOL hasBatch = (batchErr == kAXErrorSuccess && values && values.count >= 11);
+
   BOOL sec = NO;
   BOOL unv = NO;
-  NSString *role = classify_role(el, isChromium, &sec, &unv);
+  NSString *role = nil;
+  if (hasBatch) {
+    AXError rErr = kAXErrorSuccess;
+    AXError sErr = kAXErrorSuccess;
+    id roleObj = unpack_ax_slot(values[0], &rErr);
+    id subroleObj = unpack_ax_slot(values[1], &sErr);
+    NSString *roleVal =
+        [roleObj isKindOfClass:[NSString class]] ? (NSString *)roleObj : nil;
+    NSString *subrole = [subroleObj isKindOfClass:[NSString class]]
+                            ? (NSString *)subroleObj
+                            : nil;
+    role = eval_role_security(roleVal, rErr, subrole, sErr, &sec, &unv);
+  } else {
+    role = classify_role(el, isChromium, &sec, &unv);
+  }
+
   if (sec) {
     *hasSecure = YES;
     if ((int)elements.count < maxElements) {
@@ -504,7 +598,11 @@ static void walk_ax_node(AXUIElementRef el, int depth, int maxDepth,
   }
 
   CGRect frame = CGRectZero;
-  BOOL hasFrame = ax_frame(el, &frame);
+  BOOL hasFrame =
+      hasBatch
+          ? ax_frame_from_values(unpack_ax_slot(values[2], NULL),
+                                 unpack_ax_slot(values[3], NULL), &frame)
+          : ax_frame(el, &frame);
   // Prune off-screen / zero-size subtrees inside scrollable windows so
   // Electron/Chrome don't burn IPC time walking thousands of invisible lines,
   // while still scanning visible ones.
@@ -523,9 +621,21 @@ static void walk_ax_node(AXUIElementRef el, int depth, int maxDepth,
     *depthTruncated = YES;
 
   if (collectDisplay) {
-    NSString *title = truncate_str(ax_string(el, kAXTitleAttribute), 120);
-    NSString *desc = truncate_str(ax_string(el, kAXDescriptionAttribute), 120);
-    NSString *fname = truncate_str(ax_string(el, kAXFilenameAttribute), 120);
+    id rawTitle = hasBatch ? unpack_ax_slot(values[4], NULL)
+                           : ax_string(el, kAXTitleAttribute);
+    id rawDesc = hasBatch ? unpack_ax_slot(values[5], NULL)
+                          : ax_string(el, kAXDescriptionAttribute);
+    id rawFname = hasBatch ? unpack_ax_slot(values[6], NULL)
+                           : ax_string(el, kAXFilenameAttribute);
+    NSString *title = truncate_str(
+        [rawTitle isKindOfClass:[NSString class]] ? (NSString *)rawTitle : nil,
+        120);
+    NSString *desc = truncate_str(
+        [rawDesc isKindOfClass:[NSString class]] ? (NSString *)rawDesc : nil,
+        120);
+    NSString *fname = truncate_str(
+        [rawFname isKindOfClass:[NSString class]] ? (NSString *)rawFname : nil,
+        120);
     NSString *label =
         (title.length > 0)
             ? title
@@ -533,16 +643,50 @@ static void walk_ax_node(AXUIElementRef el, int depth, int maxDepth,
     NSString *valStr = nil;
     if (![role isEqualToString:@"AXWindow"] &&
         ![role isEqualToString:@"AXApplication"]) {
-      id rawVal = ax_copy(el, kAXValueAttribute);
+      id rawVal = hasBatch ? unpack_ax_slot(values[7], NULL)
+                           : ax_copy(el, kAXValueAttribute);
       if ([rawVal isKindOfClass:[NSString class]]) {
         valStr = truncate_str((NSString *)rawVal, 160);
       } else if ([rawVal isKindOfClass:[NSNumber class]]) {
         valStr = [(NSNumber *)rawVal stringValue];
       }
     }
-    NSNumber *enabled = ax_bool(el, kAXEnabledAttribute);
-    NSNumber *focused = ax_bool(el, kAXFocusedAttribute);
-    NSArray<NSString *> *actions = ax_actions(el);
+    NSString *urlStr = nil;
+    if ([role isEqualToString:@"AXWindow"] ||
+        [role isEqualToString:@"AXWebArea"] ||
+        [role isEqualToString:@"AXLink"]) {
+      id rawUrlObj = hasBatch ? unpack_ax_slot(values[10], NULL)
+                              : ax_copy(el, kAXURLAttribute);
+      NSString *rawUrl = nil;
+      if ([rawUrlObj isKindOfClass:[NSURL class]]) {
+        rawUrl = [(NSURL *)rawUrlObj absoluteString];
+      } else if ([rawUrlObj isKindOfClass:[NSString class]]) {
+        rawUrl = (NSString *)rawUrlObj;
+      }
+      if (rawUrl.length > 0) {
+        NSString *trimmedUrl = [rawUrl
+            stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (trimmedUrl.length > 0) {
+          urlStr = truncate_str(trimmedUrl, 200);
+        }
+      }
+    }
+    id rawEnabled = hasBatch ? unpack_ax_slot(values[8], NULL)
+                             : ax_bool(el, kAXEnabledAttribute);
+    NSNumber *enabled = [rawEnabled isKindOfClass:[NSNumber class]]
+                            ? (NSNumber *)rawEnabled
+                            : nil;
+    id rawFocused = hasBatch ? unpack_ax_slot(values[9], NULL)
+                             : ax_bool(el, kAXFocusedAttribute);
+    NSNumber *focused = [rawFocused isKindOfClass:[NSNumber class]]
+                            ? (NSNumber *)rawFocused
+                            : nil;
+    BOOL shouldFetchActions = is_interactive_role(role) ||
+                              [role isEqualToString:@"AXGroup"] ||
+                              [role isEqualToString:@"AXUnknown"];
+    NSArray<NSString *> *actions =
+        shouldFetchActions ? ax_actions(el) : @[];
 
     NSString *trimLabel = [label
         stringByTrimmingCharactersInSet:[NSCharacterSet
@@ -556,13 +700,16 @@ static void walk_ax_node(AXUIElementRef el, int depth, int maxDepth,
          trimVal.length == 0 && hasFrame && !CGRectIsEmpty(windowClip) &&
          (frame.size.width * frame.size.height) >
              0.5 * (windowClip.size.width * windowClip.size.height));
-    BOOL strongControl = is_interactive_role(role) ||
+    BOOL isChromiumTab =
+        (isChromium && [role isEqualToString:@"AXTab"] && trimLabel.length > 0);
+    BOOL strongControl = is_interactive_role(role) || isChromiumTab ||
                          ([actions containsObject:@"AXPress"] &&
                           ![role isEqualToString:@"AXGroup"]) ||
                          [actions containsObject:@"AXOpen"];
     BOOL interactive =
         !bigUnlabeledGroup &&
-        (is_interactive_role(role) || [actions containsObject:@"AXPress"] ||
+        (is_interactive_role(role) || isChromiumTab ||
+         [actions containsObject:@"AXPress"] ||
          [actions containsObject:@"AXOpen"]);
     BOOL interestingText = ([role isEqualToString:@"AXStaticText"] &&
                             (trimLabel.length > 0 || trimVal.length > 0));
@@ -571,11 +718,30 @@ static void walk_ax_node(AXUIElementRef el, int depth, int maxDepth,
     BOOL isSheet = [role isEqualToString:@"AXSheet"];
     BOOL isGroupWithLabel = ([role isEqualToString:@"AXGroup"] &&
                              trimLabel.length > 0 && depth <= 9);
+    BOOL isWindowWithUrl =
+        ([role isEqualToString:@"AXWindow"] && urlStr.length > 0);
+    BOOL isWebArea =
+        ([role isEqualToString:@"AXWebArea"] &&
+         (urlStr.length > 0 || (isChromium && trimLabel.length > 0)));
+    BOOL isChromiumTableNode = NO;
+    if (isChromium) {
+      if ([role isEqualToString:@"AXCell"] ||
+          [role isEqualToString:@"AXColumnHeader"]) {
+        isChromiumTableNode = (trimLabel.length > 0 || trimVal.length > 0);
+      } else if ([role isEqualToString:@"AXTable"] ||
+                 [role isEqualToString:@"AXRow"]) {
+        isChromiumTableNode =
+            (trimLabel.length > 0 || trimVal.length > 0 ||
+             (hasFrame && frame.size.width > 4.0 && frame.size.height > 4.0));
+      }
+    }
     int softTextCap = MAX(1, maxElements - (maxElements / 3));
     BOOL allowByPriority = strongControl || ((int)elements.count < softTextCap);
 
-    if (allowByPriority && (interactive || interestingText || isHeading ||
-                            isSheet || isGroupWithLabel)) {
+    if (allowByPriority &&
+        (interactive || interestingText || isHeading || isSheet ||
+         isGroupWithLabel || isWindowWithUrl || isWebArea ||
+         isChromiumTableNode)) {
       (*refCounter)++;
       NSString *refId = [NSString stringWithFormat:@"e%d", *refCounter];
       NSString *shortRole =
@@ -592,6 +758,8 @@ static void walk_ax_node(AXUIElementRef el, int depth, int maxDepth,
         entry[@"label"] = label;
       if (valStr.length > 0)
         entry[@"value"] = valStr;
+      if (urlStr.length > 0)
+        entry[@"url"] = urlStr;
       if (enabled)
         entry[@"enabled"] = enabled;
       if (focused && focused.boolValue)

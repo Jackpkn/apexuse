@@ -315,6 +315,7 @@ mod tests {
             role: role.into(),
             label: label.into(),
             value: None,
+            url: None,
             window: 0,
             depth: 2,
             interactive: true,

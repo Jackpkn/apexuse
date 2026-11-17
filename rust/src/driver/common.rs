@@ -154,6 +154,7 @@ pub fn build_snapshot_from_raw(
                 raw.label
             },
             value: if raw.is_password { None } else { raw.value },
+            url: None,
             window: raw.window,
             depth: raw.depth,
             interactive,
