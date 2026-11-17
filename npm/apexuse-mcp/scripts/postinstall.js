@@ -1,15 +1,33 @@
 #!/usr/bin/env node
 "use strict";
 
-const PKG = require("../package.json");
-const DEFAULT_VERSION = (PKG && PKG.version) || "0.3.0";
+const fs = require("node:fs");
+const path = require("node:path");
+
+const FALLBACK_VERSION = "0.3.0";
+
+function readPackageVersion(pkgPath = path.join(__dirname, "..", "package.json")) {
+  try {
+    const raw = fs.readFileSync(pkgPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.version === "string" && parsed.version.trim()) {
+      return parsed.version.trim();
+    }
+  } catch {
+    // Fall back cleanly if package.json is missing, unreadable, or malformed.
+  }
+  return FALLBACK_VERSION;
+}
 
 function renderPostinstallMessage({
   platform = process.platform,
-  version = DEFAULT_VERSION,
+  version,
+  pkgPath,
 } = {}) {
   const resolvedPlatform = platform || process.platform;
-  const resolvedVersion = version || DEFAULT_VERSION;
+  const resolvedVersion =
+    (typeof version === "string" && version.trim()) ||
+    readPackageVersion(pkgPath);
 
   const lines = [
     `Installed apexuse-mcp@${resolvedVersion}`,
@@ -56,5 +74,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  FALLBACK_VERSION,
+  readPackageVersion,
   renderPostinstallMessage,
 };

@@ -971,10 +971,12 @@ static BOOL poll_screen_recording_via_doctor(void) {
         kill(task.processIdentifier, SIGKILL);
       }
     }
+    [task waitUntilExit];
     [outPipe.fileHandleForReading closeAndReturnError:nil];
     return preflight_screen_recording_in_process();
   }
 
+  [task waitUntilExit];
   NSError *readErr = nil;
   NSData *outData =
       [outPipe.fileHandleForReading readDataToEndOfFileAndReturnError:&readErr];
@@ -1048,12 +1050,12 @@ static BOOL poll_screen_recording_via_doctor(void) {
   NSTextField *titleLabel = [NSTextField labelWithString:title];
   titleLabel.font = [NSFont systemFontOfSize:13.5 weight:NSFontWeightSemibold];
   titleLabel.textColor = [NSColor labelColor];
-  titleLabel.frame = NSMakeRect(16, 48, 175, 20);
+  titleLabel.frame = NSMakeRect(16, 48, 136, 20);
   [cardContent addSubview:titleLabel];
 
   NSTextField *badge = [NSTextField labelWithString:@"Checking..."];
   badge.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
-  badge.frame = NSMakeRect(195, 48, 110, 20);
+  badge.frame = NSMakeRect(156, 48, 116, 20);
   [cardContent addSubview:badge];
   if (outBadge) {
     *outBadge = badge;
@@ -1062,19 +1064,19 @@ static BOOL poll_screen_recording_via_doctor(void) {
   NSTextField *descLabel = [NSTextField wrappingLabelWithString:desc];
   descLabel.font = [NSFont systemFontOfSize:11.5];
   descLabel.textColor = [NSColor secondaryLabelColor];
-  descLabel.frame = NSMakeRect(16, 12, 286, 32);
+  descLabel.frame = NSMakeRect(16, 12, 254, 32);
   [cardContent addSubview:descLabel];
 
   NSButton *btn = [NSButton buttonWithTitle:btnTitle target:self action:action];
   btn.bezelStyle = NSBezelStyleRounded;
-  btn.frame = NSMakeRect(310, 23, 148, 32);
+  btn.frame = NSMakeRect(280, 23, 176, 32);
   [cardContent addSubview:btn];
 
   return card;
 }
 
 - (void)buildWindow {
-  NSRect winRect = NSMakeRect(0, 0, 520, 386);
+  NSRect winRect = NSMakeRect(0, 0, 520, 394);
   NSWindow *win =
       [[NSWindow alloc] initWithContentRect:winRect
                                   styleMask:(NSWindowStyleMaskTitled |
@@ -1091,7 +1093,7 @@ static BOOL poll_screen_recording_via_doctor(void) {
       [NSTextField labelWithString:@"Grant macOS Permissions"];
   heading.font = [NSFont boldSystemFontOfSize:16.0];
   heading.textColor = [NSColor labelColor];
-  heading.frame = NSMakeRect(24, 340, 472, 24);
+  heading.frame = NSMakeRect(24, 348, 472, 24);
   [content addSubview:heading];
 
   NSString *subtitleText =
@@ -1099,7 +1101,7 @@ static BOOL poll_screen_recording_via_doctor(void) {
   NSTextField *subtitle = [NSTextField labelWithString:subtitleText];
   subtitle.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightMedium];
   subtitle.textColor = [NSColor labelColor];
-  subtitle.frame = NSMakeRect(24, 316, 472, 20);
+  subtitle.frame = NSMakeRect(24, 324, 472, 20);
   [content addSubview:subtitle];
 
   NSTextField *helper = [NSTextField
@@ -1108,7 +1110,7 @@ static BOOL poll_screen_recording_via_doctor(void) {
           @"to your host app."];
   helper.font = [NSFont systemFontOfSize:11.5];
   helper.textColor = [NSColor secondaryLabelColor];
-  helper.frame = NSMakeRect(24, 286, 472, 26);
+  helper.frame = NSMakeRect(24, 286, 472, 34);
   [content addSubview:helper];
 
   NSTextField *axBadge = nil;
@@ -1248,6 +1250,20 @@ static BOOL poll_screen_recording_via_doctor(void) {
   self.autoCloseTimer = nil;
 }
 
+- (void)stopModalWithWakeup {
+  [NSApp stopModal];
+  [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                      location:NSZeroPoint
+                                 modifierFlags:0
+                                     timestamp:0
+                                  windowNumber:0
+                                       context:nil
+                                       subtype:0
+                                         data1:0
+                                         data2:0]
+           atStart:NO];
+}
+
 - (void)finishAndClose {
   if (self.isClosing) {
     return;
@@ -1257,7 +1273,7 @@ static BOOL poll_screen_recording_via_doctor(void) {
   if (self.window.isVisible) {
     [self.window close];
   }
-  [NSApp stopModal];
+  [self stopModalWithWakeup];
 }
 
 - (void)onPollTimer:(NSTimer *)timer {
@@ -1319,7 +1335,7 @@ static BOOL poll_screen_recording_via_doctor(void) {
   if (!self.isClosing) {
     self.isClosing = YES;
     [self syncFinalStatusIfIncomplete];
-    [NSApp stopModal];
+    [self stopModalWithWakeup];
   }
 }
 

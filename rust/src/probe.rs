@@ -1,5 +1,6 @@
 use crate::json::{parse_json, JsonValue};
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -237,6 +238,41 @@ pub fn probe_mcp_streams<W: Write>(
     ]))
 }
 
+/// Resolve bare extensionless commands on Windows (`npx` -> `npx.cmd`) from `PATH`.
+fn resolve_command_for_platform(
+    cmd: &str,
+    path_var: Option<&OsStr>,
+    is_windows: bool,
+) -> String {
+    if !is_windows
+        || cmd.is_empty()
+        || cmd.contains('/')
+        || cmd.contains('\\')
+        || cmd.contains(':')
+        || Path::new(cmd).extension().is_some()
+    {
+        return cmd.to_string();
+    }
+    let Some(path_os) = path_var else {
+        return cmd.to_string();
+    };
+    let path_str = path_os.to_string_lossy();
+    for raw_dir in path_str.split(';') {
+        let dir_str = raw_dir.trim().trim_matches('"');
+        if dir_str.is_empty() {
+            continue;
+        }
+        let dir = Path::new(dir_str);
+        for ext in [".exe", ".cmd", ".bat"] {
+            let candidate = dir.join(format!("{cmd}{ext}"));
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    cmd.to_string()
+}
+
 pub fn probe_mcp_server(
     cmd: &str,
     args: &[String],
@@ -247,7 +283,9 @@ pub fn probe_mcp_server(
         return Err("probe timeout must be > 0ms".to_string());
     }
 
-    let mut command = Command::new(cmd);
+    let path_var = std::env::var_os("PATH");
+    let resolved_cmd = resolve_command_for_platform(cmd, path_var.as_deref(), cfg!(windows));
+    let mut command = Command::new(&resolved_cmd);
     command
         .args(args)
         .stdin(Stdio::piped())
@@ -259,7 +297,7 @@ pub fn probe_mcp_server(
 
     let child = command
         .spawn()
-        .map_err(|e| format!("failed to spawn MCP server '{cmd}': {e}"))?;
+        .map_err(|e| format!("failed to spawn MCP server '{resolved_cmd}': {e}"))?;
     let mut guard = ChildGuard(Some(child));
 
     let stdin = guard
@@ -347,7 +385,9 @@ pub fn probe_mcp_server(
 mod tests {
     use super::*;
     use crate::json::parse_json;
+    use std::fs;
     use std::sync::mpsc;
+    #[cfg(unix)]
     use std::time::Instant;
 
     #[test]
@@ -654,5 +694,74 @@ mod tests {
                 start.elapsed()
             );
         }
+    }
+
+    #[test]
+    fn resolves_windows_bare_commands_on_path_and_preserves_others() {
+        let root = std::env::temp_dir().join(format!(
+            "apexuse_probe_win_cmd_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let dir1 = root.join("node_bin");
+        let dir2 = root.join("extra_bin");
+        fs::create_dir_all(&dir1).unwrap();
+        fs::create_dir_all(&dir2).unwrap();
+
+        // npm on Windows installs both extensionless `npx` (for sh) and `npx.cmd`
+        fs::write(dir1.join("npx"), "#!/bin/sh\n").unwrap();
+        let npx_cmd = dir1.join("npx.cmd");
+        fs::write(&npx_cmd, "@echo off\r\n").unwrap();
+
+        // `.exe` takes priority over `.cmd` in the same PATH directory
+        let tool_exe = dir1.join("tool.exe");
+        fs::write(&tool_exe, "mz").unwrap();
+        fs::write(dir1.join("tool.cmd"), "@echo off\r\n").unwrap();
+
+        // `.bat` found in subsequent quoted PATH entry
+        let batch_bat = dir2.join("batch.bat");
+        fs::write(&batch_bat, "@echo off\r\n").unwrap();
+
+        let path_val = format!("\"{}\";;{}", dir1.display(), dir2.display());
+        let path_os = OsStr::new(&path_val);
+
+        assert_eq!(
+            resolve_command_for_platform("npx", Some(path_os), true),
+            npx_cmd.to_string_lossy()
+        );
+        assert_eq!(
+            resolve_command_for_platform("tool", Some(path_os), true),
+            tool_exe.to_string_lossy()
+        );
+        assert_eq!(
+            resolve_command_for_platform("batch", Some(path_os), true),
+            batch_bat.to_string_lossy()
+        );
+
+        // Non-Windows keeps bare command untouched
+        assert_eq!(
+            resolve_command_for_platform("npx", Some(path_os), false),
+            "npx"
+        );
+        // Explicit extension, path separator, missing PATH, and unknown command fall back unchanged
+        assert_eq!(
+            resolve_command_for_platform("npx.cmd", Some(path_os), true),
+            "npx.cmd"
+        );
+        assert_eq!(
+            resolve_command_for_platform(r"C:\Tools\npx", Some(path_os), true),
+            r"C:\Tools\npx"
+        );
+        assert_eq!(
+            resolve_command_for_platform("./npx", Some(path_os), true),
+            "./npx"
+        );
+        assert_eq!(
+            resolve_command_for_platform("missing-tool", Some(path_os), true),
+            "missing-tool"
+        );
+        assert_eq!(resolve_command_for_platform("npx", None, true), "npx");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

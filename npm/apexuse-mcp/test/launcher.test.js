@@ -18,7 +18,11 @@ const {
   downloadBuffer,
   resolveBinary,
 } = require("../bin/apexuse-mcp.js");
-const { renderPostinstallMessage } = require("../scripts/postinstall.js");
+const {
+  FALLBACK_VERSION,
+  readPackageVersion,
+  renderPostinstallMessage,
+} = require("../scripts/postinstall.js");
 
 function makeTempDir(prefix = "apexuse-launcher-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -545,5 +549,41 @@ test("postinstall script runs cleanly and package tarball includes scripts/posti
     assert.ok(packagedPaths.includes("bin/apexuse-mcp.js"));
   } finally {
     fs.rmSync(tmpCache, { recursive: true, force: true });
+  }
+});
+
+test("readPackageVersion falls back cleanly to 0.3.0 without throwing when package.json is missing or invalid", () => {
+  assert.equal(readPackageVersion(), VERSION);
+
+  const tmpDir = makeTempDir("apexuse-postinstall-fallback-");
+  try {
+    const missingPkg = path.join(tmpDir, "missing", "package.json");
+    assert.equal(readPackageVersion(missingPkg), FALLBACK_VERSION);
+
+    const corruptPkg = path.join(tmpDir, "corrupt.json");
+    fs.writeFileSync(corruptPkg, "{broken json");
+    assert.equal(readPackageVersion(corruptPkg), FALLBACK_VERSION);
+
+    const emptyVersionPkg = path.join(tmpDir, "empty-version.json");
+    fs.writeFileSync(emptyVersionPkg, JSON.stringify({ name: "apexuse-mcp", version: "  " }));
+    assert.equal(readPackageVersion(emptyVersionPkg), FALLBACK_VERSION);
+
+    const customPkg = path.join(tmpDir, "custom.json");
+    fs.writeFileSync(customPkg, JSON.stringify({ name: "apexuse-mcp", version: "1.2.3" }));
+    assert.equal(readPackageVersion(customPkg), "1.2.3");
+
+    const fallbackMsg = renderPostinstallMessage({ platform: "linux", pkgPath: missingPkg });
+    assert.ok(fallbackMsg.includes(`Installed apexuse-mcp@${FALLBACK_VERSION}`));
+
+    // Executing postinstall.js standalone without ../package.json must not crash on require
+    const scriptsDir = path.join(tmpDir, "isolated", "scripts");
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    const srcScript = path.resolve(__dirname, "../scripts/postinstall.js");
+    const copiedScript = path.join(scriptsDir, "postinstall.js");
+    fs.copyFileSync(srcScript, copiedScript);
+    const out = execFileSync(process.execPath, [copiedScript], { encoding: "utf8" });
+    assert.ok(out.includes(`Installed apexuse-mcp@${FALLBACK_VERSION}`));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });

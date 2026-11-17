@@ -2432,4 +2432,94 @@ mod tests {
             ("npx".to_string(), vec!["-y".to_string(), "apexuse-mcp".to_string()])
         );
     }
+
+    #[test]
+    fn codex_and_codex_plugin_fail_closed_on_corrupt_toml() {
+        let (root, env) = make_temp_env("codex_corrupt_toml", TargetOs::Macos);
+        let home = env.home.as_ref().unwrap();
+        let codex_toml = home.join(".codex/config.toml");
+        let bak_path = append_bak_path(&codex_toml);
+        let plugins_dir = home.join(".codex/plugins");
+        fs::create_dir_all(codex_toml.parent().unwrap()).unwrap();
+
+        let write_opts = InstallOptions {
+            write: true,
+            use_npx: true,
+            ..InstallOptions::default()
+        };
+        let dry_opts = InstallOptions {
+            dry_run: true,
+            use_npx: true,
+            ..InstallOptions::default()
+        };
+
+        let corrupt_samples = [
+            "[broken\ncommand = \"npx\"\n",
+            "model = \"gpt-5\"\nnotes = \"\"\"\nunclosed multiline\n",
+        ];
+
+        for corrupt in corrupt_samples {
+            fs::write(&codex_toml, corrupt).unwrap();
+
+            for opts in [&dry_opts, &write_opts] {
+                let err_plugin = install_agent_with_env(
+                    CODEX_PLUGIN_TARGET,
+                    Path::new("/bin/apex"),
+                    opts,
+                    &env,
+                )
+                .expect_err("codex-plugin must fail closed on corrupt TOML");
+                assert!(
+                    err_plugin.contains("refusing to modify"),
+                    "unexpected codex-plugin error: {err_plugin}"
+                );
+                assert_eq!(fs::read(&codex_toml).unwrap(), corrupt.as_bytes());
+                assert!(!bak_path.exists());
+                assert!(!plugins_dir.exists());
+
+                let err_codex =
+                    install_agent_with_env("codex", Path::new("/bin/apex"), opts, &env)
+                        .expect_err("codex must fail closed on corrupt TOML");
+                assert!(
+                    err_codex.contains("refusing to modify"),
+                    "unexpected codex error: {err_codex}"
+                );
+                assert_eq!(fs::read(&codex_toml).unwrap(), corrupt.as_bytes());
+                assert!(!bak_path.exists());
+                assert!(!plugins_dir.exists());
+            }
+
+            let all_res = install_all_with_env(Path::new("/bin/apex"), &write_opts, &env)
+                .expect("install_all returns structured report on agent error");
+            assert_eq!(all_res.get("ok").and_then(|v| v.as_bool()), Some(false));
+            let errors = all_res
+                .get("errors")
+                .and_then(|v| v.as_array())
+                .expect("errors array");
+            assert!(
+                errors.iter().any(|e| {
+                    e.get("agent").and_then(|v| v.as_str()) == Some("codex")
+                        && e.get("error")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| s.contains("refusing to modify"))
+                }),
+                "expected codex fail-closed error in install_all errors: {errors:?}"
+            );
+            let wired = all_res
+                .get("wired")
+                .and_then(|v| v.as_array())
+                .expect("wired array");
+            assert!(!wired.iter().any(|w| {
+                matches!(
+                    w.get("agent").and_then(|v| v.as_str()),
+                    Some("codex" | "codex-plugin")
+                )
+            }));
+            assert_eq!(fs::read(&codex_toml).unwrap(), corrupt.as_bytes());
+            assert!(!bak_path.exists());
+            assert!(!plugins_dir.exists());
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
