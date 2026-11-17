@@ -623,7 +623,9 @@ def test_rust_cli_subcommands_end_to_end(tmp_path):
     )
     assert inst_write.returncode == 0, inst_write.stderr
     assert (fake_home / ".cursor/mcp.json").is_file()
-    assert (fake_home / ".agents/skills/apexuse/SKILL.md").is_file()
+    skill_text = (ROOT / ".agents/skills/apexuse/SKILL.md").read_text(encoding="utf-8")
+    assert (ROOT / "rust/assets/SKILL.md").read_text(encoding="utf-8") == skill_text
+    assert (fake_home / ".agents/skills/apexuse/SKILL.md").read_text(encoding="utf-8") == skill_text
 
     # 5. doctor --check (exits 0/1 consistently with JSON flags; --mock --check exits 0)
     doc = subprocess.run([str(RUST_BIN), "doctor", "--check"], capture_output=True, text=True, env=env)

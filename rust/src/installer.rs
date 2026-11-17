@@ -17,7 +17,7 @@ pub const SUPPORTED_AGENTS: &[&str] = &[
     "opencode",
 ];
 
-pub const SKILL_MD: &str = include_str!("../../.agents/skills/apexuse/SKILL.md");
+pub const SKILL_MD: &str = include_str!("../assets/SKILL.md");
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
