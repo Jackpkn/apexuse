@@ -2,9 +2,12 @@
 
 #[cfg(target_os = "macos")]
 use super::{
-    ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError, OcrBox,
-    OcrMode, OsDriver, Rect, RunningApp, UiElement, WindowMeta,
+    ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError,
+    ImageEncodeOptions, OcrBox, OcrMode, OsDriver, Rect, RunningApp, UiElement, WindowMeta,
+    WindowState,
 };
+#[cfg(target_os = "macos")]
+use crate::config::ImageFormat;
 #[cfg(target_os = "macos")]
 use crate::json::{parse_json, JsonValue};
 #[cfg(target_os = "macos")]
@@ -19,6 +22,7 @@ extern "C" {
     fn apexuse_macos_list_apps() -> *mut c_char;
     fn apexuse_macos_activate_app(bundle_id: *const c_char) -> *mut c_char;
     fn apexuse_macos_launch_app(bundle_id: *const c_char) -> *mut c_char;
+    fn apexuse_macos_window_state(bundle_id: *const c_char) -> *mut c_char;
     fn apexuse_macos_inspect_app(
         bundle_id: *const c_char,
         window_index: c_int,
@@ -29,15 +33,21 @@ extern "C" {
         bundle_id: *const c_char,
         window_index: c_int,
         ocr_mode: c_int,
-        encode_png: c_int,
+        encode_image: c_int,
+        image_format: c_int,
+        quality: c_int,
+        max_width: c_int,
     ) -> *mut c_char;
     fn apexuse_macos_render_som(
-        png_b64_or_cap_id: *const c_char,
+        img_b64_or_cap_id: *const c_char,
         marks_json: *const c_char,
         win_x: c_double,
         win_y: c_double,
         win_w: c_double,
         win_h: c_double,
+        image_format: c_int,
+        quality: c_int,
+        max_width: c_int,
     ) -> *mut c_char;
     fn apexuse_macos_perform_action(req_json: *const c_char) -> *mut c_char;
     fn apexuse_macos_check_point(
@@ -266,21 +276,51 @@ impl OsDriver for MacosDriver {
         })
     }
 
+    fn window_state(&self, bundle_id: &str) -> Result<WindowState, DriverError> {
+        let c = to_cstr(bundle_id)?;
+        let val = take_json(unsafe { apexuse_macos_window_state(c.as_ptr()) })?;
+        let frontmost = val
+            .get("frontmost_bundle_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let pid = val.get("pid").and_then(|v| v.as_i64()).unwrap_or(0);
+        let total = val
+            .get("windows_total")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as usize;
+        let frame = val.get("active_window_frame").and_then(parse_rect);
+        Ok(WindowState {
+            frontmost_bundle_id: frontmost,
+            pid,
+            windows_total: total,
+            active_window_frame: frame,
+        })
+    }
+
     fn capture_and_ocr(
         &self,
         bundle_id: &str,
         window: Option<i32>,
         ocr_mode: OcrMode,
-        encode_png: bool,
+        encode_image: bool,
+        options: &ImageEncodeOptions,
     ) -> Result<CaptureResult, DriverError> {
         let c = to_cstr(bundle_id)?;
         let win_idx = window.unwrap_or(-1);
+        let fmt_int = match options.format {
+            ImageFormat::Png => 0,
+            ImageFormat::Jpeg => 1,
+        };
         let val = take_json(unsafe {
             apexuse_macos_capture_and_ocr(
                 c.as_ptr(),
                 win_idx,
                 ocr_mode.as_int(),
-                if encode_png { 1 } else { 0 },
+                if encode_image { 1 } else { 0 },
+                fmt_int,
+                options.quality as c_int,
+                options.max_width as c_int,
             )
         })?;
         let wf = val
@@ -326,6 +366,12 @@ impl OsDriver for MacosDriver {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let img_b64 = val
+            .get("image_base64")
+            .or_else(|| val.get("png_base64"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         Ok(CaptureResult {
             bundle_id: cap_bundle,
             frontmost_bundle_id: cap_front,
@@ -336,23 +382,26 @@ impl OsDriver for MacosDriver {
             window_frame: wf,
             image_width: val.get("image_width").and_then(|v| v.as_i64()).unwrap_or(0) as usize,
             image_height: val.get("image_height").and_then(|v| v.as_i64()).unwrap_or(0) as usize,
-            png_base64: val
-                .get("png_base64")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            image_format: options.format,
+            image_base64: img_b64.clone(),
+            png_base64: img_b64,
             ocr_boxes,
         })
     }
 
-    fn render_som_png(
+    fn render_som_image(
         &self,
-        png_b64: &str,
+        image_b64_or_cap_id: &str,
         marks_json: &str,
         win_frame: &Rect,
+        options: &ImageEncodeOptions,
     ) -> Result<String, DriverError> {
-        let cb64 = to_cstr(png_b64)?;
+        let cb64 = to_cstr(image_b64_or_cap_id)?;
         let cmarks = to_cstr(marks_json)?;
+        let fmt_int = match options.format {
+            ImageFormat::Png => 0,
+            ImageFormat::Jpeg => 1,
+        };
         let val = take_json(unsafe {
             apexuse_macos_render_som(
                 cb64.as_ptr(),
@@ -361,12 +410,26 @@ impl OsDriver for MacosDriver {
                 win_frame.y,
                 win_frame.w,
                 win_frame.h,
+                fmt_int,
+                options.quality as c_int,
+                options.max_width as c_int,
             )
         })?;
-        val.get("png_base64")
+        val.get("image_base64")
+            .or_else(|| val.get("png_base64"))
             .and_then(|v| v.as_str())
             .map(str::to_string)
-            .ok_or_else(|| DriverError::new("render_failed", "Missing annotated png_base64"))
+            .ok_or_else(|| DriverError::new("render_failed", "Missing annotated image"))
+    }
+
+    fn render_som_png(
+        &self,
+        png_b64: &str,
+        marks_json: &str,
+        win_frame: &Rect,
+    ) -> Result<String, DriverError> {
+        let opts = ImageEncodeOptions::default();
+        self.render_som_image(png_b64, marks_json, win_frame, &opts)
     }
 
     fn perform_action(&self, req: &ActionRequest) -> Result<ActionResult, DriverError> {
@@ -414,6 +477,7 @@ impl OsDriver for MacosDriver {
                 text,
                 mode,
                 click_first,
+                key_delay_us,
             } => JsonValue::object(vec![
                 ("kind", JsonValue::String("type_point".into())),
                 ("bundle_id", JsonValue::String(bundle_id.clone())),
@@ -422,7 +486,43 @@ impl OsDriver for MacosDriver {
                 ("text", JsonValue::String(text.clone())),
                 ("mode", JsonValue::String(mode.clone())),
                 ("click_first", JsonValue::Bool(*click_first)),
+                ("key_delay_us", JsonValue::Number(*key_delay_us as f64)),
             ]),
+            ActionRequest::SetValue {
+                bundle_id,
+                x,
+                y,
+                text,
+                key_delay_us,
+            } => JsonValue::object(vec![
+                ("kind", JsonValue::String("set_value".into())),
+                ("bundle_id", JsonValue::String(bundle_id.clone())),
+                ("x", JsonValue::Number(*x)),
+                ("y", JsonValue::Number(*y)),
+                ("text", JsonValue::String(text.clone())),
+                ("key_delay_us", JsonValue::Number(*key_delay_us as f64)),
+            ]),
+            ActionRequest::SelectText {
+                bundle_id,
+                x,
+                y,
+                start,
+                end,
+            } => {
+                let mut fields = vec![
+                    ("kind", JsonValue::String("select_text".into())),
+                    ("bundle_id", JsonValue::String(bundle_id.clone())),
+                    ("x", JsonValue::Number(*x)),
+                    ("y", JsonValue::Number(*y)),
+                ];
+                if let Some(s) = start {
+                    fields.push(("start", JsonValue::Number(*s as f64)));
+                }
+                if let Some(e) = end {
+                    fields.push(("end", JsonValue::Number(*e as f64)));
+                }
+                JsonValue::object(fields)
+            }
             ActionRequest::PressKey {
                 bundle_id,
                 key,
@@ -510,5 +610,26 @@ mod tests {
         assert_ne!(out_b64, base_b64);
         // Base64 PNG header "iVBORw0KGgo"
         assert!(out_b64.starts_with("iVBORw0KGgo"));
+    }
+
+    #[test]
+    fn native_render_som_supports_jpeg_encoding() {
+        let base_b64 = encode_solid_png_b64(240, 140);
+        let marks_json = r#"[{"id":"m1","source":"ax","x":20,"y":30,"w":80,"h":30}]"#;
+        let win = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 240.0,
+            h: 140.0,
+        };
+        let opts = ImageEncodeOptions {
+            format: crate::config::ImageFormat::Jpeg,
+            quality: 80,
+            max_width: 1440,
+        };
+        let out_b64 = MacosDriver.render_som_image(&base_b64, marks_json, &win, &opts).unwrap();
+        assert!(!out_b64.is_empty());
+        // Base64 JPEG header starts with "/9j/"
+        assert!(out_b64.starts_with("/9j/"));
     }
 }

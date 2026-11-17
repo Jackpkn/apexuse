@@ -1,10 +1,11 @@
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 use super::common::{build_snapshot_from_raw, RawElement};
 use super::{
-    ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError, OcrMode,
-    OsDriver, Rect, RunningApp, WindowMeta,
+    ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError,
+    ImageEncodeOptions, OcrMode, OsDriver, Rect, RunningApp, WindowMeta, WindowState,
 };
+use crate::config::ImageFormat;
 use crate::json::{parse_json, JsonValue};
 use crate::som_png::render_som_rgba_to_b64;
 
@@ -1287,6 +1288,8 @@ run()
             window_frame: frame,
             image_width: w,
             image_height: h,
+            image_format: ImageFormat::Png,
+            image_base64: png_base64.clone(),
             png_base64,
             ocr_boxes,
         })
@@ -1442,6 +1445,7 @@ run()
                 text,
                 mode,
                 click_first,
+                ..
             } => {
                 let _ = activate_app(bundle_id);
                 if *click_first {
@@ -1607,6 +1611,14 @@ run()
                 }
                 Ok(ActionResult { method: "linux_scroll".into() })
             }
+            ActionRequest::SetValue { .. } => Err(DriverError::new(
+                "unsupported_on_platform",
+                "SetValue will be implemented in Task 4",
+            )),
+            ActionRequest::SelectText { .. } => Err(DriverError::new(
+                "unsupported_on_platform",
+                "SelectText will be implemented in Task 4",
+            )),
         }
     }
 }
@@ -1639,23 +1651,32 @@ impl OsDriver for LinuxDriver {
         native::inspect_app(bundle_id, window, max_elements, max_depth)
     }
 
+    fn window_state(&self, _bundle_id: &str) -> Result<WindowState, DriverError> {
+        Err(DriverError::new(
+            "unsupported_on_platform",
+            "window_state will be implemented in Task 4",
+        ))
+    }
+
     fn capture_and_ocr(
         &self,
         bundle_id: &str,
         window: Option<i32>,
         ocr_mode: OcrMode,
-        encode_png: bool,
+        encode_image: bool,
+        _options: &ImageEncodeOptions,
     ) -> Result<CaptureResult, DriverError> {
-        native::capture_and_ocr(bundle_id, window, ocr_mode, encode_png)
+        native::capture_and_ocr(bundle_id, window, ocr_mode, encode_image)
     }
 
-    fn render_som_png(
+    fn render_som_image(
         &self,
-        png_b64: &str,
+        image_b64: &str,
         marks_json: &str,
         win_frame: &Rect,
+        _options: &ImageEncodeOptions,
     ) -> Result<String, DriverError> {
-        render_som_rgba_to_b64(png_b64, marks_json, win_frame)
+        render_som_rgba_to_b64(image_b64, marks_json, win_frame)
     }
 
     fn perform_action(&self, req: &ActionRequest) -> Result<ActionResult, DriverError> {
@@ -1700,23 +1721,32 @@ impl OsDriver for LinuxDriver {
         Err(DriverError::new("unsupported_on_platform", "Linux driver requires Linux host."))
     }
 
+    fn window_state(&self, _bundle_id: &str) -> Result<WindowState, DriverError> {
+        Err(DriverError::new(
+            "unsupported_on_platform",
+            "Linux driver requires Linux host.",
+        ))
+    }
+
     fn capture_and_ocr(
         &self,
         _bundle_id: &str,
         _window: Option<i32>,
         _ocr_mode: OcrMode,
-        _encode_png: bool,
+        _encode_image: bool,
+        _options: &ImageEncodeOptions,
     ) -> Result<CaptureResult, DriverError> {
         Err(DriverError::new("unsupported_on_platform", "Linux driver requires Linux host."))
     }
 
-    fn render_som_png(
+    fn render_som_image(
         &self,
-        png_b64: &str,
+        image_b64: &str,
         marks_json: &str,
         win_frame: &Rect,
+        _options: &ImageEncodeOptions,
     ) -> Result<String, DriverError> {
-        render_som_rgba_to_b64(png_b64, marks_json, win_frame)
+        render_som_rgba_to_b64(image_b64, marks_json, win_frame)
     }
 
     fn perform_action(&self, _req: &ActionRequest) -> Result<ActionResult, DriverError> {

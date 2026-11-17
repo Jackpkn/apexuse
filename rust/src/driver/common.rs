@@ -73,6 +73,13 @@ pub fn is_interactive_role(role: &str) -> bool {
     )
 }
 
+pub fn is_editable_role(role: &str) -> bool {
+    matches!(
+        role,
+        "TextField" | "TextArea" | "SearchField" | "ComboBox"
+    )
+}
+
 pub fn default_actions_for_role(role: &str) -> Vec<String> {
     match role {
         "Button" | "CheckBox" | "RadioButton" | "Link" | "MenuItem" | "Tab" | "ListItem"

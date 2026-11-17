@@ -12,20 +12,28 @@ fn main() {
         let obj_path = out_dir.join("macos_bridge.o");
         let lib_path = out_dir.join("libapexuse_macos.a");
 
-        let status = Command::new("clang")
-            .args([
-                "-fobjc-arc",
-                "-O2",
-                "-mmacosx-version-min=14.0",
-                "-Wall",
-                "-Wextra",
-                "-c",
-                "native/macos_bridge.m",
-                "-o",
-            ])
-            .arg(&obj_path)
-            .status()
-            .expect("failed to invoke clang");
+        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        let arch_flag = match target_arch.as_str() {
+            "x86_64" => Some("x86_64"),
+            "aarch64" => Some("arm64"),
+            _ => None,
+        };
+
+        let mut clang = Command::new("clang");
+        clang.args([
+            "-fobjc-arc",
+            "-O2",
+            "-mmacosx-version-min=14.0",
+            "-Wall",
+            "-Wextra",
+        ]);
+        if let Some(arch) = arch_flag {
+            clang.args(["-arch", arch]);
+        }
+        clang
+            .args(["-c", "native/macos_bridge.m", "-o"])
+            .arg(&obj_path);
+        let status = clang.status().expect("failed to invoke clang");
         assert!(status.success(), "clang failed compiling native/macos_bridge.m");
 
         let ar_status = Command::new("ar")
@@ -39,6 +47,10 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", out_dir.display());
         println!("cargo:rustc-link-lib=static=apexuse_macos");
         println!("cargo:rustc-link-arg=-mmacosx-version-min=14.0");
+        if let Some(arch) = arch_flag {
+            println!("cargo:rustc-link-arg=-arch");
+            println!("cargo:rustc-link-arg={arch}");
+        }
         for fw in [
             "Foundation",
             "AppKit",

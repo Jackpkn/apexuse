@@ -1,5 +1,6 @@
 use crate::driver::{
-    ActionRequest, AppSnapshot, DoctorStatus, OcrMode, OsDriver, Rect, UiElement,
+    ActionRequest, AppSnapshot, DoctorStatus, ImageEncodeOptions, OcrMode, OsDriver, Rect,
+    UiElement, WindowState,
 };
 use crate::json::JsonValue;
 use crate::memory::{WorkflowMemory, WorkflowStep};
@@ -386,7 +387,7 @@ impl Gateway {
             // Run AX safety walk and ScreenCaptureKit + Vision OCR concurrently.
             let driver = &*self.driver;
             let (ax_res, cap_res) = thread::scope(|s| {
-                let cap_handle = s.spawn(|| driver.capture_and_ocr(&target, None, ocr_mode, false));
+                let cap_handle = s.spawn(|| driver.capture_and_ocr(&target, None, ocr_mode, false, &ImageEncodeOptions::default()));
                 let ax_res = driver.inspect_app(&target, None, 250, 14);
                 let cap_res = match cap_handle.join() {
                     Ok(r) => r,
@@ -411,7 +412,7 @@ impl Gateway {
                 Ok(s) => s,
                 Err(e) => return e,
             };
-            let cap = match self.driver.capture_and_ocr(&full.bundle_id, window, ocr_mode, false) {
+            let cap = match self.driver.capture_and_ocr(&full.bundle_id, window, ocr_mode, false, &ImageEncodeOptions::default()) {
                 Ok(c) => c,
                 Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
             };
@@ -525,7 +526,13 @@ impl Gateway {
             Ok(s) => s,
             Err(e) => return e,
         };
-        let cap = match self.driver.capture_and_ocr(&full.bundle_id, None, OcrMode::Off, true) {
+        let cap = match self.driver.capture_and_ocr(
+            &full.bundle_id,
+            None,
+            OcrMode::Off,
+            true,
+            &ImageEncodeOptions::default(),
+        ) {
             Ok(c) => c,
             Err(e) => return ToolOutput::json(err_json(&e.code, &e.message)),
         };
@@ -1124,7 +1131,7 @@ impl Gateway {
         });
         let digest = self
             .driver
-            .capture_and_ocr(app, None, OcrMode::Off, false)
+            .capture_and_ocr(app, None, OcrMode::Off, false, &ImageEncodeOptions::default())
             .ok()
             .and_then(|c| c.pixel_digest);
         (ax, digest)
@@ -1149,7 +1156,7 @@ impl Gateway {
         };
         let digest = self
             .driver
-            .capture_and_ocr(app, None, OcrMode::Off, false)
+            .capture_and_ocr(app, None, OcrMode::Off, false, &ImageEncodeOptions::default())
             .ok()
             .and_then(|c| c.pixel_digest);
         Ok((ax, digest))
@@ -1373,6 +1380,7 @@ impl Gateway {
                 text,
                 mode,
                 click_first,
+                key_delay_us: 500,
             },
             PendingAction::PressKey { key, modifiers, .. } => ActionRequest::PressKey {
                 bundle_id: app.clone(),
@@ -1728,6 +1736,7 @@ impl Gateway {
                             text: text.into(),
                             mode: mode.into(),
                             click_first,
+                            key_delay_us: 500,
                         },
                         vec![(x, y)],
                     )
@@ -1949,7 +1958,13 @@ impl Gateway {
             let ax_found = full_outline.to_ascii_lowercase().contains(&q_lower);
             let mut ocr_match_text: Option<String> = None;
             if use_ocr && !ax_found {
-                if let Ok(cap) = self.driver.capture_and_ocr(&target, window, OcrMode::Fast, false) {
+                if let Ok(cap) = self.driver.capture_and_ocr(
+                    &target,
+                    window,
+                    OcrMode::Fast,
+                    false,
+                    &ImageEncodeOptions::default(),
+                ) {
                     if let Some(bx) = cap
                         .ocr_boxes
                         .iter()
@@ -2088,6 +2103,7 @@ impl Gateway {
                             text: text.into(),
                             mode: "insert".into(),
                             click_first: !is_native_text,
+                            key_delay_us: 500,
                         }
                     } else {
                         let click_count = if act == "double_click" { 2 } else { 1 };
@@ -2576,12 +2592,35 @@ impl OsDriver for MockDriver {
         })
     }
 
+    fn window_state(
+        &self,
+        bundle_id: &str,
+    ) -> Result<WindowState, crate::driver::DriverError> {
+        let front = if bundle_id == "desktop" {
+            "com.apple.calculator"
+        } else {
+            bundle_id
+        };
+        Ok(WindowState {
+            frontmost_bundle_id: front.into(),
+            pid: 4242,
+            windows_total: 1,
+            active_window_frame: Some(Rect {
+                x: 100.0,
+                y: 100.0,
+                w: 320.0,
+                h: 440.0,
+            }),
+        })
+    }
+
     fn capture_and_ocr(
         &self,
         bundle_id: &str,
         _window: Option<i32>,
         ocr_mode: OcrMode,
-        _encode_png: bool,
+        _encode_image: bool,
+        options: &ImageEncodeOptions,
     ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
         let front = if bundle_id == "desktop" {
             "com.apple.calculator"
@@ -2602,6 +2641,7 @@ impl OsDriver for MockDriver {
                 },
             }]
         };
+        let solid = encode_solid_png_b64(64, 64);
         Ok(crate::driver::CaptureResult {
             bundle_id: bundle_id.into(),
             frontmost_bundle_id: front.into(),
@@ -2615,11 +2655,23 @@ impl OsDriver for MockDriver {
             },
             image_width: 64,
             image_height: 64,
-            png_base64: encode_solid_png_b64(64, 64),
+            image_format: options.format,
+            image_base64: solid.clone(),
+            png_base64: solid,
             capture_id: None,
             pixel_digest: None,
             ocr_boxes,
         })
+    }
+
+    fn render_som_image(
+        &self,
+        image_b64: &str,
+        _marks_json: &str,
+        _win_frame: &Rect,
+        _options: &ImageEncodeOptions,
+    ) -> Result<String, crate::driver::DriverError> {
+        Ok(image_b64.to_string())
     }
 
     fn render_som_png(
@@ -2914,9 +2966,19 @@ mod tests {
             bundle_id: &str,
             w: Option<i32>,
             ocr_mode: OcrMode,
-            encode_png: bool,
+            encode_image: bool,
+            options: &ImageEncodeOptions,
         ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
-            MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_png)
+            MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_image, options)
+        }
+        fn render_som_image(
+            &self,
+            b: &str,
+            m: &str,
+            wf: &Rect,
+            options: &ImageEncodeOptions,
+        ) -> Result<String, crate::driver::DriverError> {
+            MockDriver::new().render_som_image(b, m, wf, options)
         }
         fn render_som_png(&self, b: &str, m: &str, wf: &Rect) -> Result<String, crate::driver::DriverError> {
             MockDriver::new().render_som_png(b, m, wf)
@@ -3042,9 +3104,19 @@ mod tests {
             bundle_id: &str,
             w: Option<i32>,
             ocr_mode: OcrMode,
-            encode_png: bool,
+            encode_image: bool,
+            options: &ImageEncodeOptions,
         ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
-            MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_png)
+            MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_image, options)
+        }
+        fn render_som_image(
+            &self,
+            b: &str,
+            m: &str,
+            wf: &Rect,
+            options: &ImageEncodeOptions,
+        ) -> Result<String, crate::driver::DriverError> {
+            MockDriver::new().render_som_image(b, m, wf, options)
         }
         fn render_som_png(&self, b: &str, m: &str, wf: &Rect) -> Result<String, crate::driver::DriverError> {
             MockDriver::new().render_som_png(b, m, wf)
@@ -3510,9 +3582,19 @@ mod tests {
                 bundle_id: &str,
                 w: Option<i32>,
                 ocr_mode: OcrMode,
-                encode_png: bool,
+                encode_image: bool,
+                options: &ImageEncodeOptions,
             ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
-                MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_png)
+                MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_image, options)
+            }
+            fn render_som_image(
+                &self,
+                b: &str,
+                m: &str,
+                wf: &Rect,
+                options: &ImageEncodeOptions,
+            ) -> Result<String, crate::driver::DriverError> {
+                MockDriver::new().render_som_image(b, m, wf, options)
             }
             fn render_som_png(&self, b: &str, m: &str, wf: &Rect) -> Result<String, crate::driver::DriverError> {
                 MockDriver::new().render_som_png(b, m, wf)
@@ -3583,9 +3665,19 @@ mod tests {
                 bundle_id: &str,
                 w: Option<i32>,
                 ocr_mode: OcrMode,
-                encode_png: bool,
+                encode_image: bool,
+                options: &ImageEncodeOptions,
             ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
-                MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_png)
+                MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_image, options)
+            }
+            fn render_som_image(
+                &self,
+                b: &str,
+                m: &str,
+                wf: &Rect,
+                options: &ImageEncodeOptions,
+            ) -> Result<String, crate::driver::DriverError> {
+                MockDriver::new().render_som_image(b, m, wf, options)
             }
             fn render_som_png(&self, b: &str, m: &str, wf: &Rect) -> Result<String, crate::driver::DriverError> {
                 MockDriver::new().render_som_png(b, m, wf)
@@ -3731,13 +3823,23 @@ mod tests {
                 bundle_id: &str,
                 w: Option<i32>,
                 ocr_mode: OcrMode,
-                encode_png: bool,
+                encode_image: bool,
+                options: &ImageEncodeOptions,
             ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
-                let mut cap = MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_png)?;
+                let mut cap = MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_image, options)?;
                 let count = self.actions.load(std::sync::atomic::Ordering::SeqCst);
                 let byte = if count >= self.succeed_on_attempt { "ff" } else { "10" };
                 cap.pixel_digest = Some(byte.repeat(256));
                 Ok(cap)
+            }
+            fn render_som_image(
+                &self,
+                b: &str,
+                m: &str,
+                wf: &Rect,
+                options: &ImageEncodeOptions,
+            ) -> Result<String, crate::driver::DriverError> {
+                MockDriver::new().render_som_image(b, m, wf, options)
             }
             fn render_som_png(&self, b: &str, m: &str, wf: &Rect) -> Result<String, crate::driver::DriverError> {
                 MockDriver::new().render_som_png(b, m, wf)

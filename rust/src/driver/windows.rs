@@ -1,9 +1,10 @@
-#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#![cfg_attr(not(target_os = "windows"), allow(dead_code, unused_imports))]
 
 use super::{
-    ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError, OcrBox,
-    OcrMode, OsDriver, Rect, RunningApp,
+    ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError,
+    ImageEncodeOptions, OcrBox, OcrMode, OsDriver, Rect, RunningApp, WindowState,
 };
+use crate::config::ImageFormat;
 use crate::som_png::render_som_rgba_to_b64;
 
 /// Maps Microsoft UI Automation `UIA_ControlTypeId` (50000..=50040) to ApexUse role strings.
@@ -1407,6 +1408,8 @@ foreach ($line in $res.Lines) {
             window_frame: win_frame,
             image_width: w,
             image_height: h,
+            image_format: ImageFormat::Png,
+            image_base64: png_base64.clone(),
             png_base64,
             ocr_boxes,
         })
@@ -1777,6 +1780,7 @@ foreach ($line in $res.Lines) {
                 text,
                 mode,
                 click_first,
+                ..
             } => {
                 if !verify_point_safe(*x, *y)? {
                     return Err(DriverError::new("unsafe_target_field", "Target point is a password control"));
@@ -1912,6 +1916,14 @@ foreach ($line in $res.Lines) {
                     method: "windows_scroll".into(),
                 })
             }
+            ActionRequest::SetValue { .. } => Err(DriverError::new(
+                "unsupported_on_platform",
+                "SetValue will be implemented in Task 4",
+            )),
+            ActionRequest::SelectText { .. } => Err(DriverError::new(
+                "unsupported_on_platform",
+                "SelectText will be implemented in Task 4",
+            )),
         }
     }
 }
@@ -1944,23 +1956,32 @@ impl OsDriver for WindowsDriver {
         native::inspect_app(bundle_id, window, max_elements, max_depth)
     }
 
+    fn window_state(&self, _bundle_id: &str) -> Result<WindowState, DriverError> {
+        Err(DriverError::new(
+            "unsupported_on_platform",
+            "window_state will be implemented in Task 4",
+        ))
+    }
+
     fn capture_and_ocr(
         &self,
         bundle_id: &str,
         window: Option<i32>,
         ocr_mode: OcrMode,
-        encode_png: bool,
+        encode_image: bool,
+        _options: &ImageEncodeOptions,
     ) -> Result<CaptureResult, DriverError> {
-        native::capture_and_ocr(bundle_id, window, ocr_mode, encode_png)
+        native::capture_and_ocr(bundle_id, window, ocr_mode, encode_image)
     }
 
-    fn render_som_png(
+    fn render_som_image(
         &self,
-        png_b64: &str,
+        image_b64: &str,
         marks_json: &str,
         win_frame: &Rect,
+        _options: &ImageEncodeOptions,
     ) -> Result<String, DriverError> {
-        render_som_rgba_to_b64(png_b64, marks_json, win_frame)
+        render_som_rgba_to_b64(image_b64, marks_json, win_frame)
     }
 
     fn perform_action(&self, req: &ActionRequest) -> Result<ActionResult, DriverError> {
@@ -2013,23 +2034,32 @@ impl OsDriver for WindowsDriver {
         Err(DriverError::new("unsupported_on_platform", "Windows driver requires Windows host."))
     }
 
+    fn window_state(&self, _bundle_id: &str) -> Result<WindowState, DriverError> {
+        Err(DriverError::new(
+            "unsupported_on_platform",
+            "Windows driver requires Windows host.",
+        ))
+    }
+
     fn capture_and_ocr(
         &self,
         _bundle_id: &str,
         _window: Option<i32>,
         _ocr_mode: OcrMode,
-        _encode_png: bool,
+        _encode_image: bool,
+        _options: &ImageEncodeOptions,
     ) -> Result<CaptureResult, DriverError> {
         Err(DriverError::new("unsupported_on_platform", "Windows driver requires Windows host."))
     }
 
-    fn render_som_png(
+    fn render_som_image(
         &self,
-        png_b64: &str,
+        image_b64: &str,
         marks_json: &str,
         win_frame: &Rect,
+        _options: &ImageEncodeOptions,
     ) -> Result<String, DriverError> {
-        render_som_rgba_to_b64(png_b64, marks_json, win_frame)
+        render_som_rgba_to_b64(image_b64, marks_json, win_frame)
     }
 
     fn perform_action(&self, _req: &ActionRequest) -> Result<ActionResult, DriverError> {

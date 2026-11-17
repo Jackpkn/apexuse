@@ -3,6 +3,9 @@ pub mod linux;
 pub mod macos;
 pub mod windows;
 
+use crate::config::ImageFormat;
+pub use common::is_editable_role;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rect {
     pub x: f64,
@@ -174,6 +177,31 @@ impl OcrMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageEncodeOptions {
+    pub format: ImageFormat,
+    pub quality: u8,
+    pub max_width: usize,
+}
+
+impl Default for ImageEncodeOptions {
+    fn default() -> Self {
+        Self {
+            format: ImageFormat::Png,
+            quality: 80,
+            max_width: 1440,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowState {
+    pub frontmost_bundle_id: String,
+    pub pid: i64,
+    pub windows_total: usize,
+    pub active_window_frame: Option<Rect>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CaptureResult {
     pub bundle_id: String,
@@ -185,6 +213,8 @@ pub struct CaptureResult {
     pub window_frame: Rect,
     pub image_width: usize,
     pub image_height: usize,
+    pub image_format: ImageFormat,
+    pub image_base64: String,
     pub png_base64: String,
     pub ocr_boxes: Vec<OcrBox>,
 }
@@ -218,6 +248,21 @@ pub enum ActionRequest {
         text: String,
         mode: String,
         click_first: bool,
+        key_delay_us: u64,
+    },
+    SetValue {
+        bundle_id: String,
+        x: f64,
+        y: f64,
+        text: String,
+        key_delay_us: u64,
+    },
+    SelectText {
+        bundle_id: String,
+        x: f64,
+        y: f64,
+        start: Option<usize>,
+        end: Option<usize>,
     },
     PressKey {
         bundle_id: String,
@@ -265,19 +310,36 @@ pub trait OsDriver: Send + Sync {
         max_elements: i32,
         max_depth: i32,
     ) -> Result<AppSnapshot, DriverError>;
+    fn window_state(&self, _bundle_id: &str) -> Result<WindowState, DriverError> {
+        Err(DriverError::new(
+            "unsupported_on_platform",
+            "window_state is not supported on this platform",
+        ))
+    }
     fn capture_and_ocr(
         &self,
         bundle_id: &str,
         window: Option<i32>,
         ocr_mode: OcrMode,
-        encode_png: bool,
+        encode_image: bool,
+        options: &ImageEncodeOptions,
     ) -> Result<CaptureResult, DriverError>;
+    fn render_som_image(
+        &self,
+        image_b64_or_cap_id: &str,
+        marks_json: &str,
+        win_frame: &Rect,
+        options: &ImageEncodeOptions,
+    ) -> Result<String, DriverError>;
     fn render_som_png(
         &self,
         png_b64_or_cap_id: &str,
         marks_json: &str,
         win_frame: &Rect,
-    ) -> Result<String, DriverError>;
+    ) -> Result<String, DriverError> {
+        let opts = ImageEncodeOptions::default();
+        self.render_som_image(png_b64_or_cap_id, marks_json, win_frame, &opts)
+    }
     fn perform_action(&self, req: &ActionRequest) -> Result<ActionResult, DriverError>;
     fn supports_fast_point_verify(&self) -> bool {
         false
@@ -306,5 +368,60 @@ pub fn default_driver() -> Box<dyn OsDriver> {
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         Box::new(linux::LinuxDriver)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_editable_role_and_window_state() {
+        assert!(common::is_editable_role("TextField"));
+        assert!(common::is_editable_role("TextArea"));
+        assert!(common::is_editable_role("SearchField"));
+        assert!(common::is_editable_role("ComboBox"));
+        assert!(!common::is_editable_role("Button"));
+        assert!(!common::is_editable_role("StaticText"));
+
+        let ws = WindowState {
+            frontmost_bundle_id: "com.apple.finder".into(),
+            pid: 100,
+            windows_total: 2,
+            active_window_frame: Some(Rect {
+                x: 10.0,
+                y: 20.0,
+                w: 800.0,
+                h: 600.0,
+            }),
+        };
+        assert_eq!(ws.frontmost_bundle_id, "com.apple.finder");
+        assert_eq!(ws.windows_total, 2);
+
+        let set_act = ActionRequest::SetValue {
+            bundle_id: "com.apple.finder".into(),
+            x: 10.0,
+            y: 20.0,
+            text: "test".into(),
+            key_delay_us: 500,
+        };
+        let sel_act = ActionRequest::SelectText {
+            bundle_id: "com.apple.finder".into(),
+            x: 10.0,
+            y: 20.0,
+            start: Some(0),
+            end: Some(4),
+        };
+        match set_act {
+            ActionRequest::SetValue { text, .. } => assert_eq!(text, "test"),
+            _ => panic!("wrong variant"),
+        }
+        match sel_act {
+            ActionRequest::SelectText { start, end, .. } => {
+                assert_eq!(start, Some(0));
+                assert_eq!(end, Some(4));
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }
