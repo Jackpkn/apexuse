@@ -632,4 +632,14 @@ mod tests {
         // Base64 JPEG header starts with "/9j/"
         assert!(out_b64.starts_with("/9j/"));
     }
+
+    #[test]
+    fn native_window_state_desktop_queries_cleanly() {
+        let ws = MacosDriver.window_state("desktop");
+        assert!(ws.is_ok());
+        let st = ws.unwrap();
+        assert!(st.active_window_frame.is_some());
+        let frame = st.active_window_frame.unwrap();
+        assert!(frame.w > 0.0 && frame.h > 0.0);
+    }
 }

@@ -94,11 +94,10 @@ static double ease_out_cubic(double t) {
                                alpha:0.9 * (1.0 - p)] setFill];
     [[NSBezierPath bezierPathWithOvalInRect:dotRect] fill];
   } else {
-    // Subtle ambient tip halo so the agent hotspot reads cleanly on light/dark UIs
+    // Subtle ambient tip halo so the agent hotspot reads cleanly on light/dark
+    // UIs
     NSRect haloRect = NSMakeRect(cx - 6.0, cy - 6.0, 12.0, 12.0);
-    [[NSColor colorWithCalibratedRed:0.06
-                               green:0.72
-                                blue:0.86
+    [[NSColor colorWithCalibratedRed:0.06 green:0.72 blue:0.86
                                alpha:0.14] setFill];
     [[NSBezierPath bezierPathWithOvalInRect:haloRect] fill];
   }
@@ -113,7 +112,8 @@ static double ease_out_cubic(double t) {
     [xf concat];
   }
 
-  // Classic macOS-proportioned slanted pointer with tip anchored cleanly at (cx, cy)
+  // Classic macOS-proportioned slanted pointer with tip anchored cleanly at
+  // (cx, cy)
   NSBezierPath *arrow = [NSBezierPath bezierPath];
   [arrow moveToPoint:NSMakePoint(cx, cy)];
   [arrow lineToPoint:NSMakePoint(cx, cy - 21.0)];
@@ -620,13 +620,16 @@ static void walk_ax_node(AXUIElementRef el, int depth, int maxDepth,
   id childrenObj = ax_copy(el, kAXChildrenAttribute);
   if ([childrenObj isKindOfClass:[NSArray class]]) {
     NSArray *children = (NSArray *)childrenObj;
-    // At window root, walk any modal AXSheet first so open/save dialogs always fit
-    // inside maxElements and receive Set-of-Mark targets ahead of background web DOM.
+    // At window root, walk any modal AXSheet first so open/save dialogs always
+    // fit inside maxElements and receive Set-of-Mark targets ahead of
+    // background web DOM.
     if (depth == 0 && children.count > 1) {
       NSMutableArray *sheets = [NSMutableArray array];
-      NSMutableArray *others = [NSMutableArray arrayWithCapacity:children.count];
+      NSMutableArray *others =
+          [NSMutableArray arrayWithCapacity:children.count];
       for (id child in children) {
-        NSString *cr = ax_string((__bridge AXUIElementRef)child, kAXRoleAttribute);
+        NSString *cr =
+            ax_string((__bridge AXUIElementRef)child, kAXRoleAttribute);
         if ([cr isEqualToString:@"AXSheet"])
           [sheets addObject:child];
         else
@@ -792,7 +795,7 @@ char *apexuse_macos_window_state(const char *bundle_id) {
       for (NSDictionary *info in arr) {
         pid_t winPid = (pid_t)[info[(id)kCGWindowOwnerPID] intValue];
         int layer = [info[(id)kCGWindowLayer] intValue];
-        if (isDesktop || (winPid == pid && layer == 0)) {
+        if (layer == 0 && (isDesktop || winPid == pid)) {
           count++;
           if (!haveActiveFrame) {
             CGRect f = CGRectZero;
@@ -835,7 +838,7 @@ char *apexuse_macos_window_state(const char *bundle_id) {
 }
 
 char *apexuse_macos_inspect_app(const char *bundle_id, int window_index,
-                                 int max_elements, int max_depth) {
+                                int max_elements, int max_depth) {
   ensure_cgs_init();
   if ([NSThread isMainThread] && gCursorWin && gCursorWin.isVisible)
     touch_agent_cursor_ttl();
@@ -991,7 +994,7 @@ static size_t gWinCacheCount = 0;
 static pthread_mutex_t gWinCacheMutex = PTHREAD_MUTEX_INITIALIZER;
 
 static BOOL lookup_window_cache(const char *bundle_id, int window_index,
-                                BOOL is_desktop, pid_t *outPid,
+                                BOOL is_desktop, pid_t expected_pid,
                                 uint32_t *outWid, CGRect *outFrame) {
   if (!bundle_id)
     return NO;
@@ -1001,9 +1004,13 @@ static BOOL lookup_window_cache(const char *bundle_id, int window_index,
     if (gWinCache[i].is_desktop == is_desktop &&
         gWinCache[i].window_index == window_index &&
         strcmp(gWinCache[i].bundle_id, bundle_id) == 0) {
+      if (gWinCache[i].pid != expected_pid) {
+        gWinCache[i] = gWinCache[gWinCacheCount - 1];
+        gWinCacheCount--;
+        pthread_mutex_unlock(&gWinCacheMutex);
+        return NO;
+      }
       if (now - gWinCache[i].timestamp_ms < 1500.0) {
-        if (outPid)
-          *outPid = gWinCache[i].pid;
         if (outWid)
           *outWid = gWinCache[i].wid;
         if (outFrame)
@@ -1095,7 +1102,8 @@ static NSString *store_cached_capture(CGImageRef img) {
   }
   gCachedCapImg = CGImageRetain(img);
   gCapSeq++;
-  gCachedCapId = [NSString stringWithFormat:@"cap_%llu", (unsigned long long)gCapSeq];
+  gCachedCapId =
+      [NSString stringWithFormat:@"cap_%llu", (unsigned long long)gCapSeq];
   NSString *cid = [gCachedCapId copy];
   pthread_mutex_unlock(&gCapMutex);
   return cid;
@@ -1122,8 +1130,8 @@ static NSString *compute_pixel_digest(CGImageRef img) {
   CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
   if (!cs)
     return nil;
-  CGContextRef ctx = CGBitmapContextCreate(
-      buf, grid, grid, 8, grid, cs, (CGBitmapInfo)kCGImageAlphaNone);
+  CGContextRef ctx = CGBitmapContextCreate(buf, grid, grid, 8, grid, cs,
+                                           (CGBitmapInfo)kCGImageAlphaNone);
   CGColorSpaceRelease(cs);
   if (!ctx)
     return nil;
@@ -1138,9 +1146,9 @@ static NSString *compute_pixel_digest(CGImageRef img) {
 }
 
 char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
-                                     int ocr_mode, int encode_image,
-                                     int image_format, int quality,
-                                     int max_width) {
+                                    int ocr_mode, int encode_image,
+                                    int image_format, int quality,
+                                    int max_width) {
   if ([NSThread isMainThread])
     ensure_cgs_init();
   BOOL restoreCursorAfterCapture = NO;
@@ -1172,11 +1180,10 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
     return dup_json(@{@"ok" : @NO, @"code" : @"app_not_running"});
   pid_t pid = app ? app.processIdentifier : 0;
 
-  pid_t cachedPid = 0;
   __block uint32_t cachedWid = 0;
   CGRect cachedFrame = CGRectZero;
-  __block BOOL haveCache = lookup_window_cache(bundle_id, window_index, isDesktop,
-                                               &cachedPid, &cachedWid, &cachedFrame);
+  __block BOOL haveCache = lookup_window_cache(
+      bundle_id, window_index, isDesktop, pid, &cachedWid, &cachedFrame);
 
   CGRect targetAxFrame = CGRectZero;
   NSString *targetAxTitle = nil;
@@ -1212,19 +1219,20 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
       BOOL isStd = [sub isEqualToString:@"AXStandardWindow"] ||
                    [sub isEqualToString:@"AXDialog"];
       double area = wf.size.width * wf.size.height;
-      double sc = (isStd ? 1e12 : 0.0) + (wt.length > 0 ? 1e9 : 0.0) +
-                  ((maxStdArea > 0 && area >= maxStdArea * 0.45)
-                       ? (1e7 - wi * 1000.0)
-                       : area);
+      double sc =
+          (isStd ? 1e12 : 0.0) + (wt.length > 0 ? 1e9 : 0.0) +
+          ((maxStdArea > 0 && area >= maxStdArea * 0.45) ? (1e7 - wi * 1000.0)
+                                                         : area);
       if (sc > bestStdScore) {
         bestStdScore = sc;
         bestStdIdx = wi;
       }
     }
 
-    int axIdx = (window_index >= 0) ? window_index : (bestStdIdx >= 0 ? bestStdIdx : 0);
-    if (window_index >= 0 && window_index < (int)axWins.count && bestStdIdx >= 0 &&
-        bestStdIdx != window_index) {
+    int axIdx =
+        (window_index >= 0) ? window_index : (bestStdIdx >= 0 ? bestStdIdx : 0);
+    if (window_index >= 0 && window_index < (int)axWins.count &&
+        bestStdIdx >= 0 && bestStdIdx != window_index) {
       AXUIElementRef reqW = (__bridge AXUIElementRef)axWins[window_index];
       NSString *reqSub = ax_string(reqW, kAXSubroleAttribute) ?: @"";
       NSString *reqTitle = ax_string(reqW, kAXTitleAttribute) ?: @"";
@@ -1232,7 +1240,8 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
       BOOL reqIsStd = [reqSub isEqualToString:@"AXStandardWindow"] ||
                       [reqSub isEqualToString:@"AXDialog"];
       if (!reqIsStd && reqTitle.length == 0 && ax_frame(reqW, &reqF) &&
-          maxStdArea > 0 && (reqF.size.width * reqF.size.height) < maxStdArea * 0.55) {
+          maxStdArea > 0 &&
+          (reqF.size.width * reqF.size.height) < maxStdArea * 0.55) {
         axIdx = bestStdIdx;
       }
     }
@@ -1254,6 +1263,9 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
   [SCShareableContent getShareableContentWithCompletionHandler:^(
                           SCShareableContent *content, NSError *err) {
     if (err || !content) {
+      if (haveCache) {
+        invalidate_window_cache(bundle_id, window_index, isDesktop);
+      }
       errCode = @"screen_recording_denied";
       errMsg =
           err.localizedDescription ?: @"Unable to enumerate shareable windows.";
@@ -1301,7 +1313,8 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
                                       capturedWid, winFrame);
                  } else {
                    if (haveCache)
-                     invalidate_window_cache(bundle_id, window_index, isDesktop);
+                     invalidate_window_cache(bundle_id, window_index,
+                                             isDesktop);
                    errCode = @"capture_failed";
                    errMsg = capErr.localizedDescription
                                 ?: @"SCScreenshotManager failed.";
@@ -1314,8 +1327,8 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
     SCWindow *chosen = nil;
     if (haveCache && cachedWid > 0) {
       for (SCWindow *w in content.windows) {
-        if (w.windowID == cachedWid && w.frame.size.width > 10 &&
-            w.frame.size.height > 10) {
+        if (w.windowID == cachedWid && w.owningApplication.processID == pid &&
+            w.frame.size.width > 10 && w.frame.size.height > 10) {
           chosen = w;
           break;
         }
@@ -1436,6 +1449,9 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
     pump_ui_ms(5);
   }
   if (!captured) {
+    if (haveCache) {
+      invalidate_window_cache(bundle_id, window_index, isDesktop);
+    }
     return dup_json(@{
       @"ok" : @NO,
       @"code" : errCode ?: @"capture_timeout",
@@ -1445,9 +1461,8 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
 
   NSString *capId = store_cached_capture(captured);
   NSString *pixelDigest = compute_pixel_digest(captured);
-  NSString *b64 = encode_image
-                      ? encode_image_b64(captured, image_format, quality)
-                      : @"";
+  NSString *b64 =
+      encode_image ? encode_image_b64(captured, image_format, quality) : @"";
   NSMutableArray *ocrBoxes = [NSMutableArray array];
 
   if (ocr_mode > 0) {
@@ -1516,9 +1531,9 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
 }
 
 char *apexuse_macos_render_som(const char *img_b64_or_cap_id,
-                                const char *marks_json, double win_x,
-                                double win_y, double win_w, double win_h,
-                                int image_format, int quality, int max_width) {
+                               const char *marks_json, double win_x,
+                               double win_y, double win_w, double win_h,
+                               int image_format, int quality, int max_width) {
   if ([NSThread isMainThread])
     ensure_cgs_init();
   if (!img_b64_or_cap_id || !marks_json || win_w <= 0 || win_h <= 0) {
@@ -1542,8 +1557,8 @@ char *apexuse_macos_render_som(const char *img_b64_or_cap_id,
     if (!baseImg)
       return dup_json(@{@"ok" : @NO, @"code" : @"capture_cache_miss"});
   } else {
-    NSData *imgData =
-        [[NSData alloc] initWithBase64EncodedString:inputStr options:0];
+    NSData *imgData = [[NSData alloc] initWithBase64EncodedString:inputStr
+                                                          options:0];
     if (!imgData)
       return dup_json(@{@"ok" : @NO, @"code" : @"invalid_argument"});
     CGImageSourceRef src =
@@ -1562,14 +1577,16 @@ char *apexuse_macos_render_som(const char *img_b64_or_cap_id,
   size_t imgH = srcH;
   if (max_width > 0 && srcW > (size_t)max_width) {
     imgW = (size_t)max_width;
-    imgH = (size_t)MAX(1.0, round((double)srcH * ((double)max_width / (double)srcW)));
+    imgH = (size_t)MAX(
+        1.0, round((double)srcH * ((double)max_width / (double)srcW)));
   } else if ([inputStr hasPrefix:@"cap_"] && srcW > 1440) {
     imgW = 1440;
     imgH = (size_t)MAX(1.0, round((double)srcH * (1440.0 / (double)srcW)));
   }
   CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-  CGContextRef ctx = CGBitmapContextCreate(NULL, imgW, imgH, 8, imgW * 4, cs,
-                                           (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+  CGContextRef ctx =
+      CGBitmapContextCreate(NULL, imgW, imgH, 8, imgW * 4, cs,
+                            (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
   CGColorSpaceRelease(cs);
   if (!ctx) {
     CGImageRelease(baseImg);
@@ -1808,14 +1825,15 @@ static CGWindowID find_primary_window_for_pid(pid_t pid, CGRect *out_frame) {
     double area = bounds.size.width * bounds.size.height;
     NSString *name = w[(__bridge NSString *)kCGWindowName];
     BOOL named = [name isKindOfClass:[NSString class]] && name.length > 0;
-    BOOL major = (maxArea <= 0.0) ? (bounds.size.width > 120 && bounds.size.height > 140)
-                                  : (area >= maxArea * 0.45);
+    BOOL major = (maxArea <= 0.0)
+                     ? (bounds.size.width > 120 && bounds.size.height > 140)
+                     : (area >= maxArea * 0.45);
     double score = (major ? 1e9 : 0.0) + (named ? 1e6 : 0.0) -
                    (major ? (double)idx * 100.0 : -area);
     if (score > bestScore) {
       bestScore = score;
-      bestWid =
-          (CGWindowID)[w[(__bridge NSString *)kCGWindowNumber] unsignedIntValue];
+      bestWid = (CGWindowID)[w[(
+          __bridge NSString *)kCGWindowNumber] unsignedIntValue];
       bestBounds = bounds;
     }
     idx++;
@@ -1830,27 +1848,27 @@ static NSInteger gAgentMouseEventNum = 100;
 static CGEventRef make_pid_mouse_cg_event(pid_t pid, CGWindowID wid,
                                           CGRect winFrame, NSEventType nsType,
                                           CGEventType cgType,
-                                          CGMouseButton cgBtn,
-                                          CGPoint screenPt, int clickCount,
-                                          double pressure) {
+                                          CGMouseButton cgBtn, CGPoint screenPt,
+                                          int clickCount, double pressure) {
   if ([NSThread isMainThread] && wid != 0 && !CGRectIsEmpty(winFrame)) {
     CGFloat mainH = NSScreen.screens.firstObject
                         ? NSScreen.screens.firstObject.frame.size.height
                         : (CGFloat)CGDisplayPixelsHigh(CGMainDisplayID());
-    CGFloat localX = MAX(0.0, MIN(winFrame.size.width, screenPt.x - winFrame.origin.x));
+    CGFloat localX =
+        MAX(0.0, MIN(winFrame.size.width, screenPt.x - winFrame.origin.x));
     CGFloat localFromTop =
         MAX(0.0, MIN(winFrame.size.height, screenPt.y - winFrame.origin.y));
     NSInteger evNum = ++gAgentMouseEventNum;
-    NSEvent *nsEv = [NSEvent
-        mouseEventWithType:nsType
-                  location:NSMakePoint(localX, mainH - localFromTop)
-             modifierFlags:0
-                 timestamp:[[NSProcessInfo processInfo] systemUptime]
-              windowNumber:(NSInteger)wid
-                   context:nil
-               eventNumber:evNum
-                clickCount:clickCount
-                  pressure:(float)pressure];
+    NSEvent *nsEv =
+        [NSEvent mouseEventWithType:nsType
+                           location:NSMakePoint(localX, mainH - localFromTop)
+                      modifierFlags:0
+                          timestamp:[[NSProcessInfo processInfo] systemUptime]
+                       windowNumber:(NSInteger)wid
+                            context:nil
+                        eventNumber:evNum
+                         clickCount:clickCount
+                           pressure:(float)pressure];
     if (nsEv && nsEv.CGEvent) {
       CGEventRef cg = CGEventCreateCopy(nsEv.CGEvent);
       if (cg) {
@@ -1882,9 +1900,9 @@ static void post_mouse_move_to_pid(pid_t pid, CGWindowID wid, CGRect wf,
                                    CGPoint pt) {
   if (pid <= 0)
     return;
-  CGEventRef move = make_pid_mouse_cg_event(
-      pid, wid, wf, NSEventTypeMouseMoved, kCGEventMouseMoved,
-      kCGMouseButtonLeft, pt, 0, 0.0);
+  CGEventRef move = make_pid_mouse_cg_event(pid, wid, wf, NSEventTypeMouseMoved,
+                                            kCGEventMouseMoved,
+                                            kCGMouseButtonLeft, pt, 0, 0.0);
   if (move) {
     CGEventPostToPid(pid, move);
     CFRelease(move);
@@ -1908,8 +1926,8 @@ static void post_mouse_click_to_pid(pid_t pid, CGWindowID wid, CGRect wf,
   post_mouse_move_to_pid(pid, wid, wf, pt);
   usleep(20000);
   for (int i = 1; i <= clickCount; i++) {
-    CGEventRef down = make_pid_mouse_cg_event(pid, wid, wf, nsDown, cgDown, btn,
-                                              pt, i, 1.0);
+    CGEventRef down =
+        make_pid_mouse_cg_event(pid, wid, wf, nsDown, cgDown, btn, pt, i, 1.0);
     CGEventRef up =
         make_pid_mouse_cg_event(pid, wid, wf, nsUp, cgUp, btn, pt, i, 0.0);
     if (down) {
@@ -1954,9 +1972,9 @@ static void post_mouse_drag_to_pid(pid_t pid, CGWindowID wid, CGRect wf,
     }
     usleep(12000);
   }
-  CGEventRef up = make_pid_mouse_cg_event(
-      pid, wid, wf, NSEventTypeLeftMouseUp, kCGEventLeftMouseUp,
-      kCGMouseButtonLeft, p2, 1, 0.0);
+  CGEventRef up = make_pid_mouse_cg_event(pid, wid, wf, NSEventTypeLeftMouseUp,
+                                          kCGEventLeftMouseUp,
+                                          kCGMouseButtonLeft, p2, 1, 0.0);
   if (up) {
     CGEventPostToPid(pid, up);
     CFRelease(up);
@@ -1965,7 +1983,8 @@ static void post_mouse_drag_to_pid(pid_t pid, CGWindowID wid, CGRect wf,
 
 static inline void flush_unicode_chunk(CGEventSourceRef src, pid_t pid,
                                        unichar *buf, NSUInteger *bufLen,
-                                       uint64_t key_delay_us) {
+                                       uint64_t key_delay_us,
+                                       BOOL sleep_after) {
   if (!bufLen || *bufLen == 0)
     return;
   CGEventRef down = CGEventCreateKeyboardEvent(src, 0, true);
@@ -1983,15 +2002,15 @@ static inline void flush_unicode_chunk(CGEventSourceRef src, pid_t pid,
   if (up)
     CFRelease(up);
   *bufLen = 0;
-  usleep((useconds_t)key_delay_us);
+  if (sleep_after && key_delay_us > 0) {
+    usleep((useconds_t)key_delay_us);
+  }
 }
 
 static void type_unicode_text_to_pid(pid_t pid, NSString *text,
                                      uint64_t key_delay_us) {
   if (pid <= 0 || text.length == 0)
     return;
-  if (key_delay_us == 0)
-    key_delay_us = 500;
   CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStatePrivate);
   unichar buf[16];
   NSUInteger bufLen = 0;
@@ -1999,7 +2018,7 @@ static void type_unicode_text_to_pid(pid_t pid, NSString *text,
   for (NSUInteger i = 0; i < text.length; i++) {
     unichar ch = [text characterAtIndex:i];
     if (ch == '\n' || ch == '\r' || ch == '\t') {
-      flush_unicode_chunk(src, pid, buf, &bufLen, key_delay_us);
+      flush_unicode_chunk(src, pid, buf, &bufLen, key_delay_us, NO);
       CGKeyCode kc = (ch == '\t') ? 48 : 36;
       CGEventRef down = CGEventCreateKeyboardEvent(src, kc, true);
       CGEventRef up = CGEventCreateKeyboardEvent(src, kc, false);
@@ -2013,15 +2032,36 @@ static void type_unicode_text_to_pid(pid_t pid, NSString *text,
         CFRelease(down);
       if (up)
         CFRelease(up);
-      usleep((useconds_t)MAX(1000, key_delay_us));
+      uint64_t special_delay =
+          (key_delay_us > 0) ? MAX((uint64_t)1000, key_delay_us) : 0;
+      if (special_delay > 0) {
+        usleep((useconds_t)special_delay);
+      }
       continue;
     }
+
+    if (0xD800 <= ch && ch <= 0xDBFF && i + 1 < text.length) {
+      unichar next = [text characterAtIndex:i + 1];
+      if (0xDC00 <= next && next <= 0xDFFF) {
+        if (bufLen >= 15) {
+          flush_unicode_chunk(src, pid, buf, &bufLen, key_delay_us, YES);
+        }
+        buf[bufLen++] = ch;
+        buf[bufLen++] = next;
+        i++;
+        if (bufLen == 16) {
+          flush_unicode_chunk(src, pid, buf, &bufLen, key_delay_us, YES);
+        }
+        continue;
+      }
+    }
+
     buf[bufLen++] = ch;
     if (bufLen == 16) {
-      flush_unicode_chunk(src, pid, buf, &bufLen, key_delay_us);
+      flush_unicode_chunk(src, pid, buf, &bufLen, key_delay_us, YES);
     }
   }
-  flush_unicode_chunk(src, pid, buf, &bufLen, key_delay_us);
+  flush_unicode_chunk(src, pid, buf, &bufLen, key_delay_us, NO);
   if (src)
     CFRelease(src);
 }
@@ -2696,8 +2736,7 @@ char *apexuse_macos_perform_action(const char *req_json) {
     }
     if (!editable) {
       touch_agent_cursor_ttl();
-      return dup_json(
-          @{@"ok" : @NO, @"code" : @"target_identity_unverified"});
+      return dup_json(@{@"ok" : @NO, @"code" : @"target_identity_unverified"});
     }
     AXUIElementSetAttributeValue(editable, kAXFocusedAttribute, kCFBooleanTrue);
     AXError sErr = AXUIElementSetAttributeValue(editable, kAXValueAttribute,
@@ -2765,36 +2804,69 @@ char *apexuse_macos_perform_action(const char *req_json) {
     }
     if (!editable) {
       touch_agent_cursor_ttl();
-      return dup_json(
-          @{@"ok" : @NO, @"code" : @"target_identity_unverified"});
+      return dup_json(@{@"ok" : @NO, @"code" : @"target_identity_unverified"});
     }
     AXUIElementSetAttributeValue(editable, kAXFocusedAttribute, kCFBooleanTrue);
-    NSString *valStr = ax_string(editable, kAXValueAttribute) ?: @"";
-    NSInteger strLen = (NSInteger)valStr.length;
-    NSInteger s = (startNum && ![startNum isKindOfClass:[NSNull class]])
-                      ? [startNum integerValue]
-                      : 0;
-    NSInteger e = (endNum && ![endNum isKindOfClass:[NSNull class]])
-                      ? [endNum integerValue]
-                      : strLen;
-    s = MAX(0, MIN(strLen, s));
-    e = MAX(s, MIN(strLen, e));
-    CFRange range = CFRangeMake(s, e - s);
-    AXValueRef valRef = AXValueCreate(kAXValueCFRangeType, &range);
-    AXError rErr = kAXErrorFailure;
-    if (valRef) {
-      rErr = AXUIElementSetAttributeValue(editable,
-                                          kAXSelectedTextRangeAttribute, valRef);
-      CFRelease(valRef);
+    BOOL hasStart = (startNum && ![startNum isKindOfClass:[NSNull class]]);
+    BOOL hasEnd = (endNum && ![endNum isKindOfClass:[NSNull class]]);
+    NSInteger rawStart = hasStart ? [startNum integerValue] : 0;
+    NSInteger rawEnd = hasEnd ? [endNum integerValue] : -1;
+
+    NSString *valStr = ax_string(editable, kAXValueAttribute);
+    BOOL haveLen = NO;
+    NSInteger strLen = 0;
+    if (valStr) {
+      strLen = (NSInteger)valStr.length;
+      haveLen = YES;
+    } else {
+      CFTypeRef numCharsRef = NULL;
+      if (AXUIElementCopyAttributeValue(editable, CFSTR("AXNumberOfCharacters"),
+                                        &numCharsRef) == kAXErrorSuccess &&
+          numCharsRef) {
+        if (CFGetTypeID(numCharsRef) == CFNumberGetTypeID()) {
+          long long val = 0;
+          if (CFNumberGetValue((CFNumberRef)numCharsRef, kCFNumberLongLongType,
+                               &val) &&
+              val >= 0) {
+            strLen = (NSInteger)val;
+            haveLen = YES;
+          }
+        }
+        CFRelease(numCharsRef);
+      }
     }
+
+    AXError rErr = kAXErrorFailure;
+    if (haveLen) {
+      NSInteger s = MAX(0, MIN(strLen, rawStart));
+      NSInteger e = hasEnd ? MAX(s, MIN(strLen, rawEnd)) : strLen;
+      CFRange range = CFRangeMake(s, e - s);
+      AXValueRef valRef = AXValueCreate(kAXValueCFRangeType, &range);
+      if (valRef) {
+        rErr = AXUIElementSetAttributeValue(
+            editable, kAXSelectedTextRangeAttribute, valRef);
+        CFRelease(valRef);
+      }
+    } else if (rawStart >= 0 && (!hasEnd || rawEnd >= rawStart)) {
+      CFRange range = CFRangeMake(rawStart, hasEnd ? (rawEnd - rawStart) : 0);
+      AXValueRef valRef = AXValueCreate(kAXValueCFRangeType, &range);
+      if (valRef) {
+        rErr = AXUIElementSetAttributeValue(
+            editable, kAXSelectedTextRangeAttribute, valRef);
+        CFRelease(valRef);
+      }
+    }
+
     CFRelease(editable);
     if (rErr == kAXErrorSuccess) {
       touch_agent_cursor_ttl();
       return dup_json(@{@"ok" : @YES, @"method" : @"ax_select_text"});
     }
+
     BOOL isSelectAll =
-        (!startNum || [startNum isKindOfClass:[NSNull class]] || s == 0) &&
-        (!endNum || [endNum isKindOfClass:[NSNull class]] || e >= strLen);
+        (!hasStart || rawStart == 0) &&
+        (!hasEnd || (haveLen && rawEnd >= strLen));
+
     if (webTarget && isSelectAll) {
       show_agent_cursor_at(pt, YES);
       post_mouse_click_to_pid(eventPid, wid, widFrame, pt, 1, NO);
@@ -2863,8 +2935,8 @@ char *apexuse_macos_perform_action(const char *req_json) {
         return dup_json(@{@"ok" : @NO, @"code" : @"coordinate_outside_window"});
       }
       pid_t pTmp = pid;
-      CGWindowID hitWid = find_window_at_point(
-          isDesktop ? 0 : pid, pt, isDesktop ? &pTmp : NULL, &wf);
+      CGWindowID hitWid = find_window_at_point(isDesktop ? 0 : pid, pt,
+                                               isDesktop ? &pTmp : NULL, &wf);
       if (hitWid != 0) {
         wid = hitWid;
         pid = pTmp;
@@ -2894,7 +2966,8 @@ char *apexuse_macos_perform_action(const char *req_json) {
     }
     if (!ev) {
       CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStatePrivate);
-      ev = CGEventCreateScrollWheelEvent(src, kCGScrollEventUnitLine, 2, dy, dx);
+      ev =
+          CGEventCreateScrollWheelEvent(src, kCGScrollEventUnitLine, 2, dy, dx);
       if (ev && !CGRectIsEmpty(wf))
         CGEventSetLocation(ev, pt);
       if (ev && wid != 0) {
@@ -2946,7 +3019,7 @@ char *apexuse_macos_check_point(const char *bundle_id, double x, double y) {
   return dup_json(@{
     @"ok" : @YES,
     @"frontmost_bundle_id" :
-        [NSWorkspace sharedWorkspace].frontmostApplication.bundleIdentifier
+            [NSWorkspace sharedWorkspace].frontmostApplication.bundleIdentifier
         ?: @"",
     @"role" : role ?: @"",
   });
