@@ -41,13 +41,19 @@ Zero external LLM keys. Zero external Rust crate or npm runtime dependencies. Ze
 
 ### 1. Run via `npx` (zero-config, no Rust toolchain required)
 
-The [`apexuse-mcp`](./npm/apexuse-mcp/README.md) npm launcher uses **zero external npm dependencies** (Node.js `>=18`), downloads the matching `v0.3.0` binary from [GitHub Releases](https://github.com/Jackpkn/apexuse/releases), verifies its `.sha256` checksum before extraction, and caches it under `~/.apexuse/bin/v0.3.0/`:
+The [`apexuse-mcp`](./npm/apexuse-mcp/README.md) npm launcher uses **zero external npm dependencies** (Node.js `>=18`), downloads the matching `v0.3.0` binary from [GitHub Releases](https://github.com/Jackpkn/apexuse/releases), verifies its `.sha256` checksum before extraction, and caches it under `~/.apexuse/bin/v0.3.0/` (installing via `npm install -g apexuse-mcp` prints a platform-aware `postinstall` setup banner):
 
 ```sh
-# Wire all detected AI coding agents + install bundled SKILL.md
-npx -y apexuse-mcp install all --write --npx --with-skill
+# Wire all detected AI coding agents, install SKILL.md & verify live MCP handshake
+npx -y apexuse-mcp install all --write --npx --with-skill --probe
 
-# Verify OS accessibility & screen recording readiness
+# Or install the Codex Desktop App Plugin directly
+npx -y apexuse-mcp install codex-plugin --write --npx --probe
+
+# macOS: open host-aware Accessibility & Screen Recording onboarding UI
+npx -y apexuse-mcp doctor --onboard
+
+# Cross-platform: verify OS accessibility & screen recording readiness (headless)
 npx -y apexuse-mcp doctor --check
 ```
 
@@ -65,35 +71,50 @@ npx -y apexuse-mcp doctor --check
   cargo build --release --manifest-path rust/Cargo.toml
   ```
 
-### 3. Check OS readiness & permissions
+### 3. Check OS readiness & guided macOS onboarding
 
 ```sh
+# macOS guided AppKit onboarding window (or `apexuse-mcp onboard`)
+npx -y apexuse-mcp doctor --onboard
+
+# Headless readiness check across macOS, Windows, and Linux
 npx -y apexuse-mcp doctor --check
 # or with a local source build:
 ./rust/target/release/apexuse-mcp doctor --check
 ```
 
-- **macOS:** Enable **Accessibility** and **Screen Recording** for the terminal or IDE launching `apexuse-mcp` in **System Settings → Privacy & Security**. (`doctor --check` exits `1` if either permission is missing.)
+- **macOS:** Enable **Accessibility** and **Screen Recording** for the host terminal or IDE launching `apexuse-mcp` (`Terminal`, `iTerm2`, `Codex`, `Cursor`, `Antigravity`, etc.) in **System Settings → Privacy & Security**. Run `doctor --onboard` (`onboard [--force] [--no-auto-close]`) to detect the host app, jump straight to System Settings, and poll status live (if Screen Recording stays unset after toggling and clicking *Later*, restart the host app). `doctor --check` never spawns GUI windows and exits `1` when either grant is missing (emitting `"onboard_hint"` in JSON).
 - **Windows:** Uses built-in Win32 / UI Automation / WinRT APIs with no extra dependencies.
-- **Linux:** Runs on X11 via `libX11`/`libXtst` (`dlopen`). For full semantic accessibility, OCR, and Wayland support install distro packages as needed (e.g., `python3-gi`, `gir1.2-atspi-2.0`, `tesseract-ocr`, `xdotool`, or `grim`/`wtype`/`ydotool` on Wayland).
+- **Linux:** Runs on X11 via `libX11`/`libXtst` (`dlopen`). For full semantic accessibility, OCR, and Wayland support install distro packages as needed (e.g., `python3-gi`, `gir1.2-atspi-2.0`, `tesseract-ocr`, `xdotool`, or `grim`/`spectacle`/`gnome-screenshot` and `wtype`/`ydotool` on Wayland).
 
-### 4. Wire your AI coding agent (`install`)
+### 4. Wire your AI coding agent (`install`, `codex-plugin`, `probe`, `skills`)
 
-`apexuse-mcp install` auto-merges safely across **9 clients** (`antigravity`, `gemini`, `claude`, `claude-desktop`, `codex`, `cursor`, `windsurf`, `vscode`, `opencode`) or `all`:
+`apexuse-mcp install` auto-merges safely across **9 clients** (`antigravity`, `gemini`, `claude`, `claude-desktop`, `codex`, `cursor`, `windsurf`, `vscode`, `opencode`), **`codex-plugin`** (Codex Desktop App Plugin), or **`all`**:
 
 ```sh
 # Preview without touching disk
 npx -y apexuse-mcp install cursor --dry-run --npx
 
-# Safely merge into existing config (creates .bak backup) + install SKILL.md
-npx -y apexuse-mcp install all --write --npx --with-skill
+# Safely merge into detected configs (creates .bak backup), install SKILL.md, and probe MCP
+npx -y apexuse-mcp install all --write --npx --with-skill --probe
+
+# Install Codex Desktop Plugin (marketplace + 0.3.0 cache + ~/.codex/config.toml) and probe
+npx -y apexuse-mcp install codex-plugin --write --npx --probe
+
+# Standalone live MCP initialize + tools/list probe
+npx -y apexuse-mcp probe --npx
 
 # Project-scoped wiring with custom policy
 npx -y apexuse-mcp install claude --write --npx --scope project --policy ./policy.autonomous.yaml
+
+# Install the rich agent skill pack (SKILL.md + agents/openai.yaml + references/)
+npx skills add Jackpkn/apexuse -g -a codex --skill apexuse -y
 ```
 
-- Existing JSON files are validated before modification (invalid/commented JSON aborts cleanly without touching disk), non-empty changed files are backed up to `<file>.bak`, and Codex `config.toml` updates preserve top-level settings and sibling `[mcp_servers.*]` tables.
-- `--with-skill` writes [`.agents/skills/apexuse/SKILL.md`](./.agents/skills/apexuse/SKILL.md) to standard skill directories (`~/.agents/skills/apexuse/SKILL.md`, `~/.claude/skills/apexuse/SKILL.md`, `~/.codex/skills/apexuse/SKILL.md`, or `.agents/` / `.claude/` in project scope).
+- Existing JSON files are validated before modification (invalid/commented JSON aborts cleanly without touching disk), non-empty changed files are backed up to `<file>.bak`, and Codex `config.toml` updates preserve top-level settings and sibling tables.
+- **Codex Plugin vs. Direct MCP Server:** `install codex-plugin --write` materializes `~/.codex/plugins/marketplaces/apexuse-local/` and `~/.codex/plugins/cache/apexuse-local/apexuse/0.3.0/`, activates `[marketplaces.apexuse-local]` + `[plugins."apexuse@apexuse-local"]`, and removes `[mcp_servers.apexuse*]` to avoid duplicate registrations. When `[plugins."apexuse@apexuse-local"]` (`enabled = true`) is active, `install all --write` preserves and refreshes `codex-plugin` in place; running `install codex --write` switches back cleanly (`enabled = false` + `[mcp_servers.apexuse]`).
+- `--probe [--timeout-ms <n>] [--mock]` runs the pure-Rust MCP stdio handshake (`initialize`, `notifications/initialized`, `tools/list`) after install (`--mock` only applies to the temporary probe subprocess and is never written into configs or `.mcp.json`).
+- `--with-skill` writes [`.agents/skills/apexuse/SKILL.md`](./.agents/skills/apexuse/SKILL.md) to standard skill directories (`~/.agents/skills/apexuse/SKILL.md`, `~/.claude/skills/apexuse/SKILL.md`, `~/.codex/skills/apexuse/SKILL.md`, or `.agents/` / `.claude/` in project scope). Use `npx skills add Jackpkn/apexuse` to install the full skill pack including [`agents/openai.yaml`](./.agents/skills/apexuse/agents/openai.yaml) and [`references/`](./.agents/skills/apexuse/references/installation.md).
 
 <details>
 <summary>Copy-paste MCP snippets (`npx -y apexuse-mcp`)</summary>
@@ -152,12 +173,14 @@ See [agent-configs/README.md](./agent-configs/README.md) for full paths across m
 
 ---
 
-## CLI Commands (`config`, `call`, `doctor`, `--version`)
+## CLI Commands (`config`, `call`, `doctor`, `onboard`, `probe`, `install`, `--version`)
 
 ```sh
 apexuse-mcp --version
-apexuse-mcp doctor [--check] [--mock]
-apexuse-mcp install <agent|all> [--write] [--dry-run] [--scope user|project] [--npx] [--policy <path>] [--with-skill]
+apexuse-mcp doctor [--onboard] [--force] [--no-auto-close] [--check] [--mock]
+apexuse-mcp onboard [--force] [--no-auto-close] [--check] [--mock]
+apexuse-mcp probe [--mock] [--npx] [--policy <path>] [--timeout-ms <n>]
+apexuse-mcp install <agent|codex-plugin|all> [--write] [--dry-run] [--scope user|project] [--npx] [--policy <path>] [--with-skill] [--probe] [--timeout-ms <n>] [--mock]
 apexuse-mcp config [show | get <key> | set <key> <val> | reset]
 apexuse-mcp call <tool> [--args '<json>'] [--save-image <path>] [--mock]
 apexuse-mcp call (--calls '<json-array>' | --calls-file <path>) [--sleep-ms <n>] [--save-image <path>] [--mock]
@@ -256,12 +279,15 @@ node --test npm/apexuse-mcp/test/launcher.test.js
 ## Layout
 
 ```text
-├── .agents/skills/apexuse/SKILL.md  # Embedded agent skill instructions for ApexUse MCP tools
+├── .agents/
+│   ├── plugins/marketplace.json     # Codex local plugin marketplace catalog
+│   └── skills/apexuse/              # Skill pack (SKILL.md, agents/openai.yaml, references/)
 ├── .github/workflows/ci.yml         # 3-OS CI matrix (macOS, Ubuntu Xvfb/AT-SPI, Windows)
 ├── .github/workflows/release.yml    # Automated macOS (arm64/x86_64), Linux, Windows releases
-├── agent-configs/README.md          # Client setup snippets & auto-wiring targets (9 agents)
+├── agent-configs/README.md          # Client setup snippets & auto-wiring targets (9 agents + plugin)
 ├── llms.txt                         # AI search & crawler index summary
-├── npm/apexuse-mcp/                 # Zero-dep npx launcher (Node >= 18, SHA-256 verified)
+├── npm/apexuse-mcp/                 # Zero-dep npx launcher + postinstall banner (Node >= 18)
+├── plugins/apexuse/                 # Codex Desktop Plugin manifest, .mcp.json, and SVG icons
 ├── policy.yaml                      # Default direct policy
 ├── policy.autonomous.yaml           # Autonomous direct preset
 ├── pyproject.toml                   # Python MCP E2E test configuration
@@ -269,20 +295,22 @@ node --test npm/apexuse-mcp/test/launcher.test.js
 ├── rust/
 │   ├── Cargo.toml                   # apexuse-mcp crate (0 external dependencies)
 │   ├── build.rs                     # Compiles Objective-C macOS bridge (arm64/x86_64)
-│   ├── native/macos_bridge.{h,m}    # AXUIElement, SCKit, Vision OCR, AgentCursor, events
+│   ├── assets/                      # Embedded SKILL.md & plugin templates for crates.io
+│   ├── native/macos_bridge.{h,m}    # AXUIElement, SCKit, Vision OCR, AgentCursor, onboarding UI
 │   └── src/
 │       ├── config.rs                # Persistent ~/.apexuse/config.json loader & validator
 │       ├── driver/                  # OsDriver trait + common.rs + macos.rs + windows.rs + linux.rs
 │       ├── gateway.rs               # Snapshots, policy, set_value, semantic target, run_actions
-│       ├── installer.rs             # Safe multi-agent JSON/TOML auto-merger & SKILL.md installer
+│       ├── installer.rs             # Safe multi-agent + codex-plugin JSON/TOML auto-merger
 │       ├── json.rs                  # Zero-dependency JSON parser/serializer
-│       ├── main.rs                  # CLI entrypoint (stdio, doctor, install, config, call)
+│       ├── main.rs                  # CLI entrypoint (stdio, doctor, onboard, probe, install, config, call)
 │       ├── mcp.rs                   # JSON-RPC 2.0 MCP stdio server & tool schemas
 │       ├── memory.rs                # Structural workflow memory
 │       ├── policy.rs                # App/field security filters, rate limiter, confirmations
+│       ├── probe.rs                 # Pure-Rust bounded live MCP stdio handshake probe
 │       ├── som.rs                   # Set-of-Mark AX + OCR fusion
 │       └── som_png.rs               # Pure-Rust PNG & baseline JPEG codecs, scaler, SoM renderer
-└── tests/test_rust_mcp.py           # End-to-end MCP stdio & CLI integration tests
+└── tests/test_rust_mcp.py           # End-to-end MCP stdio, asset-sync & CLI integration tests
 ```
 
 ## Registry & License

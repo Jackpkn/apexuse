@@ -4,22 +4,43 @@ Zero-dependency `npx` launcher for **[ApexUse](https://github.com/Jackpkn/apexus
 
 ## Quick Start
 
+Installing via `npm` (`npm install -g apexuse-mcp` or `npm install apexuse-mcp`) prints a `postinstall` setup banner with platform-specific next steps.
+
 Start the MCP stdio server directly (auto-downloads and SHA-256-verifies the v0.3.0 binary into `~/.apexuse/bin/v0.3.0/` on first run):
 
 ```sh
 npx -y apexuse-mcp
 ```
 
-Or wire any AI coding agent automatically (`antigravity`, `gemini`, `claude`, `claude-desktop`, `codex`, `cursor`, `windsurf`, `vscode`, `opencode`, or `all`):
+Wire detected AI coding agents (`antigravity`, `gemini`, `claude`, `claude-desktop`, `codex`, `cursor`, `windsurf`, `vscode`, `opencode`, or `all`), install `SKILL.md`, and verify the live MCP handshake with `--probe`:
 
 ```sh
-npx -y apexuse-mcp install all --write --npx --with-skill
+npx -y apexuse-mcp install all --write --npx --with-skill --probe
 ```
 
-Check OS permissions (`--check` exits non-zero when Accessibility or Screen Recording is unset):
+Install as a **Codex Desktop Plugin** (materializes `~/.codex/plugins/` and configures `[marketplaces.apexuse-local]` + `[plugins."apexuse@apexuse-local"]` without duplicate `[mcp_servers.apexuse]`):
 
 ```sh
+npx -y apexuse-mcp install codex-plugin --write --npx --probe
+```
+
+Verify OS permissions and live MCP readiness:
+
+```sh
+# macOS guided permission onboarding UI (host-aware Accessibility + Screen Recording)
+npx -y apexuse-mcp doctor --onboard
+
+# Headless OS readiness check (exits non-zero when permissions/deps are missing)
 npx -y apexuse-mcp doctor --check
+
+# Standalone live MCP initialize + tools/list probe
+npx -y apexuse-mcp probe --npx
+```
+
+Install the full agent skill pack (`SKILL.md`, `agents/openai.yaml`, `references/`):
+
+```sh
+npx skills add Jackpkn/apexuse -g -a codex --skill apexuse -y
 ```
 
 ## Launcher Options & Environment

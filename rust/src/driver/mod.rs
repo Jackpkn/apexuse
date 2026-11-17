@@ -25,6 +25,18 @@ pub struct DoctorStatus {
 }
 
 #[derive(Debug, Clone)]
+pub struct OnboardStatus {
+    pub os: String,
+    pub shown: bool,
+    pub already_granted: bool,
+    pub accessibility: bool,
+    pub screen_recording: bool,
+    pub completed: bool,
+    pub host_app: Option<String>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunningApp {
     pub bundle_id: String,
     pub pid: i64,
@@ -597,6 +609,27 @@ impl DriverError {
 
 pub trait OsDriver: Send + Sync {
     fn doctor(&self) -> Result<DoctorStatus, DriverError>;
+    fn onboard(&self, _force: bool, _auto_close: bool) -> Result<OnboardStatus, DriverError> {
+        let os = if cfg!(target_os = "windows") {
+            "windows".to_string()
+        } else if cfg!(target_os = "linux") {
+            "linux".to_string()
+        } else {
+            self.doctor()
+                .map(|d| d.os)
+                .unwrap_or_else(|_| std::env::consts::OS.to_string())
+        };
+        Ok(OnboardStatus {
+            os,
+            shown: false,
+            already_granted: true,
+            accessibility: true,
+            screen_recording: true,
+            completed: true,
+            host_app: None,
+            note: "macOS permission onboarding is only required on macOS".into(),
+        })
+    }
     fn list_apps(&self) -> Result<Vec<RunningApp>, DriverError>;
     fn activate_app(&self, bundle_id: &str) -> Result<(), DriverError>;
     fn launch_app(&self, bundle_id: &str) -> Result<(), DriverError>;
@@ -995,5 +1028,51 @@ mod tests {
         let res_forced = reconcile_and_diff_snapshot(Some(&prev), &mut forced, &mut next_ref_id, false, true);
         assert_eq!(res_forced.mode, AxDiffMode::Full);
         assert_eq!(next_ref_id, 11);
+    }
+
+    #[test]
+    fn default_onboard_returns_non_macos_completed_without_ui() {
+        struct StubNonMacosDriver;
+        impl OsDriver for StubNonMacosDriver {
+            fn doctor(&self) -> Result<DoctorStatus, DriverError> {
+                Ok(DoctorStatus {
+                    os: "linux".into(),
+                    accessibility: true,
+                    screen_recording: true,
+                    note: "stub".into(),
+                })
+            }
+            fn list_apps(&self) -> Result<Vec<RunningApp>, DriverError> {
+                Ok(vec![])
+            }
+            fn activate_app(&self, _bundle_id: &str) -> Result<(), DriverError> {
+                Ok(())
+            }
+            fn launch_app(&self, _bundle_id: &str) -> Result<(), DriverError> {
+                Ok(())
+            }
+            fn inspect_app(&self, _b: &str, _w: Option<i32>, _me: i32, _md: i32) -> Result<AppSnapshot, DriverError> {
+                unreachable!()
+            }
+            fn capture_and_ocr(&self, _b: &str, _w: Option<i32>, _om: OcrMode, _ei: bool, _o: &ImageEncodeOptions) -> Result<CaptureResult, DriverError> {
+                unreachable!()
+            }
+            fn render_som_image(&self, _i: &str, _m: &str, _wf: &Rect, _o: &ImageEncodeOptions) -> Result<String, DriverError> {
+                unreachable!()
+            }
+            fn perform_action(&self, _req: &ActionRequest) -> Result<ActionResult, DriverError> {
+                unreachable!()
+            }
+        }
+
+        let ob = StubNonMacosDriver.onboard(false, true).unwrap();
+        assert!(!ob.shown);
+        assert!(ob.accessibility);
+        assert!(ob.screen_recording);
+        assert!(ob.completed);
+        assert!(ob.host_app.is_none());
+        assert_eq!(ob.note, "macOS permission onboarding is only required on macOS");
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        assert_eq!(ob.os, "linux");
     }
 }

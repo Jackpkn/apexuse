@@ -8,10 +8,14 @@
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <Vision/Vision.h>
 
+#include <mach-o/dyld.h>
 #include <math.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
 
 static char *dup_json(NSDictionary *obj) {
   NSError *err = nil;
@@ -837,6 +841,565 @@ char *apexuse_macos_doctor(void) {
     @"os" : @"macos",
     @"accessibility" : @(ax),
     @"screen_recording" : @(sr),
+  });
+}
+
+// MARK: - Host-Aware Permission Onboarding UI
+
+static NSString *current_executable_path(void) {
+  uint32_t bufSize = 0;
+  _NSGetExecutablePath(NULL, &bufSize);
+  if (bufSize == 0) {
+    return NSBundle.mainBundle.executablePath;
+  }
+  char *buf = (char *)malloc(bufSize);
+  if (!buf) {
+    return NSBundle.mainBundle.executablePath;
+  }
+  NSString *path = nil;
+  if (_NSGetExecutablePath(buf, &bufSize) == 0) {
+    path = [[NSFileManager defaultManager]
+        stringWithFileSystemRepresentation:buf
+                                    length:strlen(buf)];
+  }
+  free(buf);
+  return path.length > 0 ? path : NSBundle.mainBundle.executablePath;
+}
+
+static pid_t parent_pid_for(pid_t pid) {
+  if (pid <= 1) {
+    return 0;
+  }
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+  struct kinfo_proc kp;
+  memset(&kp, 0, sizeof(kp));
+  size_t size = sizeof(kp);
+  if (sysctl(mib, 4, &kp, &size, NULL, 0) != 0 || size < sizeof(kp)) {
+    return 0;
+  }
+  return kp.kp_eproc.e_ppid;
+}
+
+static NSString *detect_host_app_name(void) {
+  pid_t selfPid = getpid();
+  pid_t pid = selfPid;
+  NSString *fallbackAncestor = nil;
+  for (int depth = 0; depth < 64 && pid > 1; depth++) {
+    NSRunningApplication *app =
+        [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    if (pid != selfPid && app &&
+        app.activationPolicy == NSApplicationActivationPolicyRegular) {
+      NSString *name = app.localizedName;
+      if (name.length == 0 && app.bundleURL) {
+        name = [[app.bundleURL lastPathComponent]
+            stringByDeletingPathExtension];
+      }
+      if (name.length > 0) {
+        return name;
+      }
+    }
+    if (!fallbackAncestor && pid != selfPid && app &&
+        app.localizedName.length > 0) {
+      fallbackAncestor = app.localizedName;
+    }
+    pid_t ppid = parent_pid_for(pid);
+    if (ppid <= 1 || ppid == pid) {
+      break;
+    }
+    pid = ppid;
+  }
+  if (fallbackAncestor.length > 0) {
+    return fallbackAncestor;
+  }
+  NSString *exePath = current_executable_path();
+  if (exePath.lastPathComponent.length > 0) {
+    return exePath.lastPathComponent;
+  }
+  NSString *procName = [NSProcessInfo processInfo].processName;
+  return procName.length > 0 ? procName : @"ApexUse";
+}
+
+static BOOL preflight_screen_recording_in_process(void) {
+  if (@available(macOS 10.15, *)) {
+    return CGPreflightScreenCaptureAccess();
+  }
+  return NO;
+}
+
+static BOOL poll_screen_recording_via_doctor(void) {
+  NSString *exePath = current_executable_path();
+  if (exePath.length == 0 ||
+      ![[NSFileManager defaultManager] isExecutableFileAtPath:exePath]) {
+    return preflight_screen_recording_in_process();
+  }
+
+  NSTask *task = [[NSTask alloc] init];
+  task.executableURL = [NSURL fileURLWithPath:exePath];
+  task.arguments = @[ @"doctor" ];
+
+  NSMutableDictionary<NSString *, NSString *> *env =
+      [[NSProcessInfo processInfo].environment mutableCopy];
+  [env removeObjectForKey:@"APEXUSE_MOCK"];
+  [env removeObjectForKey:@"HANDSMCP_MOCK"];
+  task.environment = env;
+
+  NSPipe *outPipe = [NSPipe pipe];
+  task.standardOutput = outPipe;
+  task.standardError = [NSFileHandle fileHandleWithNullDevice];
+  task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+
+  dispatch_semaphore_t doneSem = dispatch_semaphore_create(0);
+  task.terminationHandler = ^(NSTask *t) {
+    (void)t;
+    dispatch_semaphore_signal(doneSem);
+  };
+
+  NSError *launchErr = nil;
+  if (![task launchAndReturnError:&launchErr]) {
+    task.terminationHandler = nil;
+    return preflight_screen_recording_in_process();
+  }
+
+  dispatch_time_t deadline =
+      dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1500 * NSEC_PER_MSEC));
+  if (dispatch_semaphore_wait(doneSem, deadline) != 0) {
+    [task terminate];
+    if (dispatch_semaphore_wait(
+            doneSem, dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC)) !=
+        0) {
+      if (task.isRunning && task.processIdentifier > 0) {
+        kill(task.processIdentifier, SIGKILL);
+      }
+    }
+    [task waitUntilExit];
+    [outPipe.fileHandleForReading closeAndReturnError:nil];
+    return preflight_screen_recording_in_process();
+  }
+
+  [task waitUntilExit];
+  NSError *readErr = nil;
+  NSData *outData =
+      [outPipe.fileHandleForReading readDataToEndOfFileAndReturnError:&readErr];
+  [outPipe.fileHandleForReading closeAndReturnError:nil];
+  if (task.terminationStatus != 0 || outData.length == 0) {
+    return preflight_screen_recording_in_process();
+  }
+
+  NSError *jsonErr = nil;
+  id parsed = [NSJSONSerialization JSONObjectWithData:outData
+                                              options:0
+                                                error:&jsonErr];
+  if (![parsed isKindOfClass:[NSDictionary class]]) {
+    return preflight_screen_recording_in_process();
+  }
+  NSDictionary *dict = (NSDictionary *)parsed;
+  id srVal = dict[@"screen_recording"];
+  if (![dict[@"ok"] boolValue] || ![srVal isKindOfClass:[NSNumber class]]) {
+    return preflight_screen_recording_in_process();
+  }
+  return [srVal boolValue];
+}
+
+@interface ApexUseOnboardController : NSObject <NSWindowDelegate>
+@property(nonatomic, strong) NSWindow *window;
+@property(nonatomic, copy) NSString *hostAppName;
+@property(nonatomic, strong) NSTextField *axBadge;
+@property(nonatomic, strong) NSTextField *srBadge;
+@property(nonatomic, strong) NSTextField *restartNoteLabel;
+@property(nonatomic, strong) NSTextField *footerStatusLabel;
+@property(nonatomic, strong) NSTimer *pollTimer;
+@property(nonatomic, strong) NSTimer *autoCloseTimer;
+@property(nonatomic, assign) BOOL autoClose;
+@property(nonatomic, assign) BOOL sawMissing;
+@property(nonatomic, assign) BOOL autoCloseScheduled;
+@property(nonatomic, assign) BOOL isClosing;
+@property(nonatomic, assign) BOOL lastAx;
+@property(nonatomic, assign) BOOL lastSr;
+@end
+
+@implementation ApexUseOnboardController
+
+- (instancetype)initWithHostAppName:(NSString *)hostAppName
+                          autoClose:(BOOL)autoClose {
+  self = [super init];
+  if (self) {
+    _hostAppName = [hostAppName copy];
+    _autoClose = autoClose;
+    [self buildWindow];
+  }
+  return self;
+}
+
+- (NSBox *)buildPermissionCardWithFrame:(NSRect)frame
+                                  title:(NSString *)title
+                            description:(NSString *)desc
+                            buttonTitle:(NSString *)btnTitle
+                           buttonAction:(SEL)action
+                             outBadge:(NSTextField *__strong *)outBadge {
+  NSBox *card = [[NSBox alloc] initWithFrame:frame];
+  card.boxType = NSBoxCustom;
+  card.titlePosition = NSNoTitle;
+  card.cornerRadius = 10.0;
+  card.borderWidth = 1.0;
+  card.borderColor = [NSColor separatorColor];
+  card.fillColor = [NSColor controlBackgroundColor];
+  card.contentViewMargins = NSZeroSize;
+
+  NSView *cardContent = card.contentView;
+
+  NSTextField *titleLabel = [NSTextField labelWithString:title];
+  titleLabel.font = [NSFont systemFontOfSize:13.5 weight:NSFontWeightSemibold];
+  titleLabel.textColor = [NSColor labelColor];
+  titleLabel.frame = NSMakeRect(16, 48, 136, 20);
+  [cardContent addSubview:titleLabel];
+
+  NSTextField *badge = [NSTextField labelWithString:@"Checking..."];
+  badge.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+  badge.frame = NSMakeRect(156, 48, 116, 20);
+  [cardContent addSubview:badge];
+  if (outBadge) {
+    *outBadge = badge;
+  }
+
+  NSTextField *descLabel = [NSTextField wrappingLabelWithString:desc];
+  descLabel.font = [NSFont systemFontOfSize:11.5];
+  descLabel.textColor = [NSColor secondaryLabelColor];
+  descLabel.frame = NSMakeRect(16, 12, 254, 32);
+  [cardContent addSubview:descLabel];
+
+  NSButton *btn = [NSButton buttonWithTitle:btnTitle target:self action:action];
+  btn.bezelStyle = NSBezelStyleRounded;
+  btn.frame = NSMakeRect(280, 23, 176, 32);
+  [cardContent addSubview:btn];
+
+  return card;
+}
+
+- (void)buildWindow {
+  NSRect winRect = NSMakeRect(0, 0, 520, 394);
+  NSWindow *win =
+      [[NSWindow alloc] initWithContentRect:winRect
+                                  styleMask:(NSWindowStyleMaskTitled |
+                                             NSWindowStyleMaskClosable)
+                                    backing:NSBackingStoreBuffered
+                                      defer:NO];
+  win.title = @"ApexUse — macOS Permissions";
+  win.releasedWhenClosed = NO;
+  win.delegate = self;
+
+  NSView *content = win.contentView;
+
+  NSTextField *heading =
+      [NSTextField labelWithString:@"Grant macOS Permissions"];
+  heading.font = [NSFont boldSystemFontOfSize:16.0];
+  heading.textColor = [NSColor labelColor];
+  heading.frame = NSMakeRect(24, 348, 472, 24);
+  [content addSubview:heading];
+
+  NSString *subtitleText =
+      [NSString stringWithFormat:@"Enable permissions for %@", self.hostAppName];
+  NSTextField *subtitle = [NSTextField labelWithString:subtitleText];
+  subtitle.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightMedium];
+  subtitle.textColor = [NSColor labelColor];
+  subtitle.frame = NSMakeRect(24, 324, 472, 20);
+  [content addSubview:subtitle];
+
+  NSTextField *helper = [NSTextField
+      wrappingLabelWithString:
+          @"macOS attributes desktop control permissions for CLI and MCP tools "
+          @"to your host app."];
+  helper.font = [NSFont systemFontOfSize:11.5];
+  helper.textColor = [NSColor secondaryLabelColor];
+  helper.frame = NSMakeRect(24, 286, 472, 34);
+  [content addSubview:helper];
+
+  NSTextField *axBadge = nil;
+  NSBox *axCard = [self
+      buildPermissionCardWithFrame:NSMakeRect(24, 198, 472, 78)
+                             title:@"Accessibility"
+                       description:
+                           @"Inspect UI elements, click, and type across apps"
+                       buttonTitle:@"Grant Accessibility"
+                      buttonAction:@selector(onGrantAccessibility:)
+                          outBadge:&axBadge];
+  self.axBadge = axBadge;
+  [content addSubview:axCard];
+
+  NSTextField *srBadge = nil;
+  NSBox *srCard = [self
+      buildPermissionCardWithFrame:NSMakeRect(24, 108, 472, 78)
+                             title:@"Screen Recording"
+                       description:
+                           @"Capture windows for Set-of-Mark and OCR grounding"
+                       buttonTitle:@"Grant Screen Recording"
+                      buttonAction:@selector(onGrantScreenRecording:)
+                          outBadge:&srBadge];
+  self.srBadge = srBadge;
+  [content addSubview:srCard];
+
+  NSString *restartMsg = [NSString
+      stringWithFormat:
+          @"If Screen Recording was just enabled and you clicked Later, "
+          @"restart %@ to activate it.",
+          self.hostAppName];
+  NSTextField *restartLabel =
+      [NSTextField wrappingLabelWithString:restartMsg];
+  restartLabel.font = [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium];
+  restartLabel.textColor = [NSColor systemOrangeColor];
+  restartLabel.frame = NSMakeRect(24, 58, 472, 40);
+  restartLabel.hidden = YES;
+  self.restartNoteLabel = restartLabel;
+  [content addSubview:restartLabel];
+
+  NSTextField *footerLabel =
+      [NSTextField labelWithString:@"Waiting for permissions..."];
+  footerLabel.font = [NSFont systemFontOfSize:12.0];
+  footerLabel.textColor = [NSColor secondaryLabelColor];
+  footerLabel.frame = NSMakeRect(24, 22, 260, 20);
+  self.footerStatusLabel = footerLabel;
+  [content addSubview:footerLabel];
+
+  NSButton *recheckBtn = [NSButton buttonWithTitle:@"Re-check"
+                                            target:self
+                                            action:@selector(onRecheck:)];
+  recheckBtn.bezelStyle = NSBezelStyleRounded;
+  recheckBtn.frame = NSMakeRect(298, 16, 94, 32);
+  [content addSubview:recheckBtn];
+
+  NSButton *doneBtn = [NSButton buttonWithTitle:@"Done"
+                                         target:self
+                                         action:@selector(onDone:)];
+  doneBtn.bezelStyle = NSBezelStyleRounded;
+  doneBtn.frame = NSMakeRect(402, 16, 94, 32);
+  [content addSubview:doneBtn];
+
+  [win center];
+  self.window = win;
+}
+
+- (void)applyStatusAx:(BOOL)ax sr:(BOOL)sr {
+  self.axBadge.stringValue = ax ? @"● Granted" : @"● Required";
+  self.axBadge.textColor =
+      ax ? [NSColor systemGreenColor] : [NSColor systemOrangeColor];
+
+  self.srBadge.stringValue = sr ? @"● Granted" : @"● Required";
+  self.srBadge.textColor =
+      sr ? [NSColor systemGreenColor] : [NSColor systemOrangeColor];
+
+  self.restartNoteLabel.hidden = !(ax && !sr);
+
+  if (ax && sr) {
+    self.footerStatusLabel.stringValue =
+        (self.autoClose && self.sawMissing)
+            ? @"All permissions granted — closing..."
+            : @"All permissions granted.";
+    self.footerStatusLabel.textColor = [NSColor systemGreenColor];
+  } else {
+    self.footerStatusLabel.stringValue = @"Waiting for permissions...";
+    self.footerStatusLabel.textColor = [NSColor secondaryLabelColor];
+  }
+}
+
+- (void)refreshStatus {
+  if (self.isClosing) {
+    return;
+  }
+  BOOL ax = AXIsProcessTrusted();
+  BOOL sr = poll_screen_recording_via_doctor();
+  if (!ax || !sr) {
+    self.sawMissing = YES;
+  }
+  self.lastAx = ax;
+  self.lastSr = sr;
+  [self applyStatusAx:ax sr:sr];
+
+  if (ax && sr && self.autoClose && self.sawMissing &&
+      !self.autoCloseScheduled) {
+    self.autoCloseScheduled = YES;
+    [self.pollTimer invalidate];
+    self.pollTimer = nil;
+    self.autoCloseTimer =
+        [NSTimer timerWithTimeInterval:0.4
+                                target:self
+                              selector:@selector(onAutoCloseTimer:)
+                              userInfo:nil
+                               repeats:NO];
+    [[NSRunLoop currentRunLoop] addTimer:self.autoCloseTimer
+                                 forMode:NSRunLoopCommonModes];
+  }
+}
+
+- (void)startPolling {
+  [self refreshStatus];
+  if (self.autoCloseScheduled) {
+    return;
+  }
+  self.pollTimer = [NSTimer timerWithTimeInterval:0.75
+                                           target:self
+                                         selector:@selector(onPollTimer:)
+                                         userInfo:nil
+                                          repeats:YES];
+  [[NSRunLoop currentRunLoop] addTimer:self.pollTimer
+                               forMode:NSRunLoopCommonModes];
+}
+
+- (void)invalidateTimers {
+  [self.pollTimer invalidate];
+  self.pollTimer = nil;
+  [self.autoCloseTimer invalidate];
+  self.autoCloseTimer = nil;
+}
+
+- (void)stopModalWithWakeup {
+  [NSApp stopModal];
+  [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                      location:NSZeroPoint
+                                 modifierFlags:0
+                                     timestamp:0
+                                  windowNumber:0
+                                       context:nil
+                                       subtype:0
+                                         data1:0
+                                         data2:0]
+           atStart:NO];
+}
+
+- (void)finishAndClose {
+  if (self.isClosing) {
+    return;
+  }
+  self.isClosing = YES;
+  [self invalidateTimers];
+  if (self.window.isVisible) {
+    [self.window close];
+  }
+  [self stopModalWithWakeup];
+}
+
+- (void)onPollTimer:(NSTimer *)timer {
+  (void)timer;
+  [self refreshStatus];
+}
+
+- (void)onAutoCloseTimer:(NSTimer *)timer {
+  (void)timer;
+  [self finishAndClose];
+}
+
+- (void)onGrantAccessibility:(id)sender {
+  (void)sender;
+  NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt : @YES};
+  (void)AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+  NSURL *url = [NSURL
+      URLWithString:@"x-apple.systempreferences:com.apple.preference.security?"
+                    @"Privacy_Accessibility"];
+  if (url) {
+    [[NSWorkspace sharedWorkspace] openURL:url];
+  }
+}
+
+- (void)onGrantScreenRecording:(id)sender {
+  (void)sender;
+  if (@available(macOS 10.15, *)) {
+    (void)CGRequestScreenCaptureAccess();
+  }
+  NSURL *url = [NSURL
+      URLWithString:@"x-apple.systempreferences:com.apple.preference.security?"
+                    @"Privacy_ScreenCapture"];
+  if (url) {
+    [[NSWorkspace sharedWorkspace] openURL:url];
+  }
+}
+
+- (void)onRecheck:(id)sender {
+  (void)sender;
+  [self refreshStatus];
+}
+
+- (void)syncFinalStatusIfIncomplete {
+  if (!(self.lastAx && self.lastSr)) {
+    self.lastAx = AXIsProcessTrusted();
+    self.lastSr = poll_screen_recording_via_doctor();
+  }
+}
+
+- (void)onDone:(id)sender {
+  (void)sender;
+  [self syncFinalStatusIfIncomplete];
+  [self finishAndClose];
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+  (void)notification;
+  [self invalidateTimers];
+  if (!self.isClosing) {
+    self.isClosing = YES;
+    [self syncFinalStatusIfIncomplete];
+    [self stopModalWithWakeup];
+  }
+}
+
+@end
+
+char *apexuse_macos_onboard(int force, int auto_close) {
+  BOOL ax = AXIsProcessTrusted();
+  BOOL sr = preflight_screen_recording_in_process();
+  NSString *hostAppName = detect_host_app_name();
+
+  if (!force && ax && sr) {
+    return dup_json(@{
+      @"ok" : @YES,
+      @"os" : @"macos",
+      @"shown" : @NO,
+      @"already_granted" : @YES,
+      @"accessibility" : @YES,
+      @"screen_recording" : @YES,
+      @"completed" : @YES,
+      @"host_app" : hostAppName ?: (id)[NSNull null],
+    });
+  }
+
+  if (![NSThread isMainThread]) {
+    return dup_json(@{
+      @"ok" : @NO,
+      @"code" : @"main_thread_required",
+      @"message" : @"macOS permission onboarding UI must run on the main thread",
+    });
+  }
+
+  ensure_cgs_init();
+  NSApplicationActivationPolicy priorPolicy = [NSApp activationPolicy];
+  [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+  if (@available(macOS 14.0, *)) {
+    [NSApp activate];
+  } else {
+    [[NSRunningApplication currentApplication]
+        activateWithOptions:NSApplicationActivateAllWindows];
+  }
+
+  ApexUseOnboardController *controller =
+      [[ApexUseOnboardController alloc] initWithHostAppName:hostAppName
+                                                  autoClose:(auto_close != 0)];
+  [controller startPolling];
+  [controller.window makeKeyAndOrderFront:nil];
+  [NSApp runModalForWindow:controller.window];
+  [controller invalidateTimers];
+  controller.window.delegate = nil;
+  [controller.window orderOut:nil];
+  pump_ui_ms(20);
+  [NSApp setActivationPolicy:priorPolicy];
+
+  BOOL finalAx = controller.lastAx;
+  BOOL finalSr = controller.lastSr;
+  return dup_json(@{
+    @"ok" : @YES,
+    @"os" : @"macos",
+    @"shown" : @YES,
+    @"already_granted" : @NO,
+    @"accessibility" : @(finalAx),
+    @"screen_recording" : @(finalSr),
+    @"completed" : @(finalAx && finalSr),
+    @"host_app" : hostAppName ?: (id)[NSNull null],
   });
 }
 

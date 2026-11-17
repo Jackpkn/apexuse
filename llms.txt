@@ -9,7 +9,8 @@
 - Crates.io: https://crates.io/crates/apexuse-mcp
 - README: https://github.com/Jackpkn/apexuse/blob/main/README.md
 - Agent Config Guide: https://github.com/Jackpkn/apexuse/blob/main/agent-configs/README.md
-- Agent Skill: https://github.com/Jackpkn/apexuse/blob/main/.agents/skills/apexuse/SKILL.md
+- Agent Skill Pack: https://github.com/Jackpkn/apexuse/blob/main/.agents/skills/apexuse/SKILL.md (`agents/openai.yaml`, `references/{installation,usage,troubleshooting}.md`)
+- Codex Desktop Plugin: https://github.com/Jackpkn/apexuse/blob/main/plugins/apexuse/.codex-plugin/plugin.json (`marketplace`: `.agents/plugins/marketplace.json`)
 - MCP Registry Manifest: https://github.com/Jackpkn/apexuse/blob/main/server.json
 - License (MIT): https://github.com/Jackpkn/apexuse/blob/main/LICENSE
 
@@ -24,18 +25,26 @@
 
 ## OS Architecture
 
-- macOS 14+ (`rust/native/macos_bridge.m`): Batched `AXUIElementCopyMultipleAttributeValues` IPC (`kAXURLAttribute` `URL=`, Chromium/Electron `AXTable`/`AXRow`/`AXCell`/`AXColumnHeader`/`AXTab`, `kAXValueAttribute`/`kAXSelectedTextRangeAttribute`), `ScreenCaptureKit` (with resolution cap & 1500ms window cache), Apple `Vision` OCR, `ApexUseCursorView` overlay, per-PID `CGEvent`/`NSEvent` chunked Unicode typing. Live verified.
+- macOS 14+ (`rust/native/macos_bridge.m`): Batched `AXUIElementCopyMultipleAttributeValues` IPC (`kAXURLAttribute` `URL=`, Chromium/Electron `AXTable`/`AXRow`/`AXCell`/`AXColumnHeader`/`AXTab`, `set_value`/`select_text`), `ScreenCaptureKit` (with resolution cap & 1500ms window cache), Apple `Vision` OCR, `ApexUseCursorView` overlay, per-PID `CGEvent`/`NSEvent` chunked Unicode typing, and host-aware AppKit permission onboarding (`onboard` / `doctor --onboard` with System Settings deep-links and live child-`doctor` Screen Recording polling). Live verified.
 - Windows 10/11 (`rust/src/driver/windows.rs`): Pure-Rust Win32 FFI (`IUIAutomation` COM `ValuePattern`/`TextPattern`, `PrintWindow`/`BitBlt`, WinRT `Windows.Media.Ocr`, batched `SendInput`, layered `AgentCursor`, `som_png` codec). Cross-checked; CI build configured.
 - Linux X11/Wayland (`rust/src/driver/linux.rs`): Runtime `dlopen` `libX11` / `libXtst`, `AT-SPI2` (`EditableText` / `Text` / `gi.repository.Atspi`), Wayland helpers (`grim`/`spectacle`/`gnome-screenshot`, `wtype`/`ydotool`), `tesseract` OCR, `som_png` codec. Cross-checked; CI build configured.
 
 ## Install, Wire & CLI
 
 ```sh
-npx -y apexuse-mcp install all --write --npx --with-skill
+npx -y apexuse-mcp install all --write --npx --with-skill --probe
+npx -y apexuse-mcp install codex-plugin --write --npx --probe
+npx -y apexuse-mcp probe --npx
+npx -y apexuse-mcp doctor --onboard
 npx -y apexuse-mcp doctor --check
+npx skills add Jackpkn/apexuse -g -a codex --skill apexuse -y
 npx -y apexuse-mcp config show
 npx -y apexuse-mcp call inspect_app --args '{"app":"Calculator"}'
 cargo install apexuse-mcp
 cargo build --release --manifest-path rust/Cargo.toml
 cargo test --manifest-path rust/Cargo.toml
 ```
+
+- `npm install` (`npm/apexuse-mcp/scripts/postinstall.js`) prints platform-aware setup commands (`doctor --onboard` on macOS, `doctor --check` elsewhere, `install all ... --probe`, `install codex-plugin`, and `mcpServers` JSON).
+- `install all --write` preserves active `codex-plugin` (`[plugins."apexuse@apexuse-local"].enabled = true`) instead of overwriting with `[mcp_servers.apexuse]`; explicit `install codex --write` switches back cleanly (`enabled = false`).
+- `probe` / `--probe` (`rust/src/probe.rs`) runs a bounded pure-Rust MCP stdio handshake (`initialize`, `notifications/initialized`, `tools/list`) against the resolved invocation.

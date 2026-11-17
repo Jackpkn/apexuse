@@ -18,6 +18,11 @@ const {
   downloadBuffer,
   resolveBinary,
 } = require("../bin/apexuse-mcp.js");
+const {
+  FALLBACK_VERSION,
+  readPackageVersion,
+  renderPostinstallMessage,
+} = require("../scripts/postinstall.js");
 
 function makeTempDir(prefix = "apexuse-launcher-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -489,6 +494,95 @@ test("defaultPathLookup skips symlink to launcher itself and resolveBinary fails
     );
     const cachePath = resolveCacheBinaryPath({ APEXUSE_STATE_DIR: stateDir }, resolveTarget("darwin", "arm64"), VERSION, "darwin");
     assert.equal(fs.existsSync(cachePath), false);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("renderPostinstallMessage adapts guidance for macOS vs Linux/Windows", () => {
+  const snippet = '{"mcpServers":{"apexuse":{"command":"npx","args":["-y","apexuse-mcp"]}}}';
+
+  const macMsg = renderPostinstallMessage({ platform: "darwin", version: "0.3.0" });
+  assert.ok(macMsg.includes("Installed apexuse-mcp@0.3.0"));
+  assert.ok(macMsg.includes("npx -y apexuse-mcp doctor --onboard"));
+  assert.ok(macMsg.includes("npx -y apexuse-mcp doctor --check"));
+  assert.ok(macMsg.includes("npx -y apexuse-mcp install all --write --npx --with-skill --probe"));
+  assert.ok(macMsg.includes("install codex-plugin --write --npx --probe"));
+  assert.ok(macMsg.includes(snippet));
+
+  for (const platform of ["linux", "win32"]) {
+    const msg = renderPostinstallMessage({ platform, version: "0.3.0" });
+    assert.ok(msg.includes("Installed apexuse-mcp@0.3.0"));
+    assert.ok(msg.includes("npx -y apexuse-mcp doctor --check"));
+    assert.equal(msg.includes("doctor --onboard"), false);
+    assert.equal(msg.includes("--onboard"), false);
+    assert.ok(msg.includes("npx -y apexuse-mcp install all --write --npx --with-skill --probe"));
+    assert.ok(msg.includes("install codex-plugin --write --npx --probe"));
+    assert.ok(msg.includes(snippet));
+  }
+});
+
+test("postinstall script runs cleanly and package tarball includes scripts/postinstall.js", () => {
+  const pkgDir = path.resolve(__dirname, "..");
+  const pkgJson = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8"));
+  assert.deepEqual(pkgJson.dependencies, {});
+  assert.equal(pkgJson.scripts && pkgJson.scripts.postinstall, "node ./scripts/postinstall.js");
+  assert.ok(Array.isArray(pkgJson.files) && pkgJson.files.includes("scripts/"));
+
+  const postinstallPath = path.join(pkgDir, "scripts", "postinstall.js");
+  const stdout = execFileSync(process.execPath, [postinstallPath], { encoding: "utf8" });
+  assert.ok(stdout.includes(`Installed apexuse-mcp@${VERSION}`));
+  assert.ok(stdout.includes("npx -y apexuse-mcp install all --write --npx --with-skill --probe"));
+
+  const tmpCache = makeTempDir("apexuse-npm-cache-");
+  try {
+    const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
+    const packOut = execFileSync(npmCmd, ["pack", "--dry-run", "--json", pkgDir], {
+      encoding: "utf8",
+      shell: process.platform === "win32",
+      env: { ...process.env, npm_config_cache: tmpCache },
+    });
+    const packInfo = JSON.parse(packOut);
+    assert.ok(Array.isArray(packInfo) && packInfo.length === 1);
+    const packagedPaths = packInfo[0].files.map((f) => f.path);
+    assert.ok(packagedPaths.includes("scripts/postinstall.js"));
+    assert.ok(packagedPaths.includes("bin/apexuse-mcp.js"));
+  } finally {
+    fs.rmSync(tmpCache, { recursive: true, force: true });
+  }
+});
+
+test("readPackageVersion falls back cleanly to 0.3.0 without throwing when package.json is missing or invalid", () => {
+  assert.equal(readPackageVersion(), VERSION);
+
+  const tmpDir = makeTempDir("apexuse-postinstall-fallback-");
+  try {
+    const missingPkg = path.join(tmpDir, "missing", "package.json");
+    assert.equal(readPackageVersion(missingPkg), FALLBACK_VERSION);
+
+    const corruptPkg = path.join(tmpDir, "corrupt.json");
+    fs.writeFileSync(corruptPkg, "{broken json");
+    assert.equal(readPackageVersion(corruptPkg), FALLBACK_VERSION);
+
+    const emptyVersionPkg = path.join(tmpDir, "empty-version.json");
+    fs.writeFileSync(emptyVersionPkg, JSON.stringify({ name: "apexuse-mcp", version: "  " }));
+    assert.equal(readPackageVersion(emptyVersionPkg), FALLBACK_VERSION);
+
+    const customPkg = path.join(tmpDir, "custom.json");
+    fs.writeFileSync(customPkg, JSON.stringify({ name: "apexuse-mcp", version: "1.2.3" }));
+    assert.equal(readPackageVersion(customPkg), "1.2.3");
+
+    const fallbackMsg = renderPostinstallMessage({ platform: "linux", pkgPath: missingPkg });
+    assert.ok(fallbackMsg.includes(`Installed apexuse-mcp@${FALLBACK_VERSION}`));
+
+    // Executing postinstall.js standalone without ../package.json must not crash on require
+    const scriptsDir = path.join(tmpDir, "isolated", "scripts");
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    const srcScript = path.resolve(__dirname, "../scripts/postinstall.js");
+    const copiedScript = path.join(scriptsDir, "postinstall.js");
+    fs.copyFileSync(srcScript, copiedScript);
+    const out = execFileSync(process.execPath, [copiedScript], { encoding: "utf8" });
+    assert.ok(out.includes(`Installed apexuse-mcp@${FALLBACK_VERSION}`));
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

@@ -2,7 +2,7 @@ use crate::config::{AppConfig, ImageFormat, TimingConfig};
 use crate::driver::common::normalize_role;
 use crate::driver::{
     is_editable_role, reconcile_and_diff_snapshot, ActionRequest, AppSnapshot, DoctorStatus,
-    ImageEncodeOptions, OcrMode, OsDriver, Rect, UiElement, WindowState,
+    ImageEncodeOptions, OcrMode, OnboardStatus, OsDriver, Rect, UiElement, WindowState,
 };
 use crate::json::JsonValue;
 use crate::memory::{WorkflowMemory, WorkflowStep};
@@ -241,17 +241,65 @@ impl Gateway {
                 accessibility,
                 screen_recording,
                 note,
-            }) => JsonValue::object(vec![
-                ("ok", JsonValue::Bool(true)),
-                ("os", JsonValue::String(os)),
-                ("accessibility", JsonValue::Bool(accessibility)),
-                ("screen_recording", JsonValue::Bool(screen_recording)),
-                ("note", JsonValue::String(note)),
-                (
-                    "mode",
-                    JsonValue::String(self.settings.mode.as_str().to_string()),
-                ),
-            ]),
+            }) => {
+                let mut fields = vec![
+                    ("ok", JsonValue::Bool(true)),
+                    ("os", JsonValue::String(os.clone())),
+                    ("accessibility", JsonValue::Bool(accessibility)),
+                    ("screen_recording", JsonValue::Bool(screen_recording)),
+                    ("note", JsonValue::String(note)),
+                    (
+                        "mode",
+                        JsonValue::String(self.settings.mode.as_str().to_string()),
+                    ),
+                ];
+                if os == "macos" && (!accessibility || !screen_recording) {
+                    fields.push((
+                        "onboard_hint",
+                        JsonValue::String(
+                            "Run 'apexuse-mcp doctor --onboard' to open guided setup".into(),
+                        ),
+                    ));
+                }
+                JsonValue::object(fields)
+            }
+            Err(e) => err_json(&e.code, &e.message),
+        }
+    }
+
+    pub fn onboard(&self, force: bool, auto_close: bool) -> JsonValue {
+        match self.driver.onboard(force, auto_close) {
+            Ok(OnboardStatus {
+                os,
+                shown,
+                already_granted,
+                accessibility,
+                screen_recording,
+                completed,
+                host_app,
+                note,
+            }) => {
+                let mut fields = vec![
+                    ("ok", JsonValue::Bool(true)),
+                    ("os", JsonValue::String(os)),
+                    ("shown", JsonValue::Bool(shown)),
+                    ("already_granted", JsonValue::Bool(already_granted)),
+                    ("accessibility", JsonValue::Bool(accessibility)),
+                    ("screen_recording", JsonValue::Bool(screen_recording)),
+                    ("completed", JsonValue::Bool(completed)),
+                    (
+                        "host_app",
+                        match host_app {
+                            Some(h) => JsonValue::String(h),
+                            None => JsonValue::Null,
+                        },
+                    ),
+                ];
+                if !note.is_empty() {
+                    fields.push(("note", JsonValue::String(note)));
+                }
+                JsonValue::object(fields)
+            }
             Err(e) => err_json(&e.code, &e.message),
         }
     }
@@ -4310,12 +4358,26 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 /// Deterministic mock driver used by Rust unit tests and `--mock` MCP smoke tests.
 pub struct MockDriver {
     pub click_log: std::sync::Mutex<Vec<String>>,
+    os: String,
+    accessibility: bool,
+    screen_recording: bool,
 }
 
 impl MockDriver {
     pub fn new() -> Self {
+        Self::with_permissions("mock", true, true)
+    }
+
+    pub fn with_permissions(
+        os: impl Into<String>,
+        accessibility: bool,
+        screen_recording: bool,
+    ) -> Self {
         Self {
             click_log: std::sync::Mutex::new(Vec::new()),
+            os: os.into(),
+            accessibility,
+            screen_recording,
         }
     }
 }
@@ -4323,10 +4385,39 @@ impl MockDriver {
 impl OsDriver for MockDriver {
     fn doctor(&self) -> Result<DoctorStatus, crate::driver::DriverError> {
         Ok(DoctorStatus {
-            os: "mock".into(),
-            accessibility: true,
-            screen_recording: true,
+            os: self.os.clone(),
+            accessibility: self.accessibility,
+            screen_recording: self.screen_recording,
             note: "Mock driver active for deterministic verification".into(),
+        })
+    }
+
+    fn onboard(
+        &self,
+        _force: bool,
+        _auto_close: bool,
+    ) -> Result<crate::driver::OnboardStatus, crate::driver::DriverError> {
+        let completed = self.accessibility && self.screen_recording;
+        let note = if self.os == "macos" {
+            if completed {
+                "Permissions already granted".into()
+            } else {
+                "Mock onboarding (UI suppressed in mock mode)".into()
+            }
+        } else if self.os == "mock" {
+            "Mock driver onboarding (no GUI window spawned)".into()
+        } else {
+            "macOS permission onboarding is only required on macOS".into()
+        };
+        Ok(crate::driver::OnboardStatus {
+            os: self.os.clone(),
+            shown: false,
+            already_granted: completed,
+            accessibility: self.accessibility,
+            screen_recording: self.screen_recording,
+            completed,
+            host_app: None,
+            note,
         })
     }
 
@@ -8730,6 +8821,113 @@ mod tests {
         );
         assert_eq!(reset_then_scroll.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(reset_then_scroll.payload.get("executed").and_then(|v| v.as_i64()), Some(3));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_includes_onboard_hint_only_when_macos_missing_permissions() {
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_doc_hint_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let gw_ax_missing = Gateway::new(
+            Box::new(MockDriver::with_permissions("macos", false, true)),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+        let doc_ax = gw_ax_missing.doctor();
+        assert_eq!(doc_ax.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(doc_ax.get("os").and_then(|v| v.as_str()), Some("macos"));
+        assert_eq!(doc_ax.get("accessibility").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(doc_ax.get("screen_recording").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            doc_ax.get("onboard_hint").and_then(|v| v.as_str()),
+            Some("Run 'apexuse-mcp doctor --onboard' to open guided setup")
+        );
+
+        let gw_sr_missing = Gateway::new(
+            Box::new(MockDriver::with_permissions("macos", true, false)),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+        let doc_sr = gw_sr_missing.doctor();
+        assert_eq!(
+            doc_sr.get("onboard_hint").and_then(|v| v.as_str()),
+            Some("Run 'apexuse-mcp doctor --onboard' to open guided setup")
+        );
+
+        let gw_macos_ok = Gateway::new(
+            Box::new(MockDriver::with_permissions("macos", true, true)),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+        assert!(gw_macos_ok.doctor().get("onboard_hint").is_none());
+
+        let gw_linux_missing = Gateway::new(
+            Box::new(MockDriver::with_permissions("linux", false, false)),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+        assert!(gw_linux_missing.doctor().get("onboard_hint").is_none());
+
+        let gw_mock_default = Gateway::new(
+            Box::new(MockDriver::new()),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+        assert!(gw_mock_default.doctor().get("onboard_hint").is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gateway_onboard_handles_mock_granted_and_missing_states() {
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_onboard_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let gw_default = Gateway::new(
+            Box::new(MockDriver::new()),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+        let ob_default = gw_default.onboard(false, true);
+        assert_eq!(ob_default.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(ob_default.get("os").and_then(|v| v.as_str()), Some("mock"));
+        assert_eq!(ob_default.get("shown").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(ob_default.get("already_granted").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(ob_default.get("accessibility").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(ob_default.get("screen_recording").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(ob_default.get("completed").and_then(|v| v.as_bool()), Some(true));
+
+        let gw_missing = Gateway::new(
+            Box::new(MockDriver::with_permissions("macos", false, true)),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+        let ob_missing = gw_missing.onboard(true, false);
+        assert_eq!(ob_missing.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(ob_missing.get("os").and_then(|v| v.as_str()), Some("macos"));
+        assert_eq!(ob_missing.get("shown").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(ob_missing.get("already_granted").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(ob_missing.get("accessibility").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(ob_missing.get("screen_recording").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(ob_missing.get("completed").and_then(|v| v.as_bool()), Some(false));
+
+        let gw_non_macos = Gateway::new(
+            Box::new(MockDriver::with_permissions("linux", true, true)),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+        let ob_linux = gw_non_macos.onboard(false, true);
+        assert_eq!(ob_linux.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(ob_linux.get("os").and_then(|v| v.as_str()), Some("linux"));
+        assert_eq!(ob_linux.get("shown").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            ob_linux.get("note").and_then(|v| v.as_str()),
+            Some("macOS permission onboarding is only required on macOS")
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

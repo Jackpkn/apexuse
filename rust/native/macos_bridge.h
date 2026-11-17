@@ -7,6 +7,7 @@ extern "C" {
 
 void apexuse_free_cstr(char *ptr);
 char *apexuse_macos_doctor(void);
+char *apexuse_macos_onboard(int force, int auto_close);
 char *apexuse_macos_list_apps(void);
 char *apexuse_macos_activate_app(const char *bundle_id);
 char *apexuse_macos_launch_app(const char *bundle_id);
