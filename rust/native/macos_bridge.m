@@ -3779,9 +3779,31 @@ char *apexuse_macos_check_point(const char *bundle_id, double x, double y) {
   if (isDesktop) {
     find_window_at_point(0, pt, &targetPid, NULL);
   }
+  AXUIElementRef hit = NULL;
   NSString *role = nil;
-  if (!check_hit_safe(targetPid, isChrome, x, y, NULL, &role)) {
+  if (!check_hit_safe(targetPid, isChrome, x, y, &hit, &role)) {
     return dup_json(@{@"ok" : @NO, @"code" : @"unsafe_target_field"});
+  }
+  NSString *label = @"";
+  if (hit) {
+    NSString *title = truncate_str(ax_string(hit, kAXTitleAttribute), 120);
+    NSString *desc = truncate_str(ax_string(hit, kAXDescriptionAttribute), 120);
+    NSString *fname = truncate_str(ax_string(hit, kAXFilenameAttribute), 120);
+    if (title.length > 0) {
+      label = title;
+    } else if (desc.length > 0) {
+      label = desc;
+    } else if (fname.length > 0) {
+      label = fname;
+    } else if ([role isEqualToString:@"AXStaticText"]) {
+      id rawVal = ax_copy(hit, kAXValueAttribute);
+      if ([rawVal isKindOfClass:[NSString class]]) {
+        NSString *txt = truncate_str((NSString *)rawVal, 120);
+        if (txt.length > 0)
+          label = txt;
+      }
+    }
+    CFRelease(hit);
   }
   return dup_json(@{
     @"ok" : @YES,
@@ -3789,6 +3811,7 @@ char *apexuse_macos_check_point(const char *bundle_id, double x, double y) {
             [NSWorkspace sharedWorkspace].frontmostApplication.bundleIdentifier
         ?: @"",
     @"role" : role ?: @"",
+    @"label" : label ?: @"",
   });
 }
 

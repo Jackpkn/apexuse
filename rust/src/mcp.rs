@@ -342,6 +342,8 @@ fn tool_defs() -> Vec<JsonValue> {
                             ("id", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
                             ("query", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
                             ("goal", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
+                            ("expected_domain", type_schema("string")),
+                            ("expected_window_contains", type_schema("string")),
                             ("steps", JsonValue::object(vec![("type", JsonValue::String("array".into()))])),
                             ("step_args", JsonValue::object(vec![("type", JsonValue::String("array".into()))])),
                         ]),

@@ -3,8 +3,8 @@
 #[cfg(target_os = "macos")]
 use super::{
     ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError,
-    ImageEncodeOptions, OcrBox, OcrMode, OnboardStatus, OsDriver, Rect, RunningApp, UiElement,
-    WindowMeta, WindowState,
+    ImageEncodeOptions, OcrBox, OcrMode, OnboardStatus, OsDriver, PointSafetyInfo, Rect,
+    RunningApp, UiElement, WindowMeta, WindowState,
 };
 #[cfg(target_os = "macos")]
 use crate::config::ImageFormat;
@@ -625,9 +625,25 @@ impl OsDriver for MacosDriver {
     }
 
     fn verify_point_safe(&self, bundle_id: &str, x: f64, y: f64) -> Result<bool, DriverError> {
+        Ok(self.probe_point_safe(bundle_id, x, y)?.safe)
+    }
+
+    fn probe_point_safe(&self, bundle_id: &str, x: f64, y: f64) -> Result<PointSafetyInfo, DriverError> {
         let c = to_cstr(bundle_id)?;
         let val = take_json(unsafe { apexuse_macos_check_point(c.as_ptr(), x, y) })?;
-        Ok(val.get("ok").and_then(|v| v.as_bool()) == Some(true))
+        let non_empty = |k: &str| {
+            val.get(k)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        Ok(PointSafetyInfo {
+            safe: val.get("ok").and_then(|v| v.as_bool()) == Some(true),
+            role: non_empty("role"),
+            label: non_empty("label"),
+            frontmost_bundle_id: non_empty("frontmost_bundle_id"),
+        })
     }
 
     fn open_url(&self, bundle_id: &str, url: &str) -> Result<(), DriverError> {
