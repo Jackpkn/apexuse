@@ -26,7 +26,7 @@ npx -y apexuse-mcp doctor --check
 - `--policy <path>` — inject `APEXUSE_POLICY=<path>` into the client's `env` / `environment` block
 - `--with-skill` — copy the bundled `SKILL.md` into standard agent skill directories (`~/.agents/skills/apexuse/SKILL.md`, `~/.claude/skills/apexuse/SKILL.md`, `~/.codex/skills/apexuse/SKILL.md`, or `.agents/` / `.claude/` in `--scope project`)
 
-Pair the MCP server with [`.agents/skills/apexuse/SKILL.md`](../.agents/skills/apexuse/SKILL.md) so your agent uses `inspect_app`, `set_value`, `select_text`, semantic `target`, `keep_snapshot`, and batched `run_actions` effectively.
+Pair the MCP server with [`.agents/skills/apexuse/SKILL.md`](../.agents/skills/apexuse/SKILL.md) so your agent uses AX-first diffing (`inspect_app`), single-round-trip `return_state: "diff"`, `verify_mode: "ax"`, `set_value`, `select_text`, semantic `target`, `keep_snapshot`, and batched `run_actions` effectively.
 
 ---
 
@@ -121,6 +121,8 @@ npx -y apexuse-mcp config show
 npx -y apexuse-mcp config set image.format png
 npx -y apexuse-mcp config set image.max_width 1600
 npx -y apexuse-mcp config set snapshot.reuse_form_refs true
+npx -y apexuse-mcp config set snapshot.ax_diff true
+npx -y apexuse-mcp config set snapshot.include_bounds false
 npx -y apexuse-mcp config reset
 ```
 
@@ -129,5 +131,5 @@ Run one-off or stateful multi-step calls directly from the shell:
 ```sh
 npx -y apexuse-mcp call inspect_app --args '{"app":"Calculator"}'
 npx -y apexuse-mcp call visual_inspect --args '{"app":"Calculator","format":"jpeg"}' --save-image out.jpg
-npx -y apexuse-mcp call --calls '[{"tool":"inspect_app","args":{"app":"Calculator"}},{"tool":"computer","args":{"action":"click","arguments":{"target":{"query":"7"}}}}]'
+npx -y apexuse-mcp call --calls '[{"tool":"inspect_app","args":{"app":"Calculator"}},{"tool":"computer","args":{"action":"click","arguments":{"target":{"query":"7"},"return_state":"diff","verify_change":true,"verify_mode":"ax"}}}]'
 ```

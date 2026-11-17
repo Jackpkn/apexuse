@@ -7,7 +7,7 @@
 [![Rust Zero Dependencies](https://img.shields.io/badge/Rust-0%20external%20crates-orange.svg)](./rust/Cargo.toml)
 [![MCP](https://img.shields.io/badge/MCP-stdio%20server-teal.svg)](./server.json)
 
-**ApexUse** (`apexuse-mcp`) is an open-source, local-first **Computer Use MCP server** written in pure Rust and native OS bridges. It gives AI coding agents — including **Antigravity**, **Claude Code**, **Claude Desktop**, **OpenAI Codex**, **Gemini CLI**, **Cursor**, **Windsurf**, **VS Code**, and **OpenCode** — full desktop and browser control over **macOS, Windows, and Linux** using native Accessibility trees, **Set-of-Mark (`[m1]..[mN]`)** visual grounding, direct native `set_value`/`select_text`, semantic `target` lookup, local OCR, compact JPEG screenshots, a non-hijacking `AgentCursor` overlay, batched `run_actions` (up to 24 steps), and local workflow memory.
+**ApexUse** (`apexuse-mcp`) is an open-source, local-first **Computer Use MCP server** written in pure Rust and native OS bridges. It gives AI coding agents — including **Antigravity**, **Claude Code**, **Claude Desktop**, **OpenAI Codex**, **Gemini CLI**, **Cursor**, **Windsurf**, **VS Code**, and **OpenCode** — full desktop and browser control over **macOS, Windows, and Linux** using batched native Accessibility trees with incremental AX diffing (`state_mode`), inline post-action `return_state: "diff"`, **Set-of-Mark (`[m1]..[mN]`)** visual grounding, direct native `set_value`/`select_text`, semantic `target` lookup, local OCR, compact JPEG screenshots, a non-hijacking `AgentCursor` overlay, batched `run_actions` (up to 24 steps), and local workflow memory.
 
 Zero external LLM keys. Zero external Rust crate or npm runtime dependencies. Zero cloud relay.
 
@@ -18,8 +18,8 @@ Zero external LLM keys. Zero external Rust crate or npm runtime dependencies. Ze
 | Capability | **ApexUse (`apexuse-mcp`)** | Screenshot-Only Computer Use | Browser-Only MCPs (Playwright / DevTools) |
 | --- | --- | --- | --- |
 | **App Coverage** | **Full OS**: native apps, Electron, terminals & any browser | Whole screen | Browser tabs only |
-| **UI Grounding** | **Hybrid**: semantic Accessibility (`e1..eN`) + deterministic `target: {query, role}` + Set-of-Mark (`[m1]..[mN]`) + OCR | Pixel coordinates only | DOM only |
-| **Form Input & Speed** | Native **`set_value`** / **`select_text`**, **`keep_snapshot`** form-ref reuse, **`run_actions`** (up to 24 steps) + adaptive **`verify_change`** | 1 LLM round-trip per slow key/click | Step-by-step DOM calls |
+| **UI Grounding** | **Hybrid AX-first**: batched Accessibility (`e1..eN`, `URL=`, Chrome/Electron tables) + incremental AX diffs + deterministic `target: {query, role}` + Set-of-Mark (`[m1]..[mN]`) + OCR | Pixel coordinates only | DOM only |
+| **Form Input & Speed** | Native **`set_value`** / **`select_text`**, **`keep_snapshot`** form-ref reuse, **`return_state: "diff"`** (1-round-trip action + diff), **`run_actions`** (up to 24 steps) + **`verify_mode: "ax"`** | 1 LLM round-trip per slow key/click | Step-by-step DOM calls |
 | **Image Bandwidth** | Pure-Rust baseline **JPEG** default (`quality=80`, `max_width=1280`) + opt-in **PNG** | Uncompressed full-res PNGs | Page screenshots |
 | **Visual Pointer** | Floating transparent **`AgentCursor`** overlay (never warps macOS hardware cursor) | Teleports real user cursor | None / page focus |
 | **Workflow Memory** | Records & replays structural macros via **`workflow_memory`** | Re-plans every run | Scripts must be coded |
@@ -31,7 +31,7 @@ Zero external LLM keys. Zero external Rust crate or npm runtime dependencies. Ze
 
 | Platform | Backend Driver | Capabilities & Verification |
 | --- | --- | --- |
-| **macOS 14+ (`arm64` & `x86_64`)** | `MacosDriver` + `rust/native/macos_bridge.m` | `AXUIElement` (`set_value` / `select_text`), `ScreenCaptureKit` (width scaling & 1500ms window cache), Apple `Vision` OCR, `ApexUseCursorView` overlay, chunked per-PID `CGEvent`/`NSEvent`. **Live verified on macOS.** |
+| **macOS 14+ (`arm64` & `x86_64`)** | `MacosDriver` + `rust/native/macos_bridge.m` | Batched `AXUIElementCopyMultipleAttributeValues` IPC (`kAXURLAttribute` `URL=`, Chromium/Electron `AXTable`/`AXRow`/`AXCell`/`AXColumnHeader`/`AXTab`, `set_value` / `select_text`), `ScreenCaptureKit` (width scaling & 1500ms window cache), Apple `Vision` OCR, `ApexUseCursorView` overlay, chunked per-PID `CGEvent`/`NSEvent`. **Live verified on macOS.** |
 | **Windows 10 / 11 (`x86_64`)** | `WindowsDriver` (`rust/src/driver/windows.rs`) | Pure-Rust Win32 FFI (`IUIAutomation` COM `ValuePattern`/`TextPattern`, `PrintWindow`/`BitBlt`, WinRT `Windows.Media.Ocr`, batched `SendInput`, layered `AgentCursor`, `som_png` JPEG/PNG codec). **Cross-checked (`x86_64-pc-windows-gnu`) & built in Windows CI.** |
 | **Linux (`x86_64`, X11 & Wayland)** | `LinuxDriver` (`rust/src/driver/linux.rs`) | Runtime `dlopen` `libX11` / `libXtst` + `AT-SPI2` (`EditableText`/`Text`/`gi.repository.Atspi`), Wayland helpers (`grim` / `spectacle` / `gnome-screenshot`, `wtype` / `ydotool`), `tesseract` OCR, `som_png` JPEG/PNG codec. **Cross-checked (`x86_64-unknown-linux-gnu`) & built in Linux CI.** |
 
@@ -176,6 +176,8 @@ Override defaults persistently via `apexuse-mcp config set <key> <value>` (or `A
 | `timing.poll_interval_ms` | `30` | `10..=500` | Early-exit poll cadence during `verify_change`. |
 | `timing.key_delay_us` | `500` | `0..=50000` | Inter-chunk delay for fast Unicode fallback typing. |
 | `snapshot.reuse_form_refs` | `true` | `true` \| `false` | Preserve `e1..eN` & `[m1]..[mN]` across non-navigating edits (`type`, `set_value`, `select_text`). |
+| `snapshot.ax_diff` | `true` | `true` \| `false` | Auto-diff repeat `inspect_app` / inline `inspect` trees of the same app/window (`state_mode`: `"full"` \| `"diff"` \| `"unchanged"`). |
+| `snapshot.include_bounds` | `false` | `true` \| `false` | Include `@(x,y,wxh)` element bounds in AX outlines (`inspect_app`, `return_state`). |
 
 Launcher wrapper options (`npx -y apexuse-mcp`):
 - `--use-system`: allow `PATH` fallback if no cached binary exists (stripped before forwarding args to `apexuse-mcp`).
@@ -187,10 +189,10 @@ Launcher wrapper options (`npx -y apexuse-mcp`):
 
 | Tool | Actions & Key Parameters |
 | --- | --- |
-| `inspect_app` | Read-only Accessibility snapshot for `app` (bundle ID, executable, app name, or `"desktop"`), optional `window` index and `query` filter. Returns `e1..eN` refs & workflow hints without taking a screenshot. |
+| `inspect_app` | AX-first read-only snapshot for `app` (bundle ID, executable, app name, or `"desktop"`), optional `window` index, `query` filter, `diff` (default `config.snapshot.ax_diff` `true`), and `include_bounds` (default `config.snapshot.include_bounds` `false` to omit `@(x,y,wxh)`). Exposes `e1..eN` refs, `URL=` on windows/`WebArea`/links, Chrome/Electron table/tab structure, `state_mode` (`"full" \| "diff" \| "unchanged" \| "filtered"`), and workflow hints without taking a screenshot. |
 | `visual_inspect` | Captures an app window or full `"desktop"`, fuses Accessibility + OCR (`ocr="auto"\|"fast"\|"accurate"\|"off"`, `max_marks` `1..=150`), and returns an annotated **JPEG** (default `format="jpeg"`, `quality=80`, `max_width=1280`) or opt-in **PNG** (`format="png"`) with `[m1]..[mN]` mark IDs. |
-| `computer` | `inspect`, `click`, `double_click`, `right_click`, `hover`, `drag`, `type`, `set_value` (direct native text write/clear on verified editable controls; `text: ""` clears; fails closed on unverified coordinates/OCR-only marks), `select_text` (optional `start`/`end` offsets), `press_key`, `scroll` (`ref`/`mark`/`x,y`), `run_actions` (up to **24** chained steps including inline `set_value`, `select_text`, `wait_for`, `inspect`, and `target`), `wait_for` (local AX/OCR poll up to 60s), `confirm`. Supports semantic `target: { query, role?, fresh? }`, `keep_snapshot`, `verify_change`, `max_retries` (`0..=3`), `settle_ms`, `poll_interval_ms`, `retry_delay_ms`, `require_change`. |
-| `desktop` | `list_applications`, `launch_application`, `activate_application`, `open_url`, `visual_click`, `double_click`, `right_click`, `hover`, `drag` (supports `mark`, `ref`, `target`, or `x`/`y`). |
+| `computer` | `inspect` (supports `diff`, `include_bounds`, `window`, `query`), `click`, `double_click`, `right_click`, `hover`, `drag`, `type`, `set_value` (direct native text write/clear on verified editable controls; `text: ""` clears; fails closed on unverified coordinates/OCR-only marks), `select_text` (optional `start`/`end` offsets), `press_key`, `scroll` (`ref`/`mark`/`x,y`), `run_actions` (up to **24** chained steps including inline `set_value`, `select_text`, `wait_for`, `inspect`, `target`, and per-step `verify_mode`/`diff`/`include_bounds`), `wait_for` (local AX/OCR poll up to 60s), `confirm`. Supports `return_state="none"\|"diff"\|"full"` (attaches post-action AX diff/tree inline and keeps new refs live in 1 round-trip), `include_bounds`, `verify_mode="auto"\|"ax"\|"visual"` (`"ax"` checks Accessibility changes with zero screenshots), semantic `target: { query, role?, fresh? }`, `keep_snapshot`, `verify_change`, `max_retries` (`0..=3`), `settle_ms`, `poll_interval_ms`, `retry_delay_ms`, `require_change`. |
+| `desktop` | `list_applications`, `launch_application`, `activate_application`, `open_url`, `visual_click`, `double_click`, `right_click`, `hover`, `drag` (supports `mark`, `ref`, `target`, or `x`/`y`). Supports `return_state="none"\|"diff"\|"full"`, `include_bounds`, `verify_change`, `verify_mode="auto"\|"ax"\|"visual"`, `max_retries`, `settle_ms`, `poll_interval_ms`, `retry_delay_ms`, `require_change`. |
 | `screenshot` | Unannotated JPEG (default) or PNG (`format="png"`) capture of the largest window of a permitted running app after safety preflight. |
 | `workflow_memory` | `list`, `lookup`, `record`, `replay` (with optional `step_args`), `clear` stored in `~/.apexuse/memory/recipes.json` (never stores typed/`set_value` secrets). |
 
@@ -223,11 +225,12 @@ Built-in safety guardrails enforced regardless of policy:
 No. `apexuse-mcp` is a pure local MCP stdio binary with zero built-in LLM calls. Your existing AI agent (Antigravity, Claude Code, Codex, Gemini CLI, Cursor, Windsurf, VS Code, OpenCode, etc.) drives it directly over MCP.
 
 **How does ApexUse stay fast and token-efficient compared to traditional Computer Use?**
-1. `inspect_app` reads compact semantic UI elements (`e1..eN`) with zero image encoding.
-2. `set_value` and `select_text` mutate verified inputs directly via native Accessibility instead of 10ms/character keystroke loops.
-3. `keep_snapshot` (`reuse_form_refs: true`) preserves element refs and marks across form field edits using `<2ms` window-state verification.
-4. `visual_inspect` and `screenshot` default to scaled baseline JPEG (`quality=80`, `max_width=1280`, pure Rust) instead of huge PNGs, and `ocr="off"` returns instant AX-only visual marks.
-5. `computer(action="run_actions")` chains up to **24** steps (including inline `set_value`, `wait_for`, and semantic `target`) inside one model turn, with adaptive early-exit `verify_change` polling (`30ms` cadence).
+1. `inspect_app` batches macOS AX attribute reads (`AXUIElementCopyMultipleAttributeValues`), omits `@(x,y,wxh)` bounds by default (`include_bounds: false`), exposes `URL=` and Chrome/Electron table structure, and auto-diffs repeat calls (`diff: true` -> `state_mode: "full" | "diff" | "unchanged"`) with zero image encoding.
+2. Passing `return_state: "diff"` on `computer`, `desktop`, or `run_actions` executes the action and returns the updated AX diff with live `e1..eN` refs (`snapshot_active: true`, `snapshot_preserved: true`) in **one** MCP round-trip — no extra `inspect_app` call needed.
+3. `set_value` and `select_text` mutate verified inputs directly via native Accessibility instead of 10ms/character keystroke loops, while `keep_snapshot` (`reuse_form_refs: true`) preserves refs across form edits.
+4. `verify_mode: "ax"` verifies `verify_change: true` transitions strictly via Accessibility with zero screenshot overhead (`30ms` early-exit polling).
+5. `visual_inspect` and `screenshot` default to scaled baseline JPEG (`quality=80`, `max_width=1280`, pure Rust) instead of huge PNGs, and `ocr="off"` returns instant AX-only visual marks.
+6. `computer(action="run_actions")` chains up to **24** steps (including inline `set_value`, `wait_for`, and semantic `target`) inside a single model turn.
 
 **Does it hijack my physical mouse cursor while working?**
 On macOS, `ApexUse` renders an independent translucent `AgentCursor` overlay window and dispatches targeted events without warping your hardware cursor during normal visual feedback. On Windows, a layered click-through `AgentCursor` overlay tracks automated actions.

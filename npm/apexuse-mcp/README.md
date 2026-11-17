@@ -1,6 +1,6 @@
 # apexuse-mcp
 
-Zero-dependency `npx` launcher for **[ApexUse](https://github.com/Jackpkn/apexuse)** (`apexuse-mcp`) — a local-first cross-platform Computer Use MCP server in pure Rust with native Accessibility, Set-of-Mark (`[m1]..[mN]`) visual grounding, local OCR, batched `run_actions`, and workflow memory.
+Zero-dependency `npx` launcher for **[ApexUse](https://github.com/Jackpkn/apexuse)** (`apexuse-mcp`) — a local-first cross-platform Computer Use MCP server in pure Rust with batched native Accessibility + incremental AX diffing (`state_mode`), single-round-trip `return_state: "diff"`, AX-only `verify_mode: "ax"`, Set-of-Mark (`[m1]..[mN]`) visual grounding, local OCR, batched `run_actions`, and workflow memory.
 
 ## Quick Start
 
@@ -35,7 +35,7 @@ Supported prebuilt release targets (`v0.3.0`):
 - `linux-x86_64` (`linux` / `x64`)
 - `windows-x86_64` (`win32` / `x64`)
 
-For full CLI (`config`, `call`), MCP tool schemas (`set_value`, `select_text`, semantic `target`, `keep_snapshot`, `run_actions`, JPEG default), and safety controls, see the [main repository README](https://github.com/Jackpkn/apexuse#readme).
+For full CLI (`config` including `snapshot.ax_diff` / `snapshot.include_bounds`, `call`), MCP tool schemas (`inspect_app` diffing, `return_state: "diff"`, `verify_mode: "ax"`, `set_value`, `select_text`, semantic `target`, `keep_snapshot`, `run_actions`, JPEG default), and safety controls, see the [main repository README](https://github.com/Jackpkn/apexuse#readme).
 
 ## License
 

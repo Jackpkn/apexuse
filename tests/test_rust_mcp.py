@@ -64,7 +64,21 @@ async def test_rust_mcp_stdio_end_to_end(tmp_path):
 
             insp = await session.call_tool("inspect_app", {"app": "Calculator"})
             assert insp.structuredContent["ok"] is True
+            assert insp.structuredContent["state_mode"] == "full"
+            assert "@(" not in insp.structuredContent["content"]
             assert len(insp.structuredContent["workflow_hints"]) == 1
+
+            insp_diff = await session.call_tool("inspect_app", {"app": "Calculator"})
+            assert insp_diff.structuredContent["ok"] is True
+            assert insp_diff.structuredContent["state_mode"] == "unchanged"
+
+            insp_bounds = await session.call_tool(
+                "inspect_app",
+                {"app": "Calculator", "diff": False, "include_bounds": True},
+            )
+            assert insp_bounds.structuredContent["ok"] is True
+            assert insp_bounds.structuredContent["state_mode"] == "full"
+            assert "@(" in insp_bounds.structuredContent["content"]
 
             # 3. Screenshot defaults to JPEG and supports explicit PNG
             ss_def = await session.call_tool("screenshot", {"app": "Calculator"})
@@ -345,6 +359,49 @@ async def test_rust_mcp_direct_policy_executes_without_confirmation_loop(tmp_pat
             assert rep.structuredContent["ok"] is True
             assert rep.structuredContent["completed_steps"] == 2
 
+            # AX-first diffing, inline return_state="diff" keeping refs live, and verify_mode="ax"
+            insp_base = await session.call_tool("inspect_app", {"app": "Calculator", "diff": False})
+            assert insp_base.structuredContent["ok"] is True
+            assert insp_base.structuredContent["state_mode"] == "full"
+            assert "@(" not in insp_base.structuredContent["content"]
+
+            clk_diff = await session.call_tool(
+                "computer",
+                {"action": "click", "arguments": {"ref": "e1", "return_state": "diff"}},
+            )
+            assert clk_diff.structuredContent["ok"] is True
+            assert "content" in clk_diff.structuredContent
+            assert clk_diff.structuredContent["state_mode"] == "unchanged"
+            assert clk_diff.structuredContent["snapshot_active"] is True
+            assert clk_diff.structuredContent["snapshot_preserved"] is True
+
+            # Ref e2 and e1 remain immediately usable without an extra inspect_app call
+            sv_live = await session.call_tool(
+                "computer",
+                {"action": "set_value", "arguments": {"ref": "e2", "text": "post return_state"}},
+            )
+            assert sv_live.structuredContent["ok"] is True
+            assert sv_live.structuredContent["snapshot_preserved"] is True
+
+            clk_ax = await session.call_tool(
+                "computer",
+                {
+                    "action": "click",
+                    "arguments": {
+                        "ref": "e1",
+                        "verify_change": True,
+                        "verify_mode": "ax",
+                        "max_retries": 0,
+                        "settle_ms": 10,
+                    },
+                },
+            )
+            assert clk_ax.structuredContent["ok"] is True
+            assert clk_ax.structuredContent["attempts"] == 1
+            assert clk_ax.structuredContent["verified_change"] is False
+            assert clk_ax.structuredContent["ax_changed"] is False
+            assert clk_ax.structuredContent["visual_changed"] is False
+
 
 def test_rust_cli_subcommands_end_to_end(tmp_path):
     if not RUST_BIN.is_file():
@@ -392,13 +449,55 @@ def test_rust_cli_subcommands_end_to_end(tmp_path):
     assert get_fmt.returncode == 0
     assert json.loads(get_fmt.stdout)["value"] == "png"
 
+    set_ax_diff = subprocess.run(
+        [str(RUST_BIN), "config", "set", "snapshot.ax_diff", "false"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert set_ax_diff.returncode == 0, set_ax_diff.stderr
+    assert json.loads(set_ax_diff.stdout)["value"] is False
+
+    get_ax_diff = subprocess.run(
+        [str(RUST_BIN), "config", "get", "snapshot.ax_diff"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert get_ax_diff.returncode == 0
+    assert json.loads(get_ax_diff.stdout)["value"] is False
+
+    set_bounds = subprocess.run(
+        [str(RUST_BIN), "config", "set", "snapshot.include_bounds", "true"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert set_bounds.returncode == 0, set_bounds.stderr
+    assert json.loads(set_bounds.stdout)["value"] is True
+
+    get_bounds = subprocess.run(
+        [str(RUST_BIN), "config", "get", "snapshot.include_bounds"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert get_bounds.returncode == 0
+    assert json.loads(get_bounds.stdout)["value"] is True
+
     show_cfg = subprocess.run([str(RUST_BIN), "config", "show"], capture_output=True, text=True, env=env)
     assert show_cfg.returncode == 0
-    assert json.loads(show_cfg.stdout)["config"]["image"]["format"] == "png"
+    show_json = json.loads(show_cfg.stdout)["config"]
+    assert show_json["image"]["format"] == "png"
+    assert show_json["snapshot"]["ax_diff"] is False
+    assert show_json["snapshot"]["include_bounds"] is True
 
     reset_cfg = subprocess.run([str(RUST_BIN), "config", "reset"], capture_output=True, text=True, env=env)
     assert reset_cfg.returncode == 0
-    assert json.loads(reset_cfg.stdout)["config"]["image"]["format"] == "jpeg"
+    reset_json = json.loads(reset_cfg.stdout)["config"]
+    assert reset_json["image"]["format"] == "jpeg"
+    assert reset_json["snapshot"]["ax_diff"] is True
+    assert reset_json["snapshot"]["include_bounds"] is False
 
     custom_cfg_path = tmp_path / "custom_config.json"
     env_custom = dict(env, APEXUSE_CONFIG=str(custom_cfg_path))
@@ -466,6 +565,28 @@ def test_rust_cli_subcommands_end_to_end(tmp_path):
     assert seq_file.returncode == 0, seq_file.stderr
     assert json.loads(seq_file.stdout)["results"][0]["result"]["image_format"] == "png"
     assert png_out.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    subprocess.run([str(RUST_BIN), "config", "reset"], check=True, env=env)
+
+    # Verify snapshot.ax_diff and snapshot.include_bounds wire into Gateway::with_config for CLI `call`
+    subprocess.run([str(RUST_BIN), "config", "set", "snapshot.ax_diff", "false"], check=True, env=env)
+    subprocess.run([str(RUST_BIN), "config", "set", "snapshot.include_bounds", "true"], check=True, env=env)
+    ax_cfg_calls = json.dumps(
+        [
+            {"tool": "inspect_app", "args": {"app": "Calculator"}},
+            {"tool": "inspect_app", "args": {"app": "Calculator"}},
+        ]
+    )
+    ax_cfg_res = subprocess.run(
+        [str(RUST_BIN), "call", "--mock", "--calls", ax_cfg_calls],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert ax_cfg_res.returncode == 0, ax_cfg_res.stderr
+    ax_cfg_data = json.loads(ax_cfg_res.stdout)
+    assert ax_cfg_data["results"][0]["result"]["state_mode"] == "full"
+    assert "@(" in ax_cfg_data["results"][0]["result"]["content"]
+    assert ax_cfg_data["results"][1]["result"]["state_mode"] == "full"
     subprocess.run([str(RUST_BIN), "config", "reset"], check=True, env=env)
 
     # Error exit codes on invalid config key and failing tool call
