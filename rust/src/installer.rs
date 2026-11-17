@@ -1361,6 +1361,7 @@ mod tests {
             .get("target_path")
             .and_then(|v| v.as_str())
             .unwrap()
+            .replace('\\', "/")
             .ends_with("Library/Application Support/Code/User/mcp.json"));
         let vsc_entry = vsc_user
             .get("config")
