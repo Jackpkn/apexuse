@@ -1,6 +1,7 @@
 pub mod config;
 pub mod driver;
 pub mod gateway;
+pub mod installer;
 pub mod json;
 pub mod mcp;
 pub mod memory;
