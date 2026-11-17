@@ -636,3 +636,186 @@ def test_rust_cli_subcommands_end_to_end(tmp_path):
     doc_mock = subprocess.run([str(RUST_BIN), "doctor", "--mock", "--check"], capture_output=True, text=True, env=env)
     assert doc_mock.returncode == 0
     assert json.loads(doc_mock.stdout)["accessibility"] is True
+
+
+def test_plugin_and_skill_assets_in_sync():
+    asset_pairs = [
+        (ROOT / "rust/assets/SKILL.md", ROOT / ".agents/skills/apexuse/SKILL.md"),
+        (ROOT / "rust/assets/plugin/marketplace.json", ROOT / ".agents/plugins/marketplace.json"),
+        (ROOT / "rust/assets/plugin/plugin.json", ROOT / "plugins/apexuse/.codex-plugin/plugin.json"),
+        (ROOT / "rust/assets/plugin/apexuse.svg", ROOT / "plugins/apexuse/assets/apexuse.svg"),
+        (ROOT / "rust/assets/plugin/apexuse-small.svg", ROOT / "plugins/apexuse/assets/apexuse-small.svg"),
+    ]
+    for crate_asset, repo_asset in asset_pairs:
+        assert crate_asset.is_file(), f"Missing crate asset: {crate_asset}"
+        assert repo_asset.is_file(), f"Missing repo asset: {repo_asset}"
+        assert crate_asset.read_bytes() == repo_asset.read_bytes(), (
+            f"Asset mismatch between {crate_asset} and {repo_asset}"
+        )
+
+    skill_dir = ROOT / ".agents/skills/apexuse"
+    openai_yaml = skill_dir / "agents/openai.yaml"
+    assert openai_yaml.is_file(), f"Missing {openai_yaml}"
+    yaml_text = openai_yaml.read_text(encoding="utf-8")
+    assert 'display_name: "ApexUse"' in yaml_text
+    assert "short_description:" in yaml_text
+    assert "default_prompt:" in yaml_text
+
+    for ref_name in ["installation.md", "usage.md", "troubleshooting.md"]:
+        ref_path = skill_dir / "references" / ref_name
+        assert ref_path.is_file(), f"Missing skill reference doc: {ref_path}"
+        assert len(ref_path.read_text(encoding="utf-8").strip()) > 0
+
+
+def test_rust_cli_codex_plugin_probe_and_onboard_end_to_end(tmp_path):
+    if not RUST_BIN.is_file():
+        pytest.skip("Rust release binary not built")
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    appdata = tmp_path / "appdata"
+    appdata.mkdir()
+    xdg_config = fake_home / ".config"
+    xdg_config.mkdir()
+    state_dir = tmp_path / "state"
+    env = dict(
+        os.environ,
+        HOME=str(fake_home),
+        USERPROFILE=str(fake_home),
+        APPDATA=str(appdata),
+        XDG_CONFIG_HOME=str(xdg_config),
+        APEXUSE_STATE_DIR=str(state_dir),
+        APEXUSE_POLICY=str(ROOT / "policy.autonomous.yaml"),
+    )
+    env.pop("APEXUSE_CONFIG", None)
+
+    # 1. Standalone probe --mock
+    probe_res = subprocess.run([str(RUST_BIN), "probe", "--mock"], capture_output=True, text=True, env=env)
+    assert probe_res.returncode == 0, probe_res.stderr
+    probe_data = json.loads(probe_res.stdout)
+    assert probe_data["ok"] is True
+    assert probe_data["server_name"] == "apexuse-mcp"
+    assert probe_data["tools_count"] == 6
+    assert set(probe_data["tools"]) == {
+        "inspect_app",
+        "visual_inspect",
+        "computer",
+        "desktop",
+        "screenshot",
+        "workflow_memory",
+    }
+
+    # 2. install codex-plugin --dry-run
+    dry_res = subprocess.run(
+        [str(RUST_BIN), "install", "codex-plugin", "--dry-run"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert dry_res.returncode == 0, dry_res.stderr
+    dry_data = json.loads(dry_res.stdout)
+    assert dry_data["ok"] is True
+    assert dry_data["agent"] == "codex-plugin"
+    assert dry_data["mode"] == "dry_run"
+    assert dry_data["status"] == "would_write"
+    assert not (fake_home / ".codex/plugins").exists()
+    assert not (fake_home / ".codex/config.toml").exists()
+
+    # 3. install codex-plugin --write --probe --mock
+    write_res = subprocess.run(
+        [str(RUST_BIN), "install", "codex-plugin", "--write", "--probe", "--mock"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert write_res.returncode == 0, write_res.stderr
+    write_data = json.loads(write_res.stdout)
+    assert write_data["ok"] is True
+    assert write_data["agent"] == "codex-plugin"
+    assert write_data["status"] == "written"
+    assert write_data["probe"]["ok"] is True
+    assert write_data["probe"]["tools_count"] == 6
+
+    marketplace_dir = fake_home / ".codex/plugins/marketplaces/apexuse-local"
+    cache_dir = fake_home / ".codex/plugins/cache/apexuse-local/apexuse/0.3.0"
+    assert (marketplace_dir / ".agents/plugins/marketplace.json").read_bytes() == (
+        ROOT / "rust/assets/plugin/marketplace.json"
+    ).read_bytes()
+    assert (cache_dir / ".codex-plugin/plugin.json").read_bytes() == (
+        ROOT / "rust/assets/plugin/plugin.json"
+    ).read_bytes()
+    assert (cache_dir / "assets/apexuse.svg").read_bytes() == (
+        ROOT / "rust/assets/plugin/apexuse.svg"
+    ).read_bytes()
+    assert (cache_dir / "assets/apexuse-small.svg").read_bytes() == (
+        ROOT / "rust/assets/plugin/apexuse-small.svg"
+    ).read_bytes()
+
+    for mcp_json_path in [marketplace_dir / "plugins/apexuse/.mcp.json", cache_dir / ".mcp.json"]:
+        assert mcp_json_path.is_file()
+        mcp_text = mcp_json_path.read_text(encoding="utf-8")
+        assert "--mock" not in mcp_text
+        mcp_json = json.loads(mcp_text)
+        entry = mcp_json["mcpServers"]["apexuse"]
+        assert "--mock" not in entry["args"]
+
+    codex_toml = fake_home / ".codex/config.toml"
+    toml_text = codex_toml.read_text(encoding="utf-8")
+    assert "[marketplaces.apexuse-local]" in toml_text
+    assert '[plugins."apexuse@apexuse-local"]' in toml_text
+    assert "enabled = true" in toml_text
+    assert "[mcp_servers.apexuse]" not in toml_text
+
+    # 4. install all --write preserves active codex-plugin
+    all_res = subprocess.run(
+        [str(RUST_BIN), "install", "all", "--write"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert all_res.returncode == 0, all_res.stderr
+    all_data = json.loads(all_res.stdout)
+    wired_agents = [item["agent"] for item in all_data["wired"]]
+    assert "codex-plugin" in wired_agents
+    assert "codex" not in wired_agents
+    toml_after_all = codex_toml.read_text(encoding="utf-8")
+    assert "[mcp_servers.apexuse]" not in toml_after_all
+    assert '[plugins."apexuse@apexuse-local"]' in toml_after_all
+    assert "enabled = true" in toml_after_all
+
+    # 5. install codex --write disables codex-plugin and writes [mcp_servers.apexuse]
+    codex_res = subprocess.run(
+        [str(RUST_BIN), "install", "codex", "--write"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert codex_res.returncode == 0, codex_res.stderr
+    toml_after_codex = codex_toml.read_text(encoding="utf-8")
+    assert "[mcp_servers.apexuse]" in toml_after_codex
+    assert '[plugins."apexuse@apexuse-local"]' in toml_after_codex
+    assert "enabled = false" in toml_after_codex
+    assert "enabled = true" not in toml_after_codex
+
+    # 6. onboard --mock --check and doctor --onboard --mock --check exit 0 with shown: false
+    onboard_res = subprocess.run(
+        [str(RUST_BIN), "onboard", "--mock", "--check"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert onboard_res.returncode == 0, onboard_res.stderr
+    onboard_data = json.loads(onboard_res.stdout)
+    assert onboard_data["ok"] is True
+    assert onboard_data["shown"] is False
+
+    doc_onboard_res = subprocess.run(
+        [str(RUST_BIN), "doctor", "--onboard", "--mock", "--check"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert doc_onboard_res.returncode == 0, doc_onboard_res.stderr
+    doc_onboard_data = json.loads(doc_onboard_res.stdout)
+    assert doc_onboard_data["ok"] is True
+    assert doc_onboard_data["shown"] is False

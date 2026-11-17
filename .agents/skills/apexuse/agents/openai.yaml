@@ -1,0 +1,4 @@
+interface:
+  display_name: "ApexUse"
+  short_description: "Native Accessibility + Set-of-Mark desktop and browser control"
+  default_prompt: "Use $apexuse to inspect desktop or browser apps via inspect_app first, execute actions with return_state: \"diff\" or batched run_actions, verify changes via verify_mode: \"ax\", and use visual_inspect Set-of-Mark grounding only when visual context is needed."
