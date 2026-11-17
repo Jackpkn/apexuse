@@ -348,7 +348,11 @@ pub fn reconcile_and_diff_snapshot(
     };
 
     let Some(p) = prev.filter(|p| {
-        !force_full && p.bundle_id == next.bundle_id && p.pid == next.pid && !p.elements.is_empty()
+        !force_full
+            && p.bundle_id == next.bundle_id
+            && p.pid == next.pid
+            && (p.bundle_id != "desktop" || p.frontmost_bundle_id == next.frontmost_bundle_id)
+            && !p.elements.is_empty()
     }) else {
         return full_result(next, next_ref_id);
     };

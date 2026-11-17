@@ -392,6 +392,7 @@ pub enum PendingAction {
 pub struct ConfirmationStore {
     ttl: Duration,
     entries: HashMap<String, (Instant, PendingAction)>,
+    order: VecDeque<String>,
     counter: u64,
 }
 
@@ -400,32 +401,56 @@ impl ConfirmationStore {
         Self {
             ttl: Duration::from_secs(ttl_seconds),
             entries: HashMap::new(),
+            order: VecDeque::new(),
             counter: 0,
         }
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        self.entries.retain(|_, (exp, _)| *exp > now);
+        self.order.retain(|tok| self.entries.contains_key(tok));
     }
 
     pub fn issue(&mut self, action: PendingAction) -> String {
         self.counter += 1;
         let now = Instant::now();
-        self.entries
-            .retain(|_, (exp, _)| *exp > now);
+        self.prune_expired(now);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos();
         let token = format!("tok_{}_{:08x}", self.counter, nanos ^ 0x5A5A_3C3C);
         self.entries.insert(token.clone(), (now + self.ttl, action));
+        self.order.push_back(token.clone());
         token
+    }
+
+    pub fn contains(&self, token: &str) -> bool {
+        self.entries.contains_key(token)
+    }
+
+    pub fn evict_excess(&mut self, max_entries: usize) {
+        while self.entries.len() > max_entries {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
     }
 
     pub fn consume(&mut self, token: &str) -> Option<PendingAction> {
         let now = Instant::now();
-        self.entries.retain(|_, (exp, _)| *exp > now);
-        self.entries.remove(token).map(|(_, act)| act)
+        self.prune_expired(now);
+        let removed = self.entries.remove(token).map(|(_, act)| act);
+        if removed.is_some() {
+            self.order.retain(|tok| tok != token);
+        }
+        removed
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.order.clear();
     }
 }
 

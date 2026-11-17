@@ -20,6 +20,10 @@ impl JsonValue {
         JsonValue::Object(map)
     }
 
+    pub fn is_null(&self) -> bool {
+        matches!(self, JsonValue::Null)
+    }
+
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             JsonValue::Bool(b) => Some(*b),

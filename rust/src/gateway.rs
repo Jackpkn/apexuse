@@ -278,6 +278,7 @@ impl Gateway {
 
     fn invalidate_snapshot(&mut self) {
         self.epoch += 1;
+        self.snapshot_filtered = false;
         self.snapshot_pid = None;
         self.snapshot_frontmost = None;
         self.snapshot_windows_total = None;
@@ -418,7 +419,12 @@ impl Gateway {
             let content = snap.render_outline_with_options(Some(q), include_bounds);
             return (content, "filtered", snap);
         }
-        let force_full = !diff_enabled || self.prev_ax_window != window;
+        let desktop_frontmost_changed = self.prev_ax_snapshot.as_ref().is_some_and(|p| {
+            (p.bundle_id == "desktop" || snap.bundle_id == "desktop")
+                && p.frontmost_bundle_id != snap.frontmost_bundle_id
+        });
+        let force_full =
+            !diff_enabled || self.prev_ax_window != window || desktop_frontmost_changed;
         let prev = if force_full {
             None
         } else {
@@ -626,11 +632,19 @@ impl Gateway {
             Ok(w) => w,
             Err(e) => return e,
         };
-        let ocr_mode = match args.get("ocr").and_then(|v| v.as_str()) {
-            None | Some("auto") | Some("fast") => OcrMode::Fast,
-            Some("accurate") => OcrMode::Accurate,
-            Some("off") | Some("none") => OcrMode::Off,
-            Some(_) => return ToolOutput::json(err_json("invalid_argument", "'ocr' must be auto, fast, accurate, or off")),
+        let ocr_mode = match args.get("ocr") {
+            None | Some(JsonValue::Null) => OcrMode::Fast,
+            Some(v) => match v.as_str() {
+                Some("auto") | Some("fast") => OcrMode::Fast,
+                Some("accurate") => OcrMode::Accurate,
+                Some("off") | Some("none") => OcrMode::Off,
+                _ => {
+                    return ToolOutput::json(err_json(
+                        "invalid_argument",
+                        "'ocr' must be auto, fast, accurate, or off",
+                    ))
+                }
+            },
         };
         let max_marks = match args.get("max_marks") {
             None | Some(JsonValue::Null) => 80usize,
@@ -1020,7 +1034,7 @@ impl Gateway {
             ));
         }
 
-        if args.get("x").is_some() || args.get("y").is_some() {
+        if has_non_null(args, "x") || has_non_null(args, "y") {
             return Err(ToolOutput::json(err_json(
                 "target_identity_unverified",
                 &format!("{action_name} requires a verified editable AX ref, editable mark, or target; raw x/y coordinates are rejected"),
@@ -1152,13 +1166,15 @@ impl Gateway {
         let Some(app) = self.snapshot_app.clone() else {
             return ToolOutput::json(err_json("stale_ref", "Inspect or visual_inspect an app or 'desktop' first"));
         };
-        let has_coords = sub_args.get("x").is_some() || sub_args.get("y").is_some();
+        let has_coords = has_non_null(sub_args, "x") || has_non_null(sub_args, "y");
         if has_coords && self.snapshot_filtered {
             return ToolOutput::json(err_json("invalid_state", "Visual coordinate clicks require an unfiltered snapshot"));
         }
 
-        if sub_args.get("mark").is_none() && !has_coords && sub_args.get("ref").is_some() {
-            let rid = sub_args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+        if !has_non_null(sub_args, "mark") && !has_coords && has_non_null(sub_args, "ref") {
+            let Some(rid) = sub_args.get("ref").and_then(|v| v.as_str()) else {
+                return ToolOutput::json(err_json("invalid_argument", "'ref' must be a string"));
+            };
             let Some(el) = self.elements_by_ref.get(rid).cloned() else {
                 return ToolOutput::json(err_json("stale_ref", "Unknown or stale element ref"));
             };
@@ -1379,10 +1395,13 @@ impl Gateway {
                 {
                     return ToolOutput::json(err_json("invalid_argument", "Invalid http/https URL"));
                 }
-                let raw_app = sub_args
-                    .get("app")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("com.google.Chrome");
+                let raw_app = match sub_args.get("app") {
+                    None | Some(JsonValue::Null) => "com.google.Chrome",
+                    Some(v) => match v.as_str() {
+                        Some(s) => s,
+                        None => return ToolOutput::json(err_json("invalid_argument", "'app' must be a string")),
+                    },
+                };
                 let Some(bundle) = self.resolve_target(raw_app) else {
                     return ToolOutput::json(err_json("invalid_app", "App is invalid, protected, or not permitted"));
                 };
@@ -1447,7 +1466,10 @@ impl Gateway {
                 let Some(text) = sub_args.get("text").and_then(|v| v.as_str()) else {
                     return ToolOutput::json(err_json("invalid_argument", "Missing arguments.text"));
                 };
-                let mode = sub_args.get("mode").and_then(|v| v.as_str()).unwrap_or("insert");
+                let mode = match sub_args.get("mode") {
+                    None | Some(JsonValue::Null) => "insert",
+                    Some(v) => v.as_str().unwrap_or(""),
+                };
                 if !matches!(mode, "insert" | "replace") {
                     return ToolOutput::json(err_json("invalid_argument", "mode must be 'insert' or 'replace'"));
                 }
@@ -1734,10 +1756,22 @@ impl Gateway {
                     .pending_verify
                     .remove(token)
                     .unwrap_or_else(|| ActionVerifyOptions::from_timing(&self.config.timing));
-                let gw_action = self
-                    .pending_gateway_actions
-                    .remove(token)
-                    .unwrap_or(GatewayAction::Std(approved));
+                let gw_action = match self.pending_gateway_actions.remove(token) {
+                    Some(gw) => gw,
+                    None => {
+                        if matches!(
+                            &approved,
+                            PendingAction::TypeText { mode, .. }
+                                if mode == "set_value" || mode == "select_text"
+                        ) {
+                            return ToolOutput::json(err_json(
+                                "invalid_confirmation",
+                                "Invalid or expired confirmation token",
+                            ));
+                        }
+                        GatewayAction::Std(approved)
+                    }
+                };
                 self.execute_action(gw_action, "confirmed", verify_opts)
             }
             _ => ToolOutput::json(err_json("not_implemented", "Operation disabled")),
@@ -1791,14 +1825,13 @@ impl Gateway {
             },
         };
         let token = self.confirmations.issue(std_action);
-        if self.pending_verify.len() > 256 {
-            self.pending_verify.clear();
-        }
+        self.confirmations.evict_excess(256);
+        self.pending_verify
+            .retain(|k, _| self.confirmations.contains(k));
+        self.pending_gateway_actions
+            .retain(|k, _| self.confirmations.contains(k));
         self.pending_verify.insert(token.clone(), verify_opts);
         if !matches!(action, GatewayAction::Std(_)) {
-            if self.pending_gateway_actions.len() > 256 {
-                self.pending_gateway_actions.clear();
-            }
             self.pending_gateway_actions.insert(token.clone(), action);
         }
         ToolOutput::json(confirmation_json(&token, summary))
@@ -2513,14 +2546,14 @@ impl Gateway {
         if self.audit.record("run_actions", "direct", "requested").is_err() {
             return ToolOutput::json(err_json("audit_unavailable", "Audit log write failed"));
         }
-        if sub_args.get("app").is_some() && self.snapshot_app.as_deref() != Some(cur_app.as_str()) {
+        if has_non_null(sub_args, "app") && self.snapshot_app.as_deref() != Some(cur_app.as_str()) {
             self.invalidate_snapshot();
             self.snapshot_window = None;
         }
 
         let initial_ax = self.snapshot_comparable.clone();
         let initial_app = self.snapshot_app.clone();
-        let mut is_filtered = self.snapshot_filtered;
+        let mut step_filtered = self.snapshot_filtered;
         let initial_window_unscoped = self.snapshot_window.is_none();
         let mut navigated = false;
         let mut step_results = Vec::with_capacity(steps.len());
@@ -2563,7 +2596,7 @@ impl Gateway {
                 self.snapshot_window = None;
                 self.snapshot_app = Some(bundle.clone());
                 cur_app = bundle.clone();
-                is_filtered = false;
+                step_filtered = false;
                 navigated = true;
                 step_results.push(JsonValue::object(vec![
                     ("step", JsonValue::Number(idx as f64)),
@@ -2647,7 +2680,7 @@ impl Gateway {
                 self.record_snapshot_meta(&reconciled_snap, window, 150, 12, query.is_some());
                 self.snapshot_comparable = Some(raw_comparable);
                 cur_app = reconciled_snap.bundle_id;
-                is_filtered = self.snapshot_filtered;
+                step_filtered = self.snapshot_filtered;
                 navigated = false;
                 step_results.push(JsonValue::object(vec![
                     ("step", JsonValue::Number(idx as f64)),
@@ -2665,7 +2698,7 @@ impl Gateway {
                             if let Some(a) = self.snapshot_app.clone() {
                                 cur_app = a;
                             }
-                            is_filtered = self.snapshot_filtered;
+                            step_filtered = self.snapshot_filtered;
                             navigated = false;
                             let src = wait_payload
                                 .get("source")
@@ -2720,7 +2753,7 @@ impl Gateway {
                     return e;
                 }
             };
-            if step.get("verify_mode").is_none() || matches!(step.get("verify_mode"), Some(JsonValue::Null)) {
+            if !has_non_null(step, "verify_mode") {
                 verify_opts.verify_mode = batch_opts.verify_mode;
             }
 
@@ -2743,7 +2776,7 @@ impl Gateway {
                             }
                         };
                         cur_app = resolved_app;
-                        is_filtered = false;
+                        step_filtered = self.snapshot_filtered;
                         if el.enabled == Some(false) {
                             self.invalidate_snapshot();
                             return ToolOutput::json(err_json("not_implemented", "Element is disabled"));
@@ -2832,7 +2865,10 @@ impl Gateway {
                         self.invalidate_snapshot();
                         return e;
                     }
-                    let mode = step.get("mode").and_then(|v| v.as_str()).unwrap_or("insert");
+                    let mode = match step.get("mode") {
+                        None | Some(JsonValue::Null) => "insert",
+                        Some(v) => v.as_str().unwrap_or(""),
+                    };
                     if !matches!(mode, "insert" | "replace") {
                         self.invalidate_snapshot();
                         return ToolOutput::json(err_json("invalid_argument", "mode must be 'insert' or 'replace'"));
@@ -2853,7 +2889,7 @@ impl Gateway {
                             }
                         };
                         cur_app = resolved_app;
-                        is_filtered = false;
+                        step_filtered = self.snapshot_filtered;
                         let is_native = is_editable_role(&el.role);
                         if mode == "replace" && !is_native {
                             self.invalidate_snapshot();
@@ -2912,6 +2948,7 @@ impl Gateway {
                         }
                     };
                     cur_app = resolved_app;
+                    step_filtered = self.snapshot_filtered;
                     (
                         ActionRequest::SetValue {
                             bundle_id: cur_app.clone(),
@@ -2943,6 +2980,7 @@ impl Gateway {
                         }
                     };
                     cur_app = resolved_app;
+                    step_filtered = self.snapshot_filtered;
                     (
                         ActionRequest::SelectText {
                             bundle_id: cur_app.clone(),
@@ -3003,7 +3041,7 @@ impl Gateway {
                             }
                         };
                         cur_app = resolved_app;
-                        is_filtered = false;
+                        step_filtered = self.snapshot_filtered;
                         let Some(ref f) = el.frame else {
                             self.invalidate_snapshot();
                             return ToolOutput::json(err_json("target_identity_unverified", "Element lacks coordinates"));
@@ -3014,7 +3052,7 @@ impl Gateway {
                             step,
                             &self.elements_by_ref,
                             &self.marks_by_id,
-                            is_filtered && idx == 0,
+                            step_filtered,
                         ) {
                             Ok(v) => v,
                             Err(e) => {
@@ -3153,19 +3191,38 @@ impl Gateway {
         sub_args: &JsonValue,
         default_app: Option<&str>,
     ) -> Result<JsonValue, ToolOutput> {
-        let raw_app = match sub_args.get("app").and_then(|v| v.as_str()).or(default_app) {
-            Some(a) => a,
-            None => return Err(ToolOutput::json(err_json("invalid_argument", "Missing arguments.app"))),
+        let raw_app = match sub_args.get("app") {
+            None | Some(JsonValue::Null) => match default_app {
+                Some(a) => a,
+                None => {
+                    return Err(ToolOutput::json(err_json(
+                        "invalid_argument",
+                        "Missing arguments.app",
+                    )))
+                }
+            },
+            Some(v) => v.as_str().ok_or_else(|| {
+                ToolOutput::json(err_json("invalid_argument", "'app' must be a string"))
+            })?,
         };
         let Some(target) = self.resolve_target(raw_app) else {
             return Err(ToolOutput::json(err_json("invalid_app", "Target is invalid, protected, or not permitted")));
         };
-        let Some(query) = sub_args
-            .get("query")
-            .or_else(|| sub_args.get("text"))
-            .and_then(|v| v.as_str())
-        else {
-            return Err(ToolOutput::json(err_json("invalid_argument", "Missing arguments.query")));
+        let query = match sub_args.get("query") {
+            None | Some(JsonValue::Null) => match sub_args.get("text") {
+                None | Some(JsonValue::Null) => {
+                    return Err(ToolOutput::json(err_json(
+                        "invalid_argument",
+                        "Missing arguments.query",
+                    )))
+                }
+                Some(v) => v.as_str().ok_or_else(|| {
+                    ToolOutput::json(err_json("invalid_argument", "Invalid arguments.query"))
+                })?,
+            },
+            Some(v) => v.as_str().ok_or_else(|| {
+                ToolOutput::json(err_json("invalid_argument", "Invalid arguments.query"))
+            })?,
         };
         if query.is_empty() || query.len() > 120 || query.chars().any(|c| c.is_control()) {
             return Err(ToolOutput::json(err_json("invalid_argument", "Invalid arguments.query")));
@@ -3757,6 +3814,10 @@ fn parse_return_state_and_bounds(args: &JsonValue) -> Result<(ReturnStateMode, O
     Ok((return_state, include_bounds))
 }
 
+fn has_non_null(args: &JsonValue, key: &str) -> bool {
+    matches!(args.get(key), Some(v) if !v.is_null())
+}
+
 fn parse_semantic_target(args: &JsonValue) -> Result<Option<SemanticTargetSpec>, ToolOutput> {
     let Some(val) = args.get("target") else {
         return Ok(None);
@@ -3764,10 +3825,10 @@ fn parse_semantic_target(args: &JsonValue) -> Result<Option<SemanticTargetSpec>,
     if matches!(val, JsonValue::Null) {
         return Ok(None);
     }
-    if args.get("ref").is_some()
-        || args.get("mark").is_some()
-        || args.get("x").is_some()
-        || args.get("y").is_some()
+    if has_non_null(args, "ref")
+        || has_non_null(args, "mark")
+        || has_non_null(args, "x")
+        || has_non_null(args, "y")
     {
         return Err(ToolOutput::json(err_json(
             "invalid_argument",
@@ -3848,16 +3909,23 @@ fn role_matches(el_role: &str, wanted_role: &str) -> bool {
     norm != "Element" && el_role.eq_ignore_ascii_case(norm)
 }
 
+#[derive(Default)]
+struct TierMatches<'a> {
+    enabled: Vec<&'a UiElement>,
+    has_disabled: bool,
+}
+
 fn match_semantic_in_elements(
     elements: &HashMap<String, UiElement>,
     spec: &SemanticTargetSpec,
 ) -> Result<UiElement, SemanticMatchError> {
     let q_lower = spec.query.trim().to_ascii_lowercase();
-    let mut exact_label: Vec<&UiElement> = Vec::new();
-    let mut partial_label: Vec<&UiElement> = Vec::new();
-    let mut exact_val: Vec<&UiElement> = Vec::new();
-    let mut partial_val: Vec<&UiElement> = Vec::new();
-    let mut disabled_match = false;
+    let mut tiers = [
+        TierMatches::default(),
+        TierMatches::default(),
+        TierMatches::default(),
+        TierMatches::default(),
+    ];
 
     for el in elements.values() {
         if el.frame.is_none() {
@@ -3882,34 +3950,34 @@ fn match_semantic_in_elements(
         if !(lbl_exact || lbl_part || val_exact || val_part) {
             continue;
         }
-        if el.enabled == Some(false) {
-            disabled_match = true;
-            continue;
-        }
-        if lbl_exact {
-            exact_label.push(el);
+        let tier_idx = if lbl_exact {
+            0
         } else if lbl_part {
-            partial_label.push(el);
+            1
         } else if val_exact {
-            exact_val.push(el);
+            2
         } else {
-            partial_val.push(el);
+            3
+        };
+        if el.enabled == Some(false) {
+            tiers[tier_idx].has_disabled = true;
+        } else {
+            tiers[tier_idx].enabled.push(el);
         }
     }
 
-    for bucket in [exact_label, partial_label, exact_val, partial_val] {
-        if bucket.len() == 1 {
-            return Ok(bucket[0].clone());
+    for tier in tiers {
+        if tier.enabled.len() == 1 {
+            return Ok(tier.enabled[0].clone());
         }
-        if bucket.len() > 1 {
+        if tier.enabled.len() > 1 {
             return Err(SemanticMatchError::Ambiguous);
         }
+        if tier.has_disabled {
+            return Err(SemanticMatchError::Disabled);
+        }
     }
-    if disabled_match {
-        Err(SemanticMatchError::Disabled)
-    } else {
-        Err(SemanticMatchError::NotFound)
-    }
+    Err(SemanticMatchError::NotFound)
 }
 
 fn parse_verify_options(args: &JsonValue, timing: &TimingConfig) -> Result<ActionVerifyOptions, ToolOutput> {
@@ -4134,8 +4202,8 @@ fn resolve_scroll_args(
     snapshot_filtered: bool,
 ) -> Result<(String, i32, Option<(f64, f64)>, String), ToolOutput> {
     let (direction, amount) = parse_scroll_dir_amount(args)?;
-    let has_ref_or_mark = args.get("mark").is_some() || args.get("ref").is_some();
-    let has_coords = args.get("x").is_some() || args.get("y").is_some();
+    let has_ref_or_mark = has_non_null(args, "mark") || has_non_null(args, "ref");
+    let has_coords = has_non_null(args, "x") || has_non_null(args, "y");
     if snapshot_filtered && !has_ref_or_mark {
         return Err(ToolOutput::json(err_json("invalid_state", "scroll requires an unfiltered snapshot")));
     }
@@ -7981,6 +8049,687 @@ mod tests {
             ]),
         );
         assert_eq!(bad_vm.payload.get("code").and_then(|v| v.as_str()), Some("invalid_argument"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_null_optional_fields_behave_like_omitted_keys() {
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_nulls_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut gw = Gateway::new(Box::new(MockDriver::new()), PolicySettings::default(), dir.clone());
+
+        gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("Calculator".into()))]),
+        );
+
+        let click_ref_nulls = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("ref", JsonValue::String("e1".into())),
+                        ("mark", JsonValue::Null),
+                        ("x", JsonValue::Null),
+                        ("y", JsonValue::Null),
+                        ("target", JsonValue::Null),
+                        ("window", JsonValue::Null),
+                        ("return_state", JsonValue::Null),
+                        ("verify_mode", JsonValue::Null),
+                        ("keep_snapshot", JsonValue::Null),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(click_ref_nulls.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let click_target_nulls = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("app", JsonValue::String("Calculator".into())),
+                        (
+                            "target",
+                            JsonValue::object(vec![
+                                ("query", JsonValue::String("7".into())),
+                                ("role", JsonValue::Null),
+                                ("fresh", JsonValue::Null),
+                            ]),
+                        ),
+                        ("ref", JsonValue::Null),
+                        ("mark", JsonValue::Null),
+                        ("x", JsonValue::Null),
+                        ("y", JsonValue::Null),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(click_target_nulls.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("Calculator".into()))]),
+        );
+        let set_val_nulls = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("set_value".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("ref", JsonValue::String("e2".into())),
+                        ("text", JsonValue::String("hi".into())),
+                        ("x", JsonValue::Null),
+                        ("y", JsonValue::Null),
+                        ("mark", JsonValue::Null),
+                        ("target", JsonValue::Null),
+                        ("keep_snapshot", JsonValue::Bool(true)),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(set_val_nulls.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let sel_nulls = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("select_text".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("ref", JsonValue::String("e2".into())),
+                        ("start", JsonValue::Null),
+                        ("end", JsonValue::Null),
+                        ("x", JsonValue::Null),
+                        ("y", JsonValue::Null),
+                        ("mark", JsonValue::Null),
+                        ("target", JsonValue::Null),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(sel_nulls.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("Calculator".into()))]),
+        );
+        let scroll_unfiltered_nulls = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("scroll".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("direction", JsonValue::String("down".into())),
+                        ("amount", JsonValue::Number(2.0)),
+                        ("ref", JsonValue::Null),
+                        ("mark", JsonValue::Null),
+                        ("x", JsonValue::Null),
+                        ("y", JsonValue::Null),
+                        ("target", JsonValue::Null),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(
+            scroll_unfiltered_nulls.payload.get("ok").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![
+                ("app", JsonValue::String("Calculator".into())),
+                ("query", JsonValue::String("7".into())),
+            ]),
+        );
+        let scroll_filtered_nulls = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("scroll".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("direction", JsonValue::String("down".into())),
+                        ("amount", JsonValue::Number(2.0)),
+                        ("ref", JsonValue::Null),
+                        ("mark", JsonValue::Null),
+                        ("x", JsonValue::Null),
+                        ("y", JsonValue::Null),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(
+            scroll_filtered_nulls.payload.get("code").and_then(|v| v.as_str()),
+            Some("invalid_state")
+        );
+
+        let wait_null_query = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("wait_for".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("app", JsonValue::String("Calculator".into())),
+                        ("query", JsonValue::Null),
+                        ("text", JsonValue::String("Notes".into())),
+                        ("role", JsonValue::Null),
+                        ("timeout_ms", JsonValue::Number(500.0)),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(wait_null_query.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        // Non-null invalid types still fail closed
+        let bad_ref = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                ("arguments", JsonValue::object(vec![("ref", JsonValue::Number(123.0))])),
+            ]),
+        );
+        assert_eq!(bad_ref.payload.get("code").and_then(|v| v.as_str()), Some("invalid_argument"));
+
+        let bad_set_xy = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("set_value".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("ref", JsonValue::String("e2".into())),
+                        ("text", JsonValue::String("hi".into())),
+                        ("x", JsonValue::Number(100.0)),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(
+            bad_set_xy.payload.get("code").and_then(|v| v.as_str()),
+            Some("target_identity_unverified")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_fails_closed_when_pending_gateway_action_missing_and_syncs_eviction() {
+        use std::sync::{Arc, Mutex};
+        struct RecordingDriver {
+            log: Arc<Mutex<Vec<String>>>,
+        }
+        impl OsDriver for RecordingDriver {
+            fn doctor(&self) -> Result<DoctorStatus, crate::driver::DriverError> {
+                MockDriver::new().doctor()
+            }
+            fn list_apps(&self) -> Result<Vec<crate::driver::RunningApp>, crate::driver::DriverError> {
+                MockDriver::new().list_apps()
+            }
+            fn activate_app(&self, _: &str) -> Result<(), crate::driver::DriverError> {
+                Ok(())
+            }
+            fn launch_app(&self, _: &str) -> Result<(), crate::driver::DriverError> {
+                Ok(())
+            }
+            fn inspect_app(
+                &self,
+                bundle_id: &str,
+                w: Option<i32>,
+                me: i32,
+                md: i32,
+            ) -> Result<AppSnapshot, crate::driver::DriverError> {
+                MockDriver::new().inspect_app(bundle_id, w, me, md)
+            }
+            fn capture_and_ocr(
+                &self,
+                bundle_id: &str,
+                w: Option<i32>,
+                ocr_mode: OcrMode,
+                encode_image: bool,
+                options: &ImageEncodeOptions,
+            ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
+                MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_image, options)
+            }
+            fn render_som_image(
+                &self,
+                b: &str,
+                m: &str,
+                wf: &Rect,
+                options: &ImageEncodeOptions,
+            ) -> Result<String, crate::driver::DriverError> {
+                MockDriver::new().render_som_image(b, m, wf, options)
+            }
+            fn perform_action(
+                &self,
+                req: &ActionRequest,
+            ) -> Result<crate::driver::ActionResult, crate::driver::DriverError> {
+                self.log.lock().unwrap().push(format!("{req:?}"));
+                Ok(crate::driver::ActionResult {
+                    method: "mock_ok".into(),
+                })
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_conf_sync_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let settings = PolicySettings {
+            require_confirmation: true,
+            ..PolicySettings::default()
+        };
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut gw = Gateway::new(
+            Box::new(RecordingDriver { log: log.clone() }),
+            settings,
+            dir.clone(),
+        );
+        gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("Calculator".into()))]),
+        );
+
+        for (action_name, extra) in [
+            ("set_value", vec![("text", JsonValue::String("abc".into()))]),
+            ("select_text", vec![("start", JsonValue::Number(0.0)), ("end", JsonValue::Number(2.0))]),
+        ] {
+            let mut arg_entries = vec![("ref", JsonValue::String("e2".into()))];
+            arg_entries.extend(extra);
+            let pending = gw.dispatch(
+                "computer",
+                &JsonValue::object(vec![
+                    ("action", JsonValue::String(action_name.into())),
+                    ("arguments", JsonValue::object(arg_entries)),
+                ]),
+            );
+            let tok = pending
+                .payload
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string();
+            // Simulate missing pending_gateway_actions entry while ConfirmationStore holds token
+            assert!(gw.pending_gateway_actions.remove(&tok).is_some());
+            let conf = gw.dispatch(
+                "computer",
+                &JsonValue::object(vec![
+                    ("action", JsonValue::String("confirm".into())),
+                    ("arguments", JsonValue::object(vec![("token", JsonValue::String(tok))])),
+                ]),
+            );
+            assert_eq!(conf.payload.get("ok").and_then(|v| v.as_bool()), Some(false));
+            assert_eq!(
+                conf.payload.get("code").and_then(|v| v.as_str()),
+                Some("invalid_confirmation")
+            );
+        }
+        assert!(log.lock().unwrap().is_empty(), "must never downgrade to TypePoint");
+
+        // >256 eviction stays synchronized across confirmations, pending_verify, and pending_gateway_actions
+        let mut tokens = Vec::new();
+        for i in 0..260 {
+            let pending = gw.dispatch(
+                "computer",
+                &JsonValue::object(vec![
+                    ("action", JsonValue::String("set_value".into())),
+                    (
+                        "arguments",
+                        JsonValue::object(vec![
+                            ("ref", JsonValue::String("e2".into())),
+                            ("text", JsonValue::String(format!("val_{i}"))),
+                        ]),
+                    ),
+                ]),
+            );
+            tokens.push(
+                pending
+                    .payload
+                    .get("token")
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_eq!(gw.pending_verify.len(), 256);
+        assert_eq!(gw.pending_gateway_actions.len(), 256);
+
+        let evicted = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("confirm".into())),
+                ("arguments", JsonValue::object(vec![("token", JsonValue::String(tokens[0].clone()))])),
+            ]),
+        );
+        assert_eq!(
+            evicted.payload.get("code").and_then(|v| v.as_str()),
+            Some("invalid_confirmation")
+        );
+        assert!(log.lock().unwrap().is_empty());
+
+        let newest = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("confirm".into())),
+                ("arguments", JsonValue::object(vec![("token", JsonValue::String(tokens[259].clone()))])),
+            ]),
+        );
+        assert_eq!(newest.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        let entries = log.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].starts_with("SetValue {"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semantic_matcher_disabled_exact_beats_enabled_partial_match() {
+        let mut elements = HashMap::new();
+        elements.insert(
+            "e1".into(),
+            UiElement {
+                ref_id: "e1".into(),
+                role: "Button".into(),
+                label: "Save".into(),
+                value: None,
+                url: None,
+                window: 0,
+                depth: 1,
+                interactive: true,
+                enabled: Some(false),
+                focused: false,
+                actions: vec!["AXPress".into()],
+                frame: Some(Rect { x: 10.0, y: 10.0, w: 60.0, h: 30.0 }),
+            },
+        );
+        elements.insert(
+            "e2".into(),
+            UiElement {
+                ref_id: "e2".into(),
+                role: "Button".into(),
+                label: "Save As...".into(),
+                value: None,
+                url: None,
+                window: 0,
+                depth: 1,
+                interactive: true,
+                enabled: Some(true),
+                focused: false,
+                actions: vec!["AXPress".into()],
+                frame: Some(Rect { x: 80.0, y: 10.0, w: 80.0, h: 30.0 }),
+            },
+        );
+
+        let spec = SemanticTargetSpec {
+            query: "Save".into(),
+            role: Some("Button".into()),
+            fresh: false,
+        };
+        assert!(matches!(
+            match_semantic_in_elements(&elements, &spec),
+            Err(SemanticMatchError::Disabled)
+        ));
+
+        // Same-tier enabled exact match still wins over same-tier disabled exact match
+        elements.insert(
+            "e3".into(),
+            UiElement {
+                ref_id: "e3".into(),
+                role: "Button".into(),
+                label: "Save".into(),
+                value: None,
+                url: None,
+                window: 0,
+                depth: 1,
+                interactive: true,
+                enabled: Some(true),
+                focused: false,
+                actions: vec!["AXPress".into()],
+                frame: Some(Rect { x: 170.0, y: 10.0, w: 60.0, h: 30.0 }),
+            },
+        );
+        let matched = match_semantic_in_elements(&elements, &spec);
+        assert!(matches!(matched, Ok(el) if el.ref_id == "e3"));
+    }
+
+    #[test]
+    fn desktop_frontmost_change_forces_full_and_run_actions_tracks_step_filtered() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct DesktopSwitchDriver {
+            phase: Arc<AtomicUsize>,
+        }
+        impl OsDriver for DesktopSwitchDriver {
+            fn doctor(&self) -> Result<DoctorStatus, crate::driver::DriverError> {
+                MockDriver::new().doctor()
+            }
+            fn list_apps(&self) -> Result<Vec<crate::driver::RunningApp>, crate::driver::DriverError> {
+                MockDriver::new().list_apps()
+            }
+            fn activate_app(&self, _: &str) -> Result<(), crate::driver::DriverError> {
+                Ok(())
+            }
+            fn launch_app(&self, _: &str) -> Result<(), crate::driver::DriverError> {
+                Ok(())
+            }
+            fn inspect_app(
+                &self,
+                bundle_id: &str,
+                w: Option<i32>,
+                me: i32,
+                md: i32,
+            ) -> Result<AppSnapshot, crate::driver::DriverError> {
+                let mut snap = MockDriver::new().inspect_app(bundle_id, w, me, md)?;
+                if bundle_id == "desktop" {
+                    snap.frontmost_bundle_id = if self.phase.load(Ordering::SeqCst) == 0 {
+                        "com.apple.calculator".into()
+                    } else {
+                        "com.apple.TextEdit".into()
+                    };
+                }
+                Ok(snap)
+            }
+            fn capture_and_ocr(
+                &self,
+                bundle_id: &str,
+                w: Option<i32>,
+                ocr_mode: OcrMode,
+                encode_image: bool,
+                options: &ImageEncodeOptions,
+            ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
+                MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_image, options)
+            }
+            fn render_som_image(
+                &self,
+                b: &str,
+                m: &str,
+                wf: &Rect,
+                options: &ImageEncodeOptions,
+            ) -> Result<String, crate::driver::DriverError> {
+                MockDriver::new().render_som_image(b, m, wf, options)
+            }
+            fn perform_action(&self, req: &ActionRequest) -> Result<crate::driver::ActionResult, crate::driver::DriverError> {
+                MockDriver::new().perform_action(req)
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_desk_filt_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let phase = Arc::new(AtomicUsize::new(0));
+        let mut gw = Gateway::new(
+            Box::new(DesktopSwitchDriver {
+                phase: phase.clone(),
+            }),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+
+        let d1 = gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("desktop".into()))]),
+        );
+        assert_eq!(d1.payload.get("state_mode").and_then(|v| v.as_str()), Some("full"));
+
+        // Switching frontmost_bundle_id under app="desktop" must force "full" even when pid (4242) matches
+        phase.store(1, Ordering::SeqCst);
+        let d2 = gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("desktop".into()))]),
+        );
+        assert_eq!(d2.payload.get("state_mode").and_then(|v| v.as_str()), Some("full"));
+
+        // Same frontmost app again -> unchanged
+        let d3 = gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("desktop".into()))]),
+        );
+        assert_eq!(d3.payload.get("state_mode").and_then(|v| v.as_str()), Some("unchanged"));
+
+        // Sub-issue B: run_actions step 1+ unscoped scroll fails closed when prior step left snapshot filtered
+        let step_inspect_filtered_scroll = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("run_actions".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("app", JsonValue::String("Calculator".into())),
+                        (
+                            "steps",
+                            JsonValue::Array(vec![
+                                JsonValue::object(vec![
+                                    ("action", JsonValue::String("inspect".into())),
+                                    ("query", JsonValue::String("7".into())),
+                                ]),
+                                JsonValue::object(vec![
+                                    ("action", JsonValue::String("scroll".into())),
+                                    ("direction", JsonValue::String("down".into())),
+                                    ("amount", JsonValue::Number(3.0)),
+                                ]),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(
+            step_inspect_filtered_scroll.payload.get("code").and_then(|v| v.as_str()),
+            Some("invalid_state")
+        );
+
+        // Initial filtered snapshot + sleep_ms step 0 + unscoped scroll step 1 also fails closed
+        gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![
+                ("app", JsonValue::String("Calculator".into())),
+                ("query", JsonValue::String("7".into())),
+            ]),
+        );
+        let sleep_then_scroll = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("run_actions".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![(
+                        "steps",
+                        JsonValue::Array(vec![
+                            JsonValue::object(vec![
+                                ("action", JsonValue::String("sleep_ms".into())),
+                                ("ms", JsonValue::Number(10.0)),
+                            ]),
+                            JsonValue::object(vec![
+                                ("action", JsonValue::String("scroll".into())),
+                                ("direction", JsonValue::String("down".into())),
+                                ("amount", JsonValue::Number(3.0)),
+                            ]),
+                        ]),
+                    )]),
+                ),
+            ]),
+        );
+        assert_eq!(
+            sleep_then_scroll.payload.get("code").and_then(|v| v.as_str()),
+            Some("invalid_state")
+        );
+
+        // wait_for (AX match leaves snapshot filtered) + unscoped scroll step 1 also fails closed
+        let wait_then_scroll = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("run_actions".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("app", JsonValue::String("Calculator".into())),
+                        (
+                            "steps",
+                            JsonValue::Array(vec![
+                                JsonValue::object(vec![
+                                    ("action", JsonValue::String("wait_for".into())),
+                                    ("query", JsonValue::String("Notes".into())),
+                                    ("timeout_ms", JsonValue::Number(500.0)),
+                                ]),
+                                JsonValue::object(vec![
+                                    ("action", JsonValue::String("scroll".into())),
+                                    ("direction", JsonValue::String("down".into())),
+                                    ("amount", JsonValue::Number(3.0)),
+                                ]),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(
+            wait_then_scroll.payload.get("code").and_then(|v| v.as_str()),
+            Some("invalid_state")
+        );
+
+        // Unfiltered inspect clears step_filtered so subsequent unscoped scroll succeeds
+        let reset_then_scroll = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("run_actions".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("app", JsonValue::String("Calculator".into())),
+                        (
+                            "steps",
+                            JsonValue::Array(vec![
+                                JsonValue::object(vec![
+                                    ("action", JsonValue::String("inspect".into())),
+                                    ("query", JsonValue::String("7".into())),
+                                ]),
+                                JsonValue::object(vec![("action", JsonValue::String("inspect".into()))]),
+                                JsonValue::object(vec![
+                                    ("action", JsonValue::String("scroll".into())),
+                                    ("direction", JsonValue::String("down".into())),
+                                    ("amount", JsonValue::Number(3.0)),
+                                ]),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(reset_then_scroll.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(reset_then_scroll.payload.get("executed").and_then(|v| v.as_i64()), Some(3));
 
         let _ = fs::remove_dir_all(&dir);
     }

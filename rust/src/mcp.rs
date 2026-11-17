@@ -4,11 +4,103 @@ use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
+fn type_schema(ty: &str) -> JsonValue {
+    JsonValue::object(vec![("type", JsonValue::String(ty.into()))])
+}
+
 fn bool_schema(desc: &str) -> JsonValue {
     JsonValue::object(vec![
         ("type", JsonValue::String("boolean".into())),
         ("description", JsonValue::String(desc.into())),
     ])
+}
+
+fn target_schema() -> JsonValue {
+    JsonValue::object(vec![
+        ("type", JsonValue::String("object".into())),
+        (
+            "properties",
+            JsonValue::object(vec![
+                ("query", type_schema("string")),
+                ("role", type_schema("string")),
+                ("fresh", type_schema("boolean")),
+            ]),
+        ),
+    ])
+}
+
+fn common_action_argument_props() -> Vec<(&'static str, JsonValue)> {
+    vec![
+        ("app", type_schema("string")),
+        ("window", type_schema("integer")),
+        ("ref", type_schema("string")),
+        ("mark", type_schema("string")),
+        ("target", target_schema()),
+        ("x", type_schema("number")),
+        ("y", type_schema("number")),
+        ("from_ref", type_schema("string")),
+        ("from_mark", type_schema("string")),
+        ("to_ref", type_schema("string")),
+        ("to_mark", type_schema("string")),
+        ("x1", type_schema("number")),
+        ("y1", type_schema("number")),
+        ("x2", type_schema("number")),
+        ("y2", type_schema("number")),
+        ("include_bounds", include_bounds_schema()),
+        ("return_state", return_state_schema()),
+        ("verify_mode", verify_mode_schema()),
+        ("keep_snapshot", type_schema("boolean")),
+        ("verify_change", type_schema("boolean")),
+        ("require_change", type_schema("boolean")),
+        ("max_retries", type_schema("integer")),
+        ("settle_ms", type_schema("integer")),
+        ("poll_interval_ms", type_schema("integer")),
+        ("retry_delay_ms", type_schema("integer")),
+    ]
+}
+
+fn computer_argument_properties() -> JsonValue {
+    let mut props = common_action_argument_props();
+    props.extend([
+        ("text", type_schema("string")),
+        ("mode", type_schema("string")),
+        ("start", type_schema("integer")),
+        ("end", type_schema("integer")),
+        ("click_first", type_schema("boolean")),
+        ("key", type_schema("string")),
+        ("modifiers", type_schema("array")),
+        ("direction", type_schema("string")),
+        ("amount", type_schema("integer")),
+        (
+            "steps",
+            JsonValue::object(vec![
+                ("type", JsonValue::String("array".into())),
+                (
+                    "description",
+                    JsonValue::String(
+                        "Up to 24 action steps; each step supports verify_mode, verify_change, diff, and include_bounds."
+                            .into(),
+                    ),
+                ),
+            ]),
+        ),
+        ("inspect_after", type_schema("boolean")),
+        ("diff", diff_schema()),
+        ("query", type_schema("string")),
+        ("role", type_schema("string")),
+        ("timeout_ms", type_schema("integer")),
+        ("poll_ms", type_schema("integer")),
+        ("absent", type_schema("boolean")),
+        ("ocr", type_schema("boolean")),
+        ("token", type_schema("string")),
+    ]);
+    JsonValue::object(props)
+}
+
+fn desktop_argument_properties() -> JsonValue {
+    let mut props = common_action_argument_props();
+    props.push(("url", type_schema("string")));
+    JsonValue::object(props)
 }
 
 fn str_enum_schema(values: &[&str], desc: &str) -> JsonValue {
@@ -138,62 +230,7 @@ fn tool_defs() -> Vec<JsonValue> {
                                 "arguments",
                                 JsonValue::object(vec![
                                     ("type", JsonValue::String("object".into())),
-                                    (
-                                        "properties",
-                                        JsonValue::object(vec![
-                                            ("app", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("window", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("ref", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("mark", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            (
-                                                "target",
-                                                JsonValue::object(vec![
-                                                    ("type", JsonValue::String("object".into())),
-                                                    (
-                                                        "properties",
-                                                        JsonValue::object(vec![
-                                                            ("query", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                                            ("role", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                                            ("fresh", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
-                                                        ]),
-                                                    ),
-                                                ]),
-                                            ),
-                                            ("text", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("mode", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("start", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("end", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("key", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("modifiers", JsonValue::object(vec![("type", JsonValue::String("array".into()))])),
-                                            ("direction", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("amount", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("steps", JsonValue::object(vec![
-                                                ("type", JsonValue::String("array".into())),
-                                                ("description", JsonValue::String("Up to 24 action steps; each step supports verify_mode, verify_change, diff, and include_bounds.".into())),
-                                            ])),
-                                            ("inspect_after", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
-                                            ("diff", diff_schema()),
-                                            ("include_bounds", include_bounds_schema()),
-                                            ("return_state", return_state_schema()),
-                                            ("verify_mode", verify_mode_schema()),
-                                            ("keep_snapshot", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
-                                            ("verify_change", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
-                                            ("require_change", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
-                                            ("max_retries", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("settle_ms", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("poll_interval_ms", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("retry_delay_ms", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("query", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("role", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("timeout_ms", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("poll_ms", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("absent", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
-                                            ("ocr", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
-                                            ("token", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("x", JsonValue::object(vec![("type", JsonValue::String("number".into()))])),
-                                            ("y", JsonValue::object(vec![("type", JsonValue::String("number".into()))])),
-                                        ]),
-                                    ),
+                                    ("properties", computer_argument_properties()),
                                 ]),
                             ),
                         ]),
@@ -223,27 +260,7 @@ fn tool_defs() -> Vec<JsonValue> {
                                 "arguments",
                                 JsonValue::object(vec![
                                     ("type", JsonValue::String("object".into())),
-                                    (
-                                        "properties",
-                                        JsonValue::object(vec![
-                                            ("app", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("url", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("ref", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("mark", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                                            ("target", JsonValue::object(vec![("type", JsonValue::String("object".into()))])),
-                                            ("return_state", return_state_schema()),
-                                            ("include_bounds", include_bounds_schema()),
-                                            ("verify_change", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
-                                            ("verify_mode", verify_mode_schema()),
-                                            ("require_change", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
-                                            ("max_retries", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("settle_ms", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("poll_interval_ms", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("retry_delay_ms", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("x", JsonValue::object(vec![("type", JsonValue::String("number".into()))])),
-                                            ("y", JsonValue::object(vec![("type", JsonValue::String("number".into()))])),
-                                        ]),
-                                    ),
+                                    ("properties", desktop_argument_properties()),
                                 ]),
                             ),
                         ]),
@@ -612,8 +629,30 @@ mod tests {
             .and_then(|p| p.get("arguments"))
             .and_then(|a| a.get("properties"))
             .unwrap();
-        for key in ["diff", "include_bounds", "return_state", "verify_mode"] {
+        for key in [
+            "diff",
+            "include_bounds",
+            "return_state",
+            "verify_mode",
+            "from_ref",
+            "from_mark",
+            "to_ref",
+            "to_mark",
+            "x1",
+            "y1",
+            "x2",
+            "y2",
+            "click_first",
+            "target",
+        ] {
             assert!(computer_props.get(key).is_some(), "computer missing {key}");
+        }
+        let computer_target_props = computer_props
+            .get("target")
+            .and_then(|t| t.get("properties"))
+            .unwrap();
+        for key in ["query", "role", "fresh"] {
+            assert!(computer_target_props.get(key).is_some(), "computer.target missing {key}");
         }
 
         let desktop_props = by_name("desktop")
@@ -622,8 +661,30 @@ mod tests {
             .and_then(|p| p.get("arguments"))
             .and_then(|a| a.get("properties"))
             .unwrap();
-        for key in ["return_state", "verify_mode", "include_bounds"] {
+        for key in [
+            "return_state",
+            "verify_mode",
+            "include_bounds",
+            "window",
+            "keep_snapshot",
+            "from_ref",
+            "from_mark",
+            "to_ref",
+            "to_mark",
+            "x1",
+            "y1",
+            "x2",
+            "y2",
+            "target",
+        ] {
             assert!(desktop_props.get(key).is_some(), "desktop missing {key}");
+        }
+        let desktop_target_props = desktop_props
+            .get("target")
+            .and_then(|t| t.get("properties"))
+            .unwrap();
+        for key in ["query", "role", "fresh"] {
+            assert!(desktop_target_props.get(key).is_some(), "desktop.target missing {key}");
         }
         let _ = fs::remove_dir_all(&dir);
     }

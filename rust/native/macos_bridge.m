@@ -1142,10 +1142,6 @@ static NSString *encode_image_b64(CGImageRef img, int format, int quality) {
   return [data base64EncodedStringWithOptions:0];
 }
 
-static NSString *png_b64_from_cgimage(CGImageRef img) {
-  return encode_image_b64(img, 0, 80);
-}
-
 typedef struct {
   char bundle_id[128];
   int window_index;
@@ -1340,6 +1336,8 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
   if (!bundle_id)
     return dup_json(@{@"ok" : @NO, @"code" : @"invalid_argument"});
   NSString *bid = [NSString stringWithUTF8String:bundle_id];
+  if (!bid)
+    return dup_json(@{@"ok" : @NO, @"code" : @"invalid_argument"});
   BOOL isDesktop = [bid.lowercaseString isEqualToString:@"desktop"];
   NSRunningApplication *frontApp =
       [NSWorkspace sharedWorkspace].frontmostApplication;
@@ -1348,15 +1346,15 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
     return dup_json(@{@"ok" : @NO, @"code" : @"app_not_running"});
   pid_t pid = app ? app.processIdentifier : 0;
 
-  __block uint32_t cachedWid = 0;
+  uint32_t cachedWid = 0;
   CGRect cachedFrame = CGRectZero;
-  __block BOOL haveCache = lookup_window_cache(
-      bundle_id, window_index, isDesktop, pid, &cachedWid, &cachedFrame);
+  BOOL initialHaveCache = lookup_window_cache(
+      bid.UTF8String, window_index, isDesktop, pid, &cachedWid, &cachedFrame);
 
   CGRect targetAxFrame = CGRectZero;
   NSString *targetAxTitle = nil;
   BOOL haveAxFrame = NO;
-  if (!isDesktop && !haveCache && AXIsProcessTrusted()) {
+  if (!isDesktop && !initialHaveCache && AXIsProcessTrusted()) {
     AXUIElementRef appEl = AXUIElementCreateApplication(pid);
     id winsObj = ax_copy(appEl, kAXWindowsAttribute);
     NSArray *axWins =
@@ -1421,6 +1419,8 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
     CFRelease(appEl);
   }
 
+  NSLock *stateLock = [[NSLock alloc] init];
+  __block BOOL timedOut = NO;
   __block CGImageRef captured = NULL;
   __block CGRect winFrame = CGRectZero;
   __block uint32_t capturedWid = 0;
@@ -1430,13 +1430,18 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
 
   [SCShareableContent getShareableContentWithCompletionHandler:^(
                           SCShareableContent *content, NSError *err) {
+    BOOL cbHaveCache = initialHaveCache;
     if (err || !content) {
-      if (haveCache) {
-        invalidate_window_cache(bundle_id, window_index, isDesktop);
+      [stateLock lock];
+      if (!timedOut) {
+        if (cbHaveCache) {
+          invalidate_window_cache(bid.UTF8String, window_index, isDesktop);
+        }
+        errCode = @"screen_recording_denied";
+        errMsg =
+            err.localizedDescription ?: @"Unable to enumerate shareable windows.";
       }
-      errCode = @"screen_recording_denied";
-      errMsg =
-          err.localizedDescription ?: @"Unable to enumerate shareable windows.";
+      [stateLock unlock];
       dispatch_semaphore_signal(sem);
       return;
     }
@@ -1452,13 +1457,17 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
       if (!disp)
         disp = content.displays.firstObject;
       if (!disp) {
-        errCode = @"display_not_found";
-        errMsg = @"No active display found.";
+        [stateLock lock];
+        if (!timedOut) {
+          errCode = @"display_not_found";
+          errMsg = @"No active display found.";
+        }
+        [stateLock unlock];
         dispatch_semaphore_signal(sem);
         return;
       }
-      winFrame = disp.frame;
-      capturedWid = disp.displayID;
+      CGRect targetFrame = disp.frame;
+      uint32_t targetWid = disp.displayID;
       SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:disp
                                                         excludingWindows:@[]];
       SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
@@ -1475,25 +1484,31 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
           captureImageWithFilter:filter
                    configuration:cfg
                completionHandler:^(CGImageRef image, NSError *capErr) {
-                 if (image) {
-                   captured = CGImageRetain(image);
-                   store_window_cache(bundle_id, window_index, isDesktop, pid,
-                                      capturedWid, winFrame);
-                 } else {
-                   if (haveCache)
-                     invalidate_window_cache(bundle_id, window_index,
-                                             isDesktop);
-                   errCode = @"capture_failed";
-                   errMsg = capErr.localizedDescription
-                                ?: @"SCScreenshotManager failed.";
+                 [stateLock lock];
+                 if (!timedOut) {
+                   if (image) {
+                     captured = CGImageRetain(image);
+                     winFrame = targetFrame;
+                     capturedWid = targetWid;
+                     store_window_cache(bid.UTF8String, window_index, isDesktop,
+                                        pid, targetWid, targetFrame);
+                   } else {
+                     if (cbHaveCache)
+                       invalidate_window_cache(bid.UTF8String, window_index,
+                                               isDesktop);
+                     errCode = @"capture_failed";
+                     errMsg = capErr.localizedDescription
+                                  ?: @"SCScreenshotManager failed.";
+                   }
                  }
+                 [stateLock unlock];
                  dispatch_semaphore_signal(sem);
                }];
       return;
     }
 
     SCWindow *chosen = nil;
-    if (haveCache && cachedWid > 0) {
+    if (cbHaveCache && cachedWid > 0) {
       for (SCWindow *w in content.windows) {
         if (w.windowID == cachedWid && w.owningApplication.processID == pid &&
             w.frame.size.width > 10 && w.frame.size.height > 10) {
@@ -1502,8 +1517,8 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
         }
       }
       if (!chosen) {
-        haveCache = NO;
-        invalidate_window_cache(bundle_id, window_index, isDesktop);
+        cbHaveCache = NO;
+        invalidate_window_cache(bid.UTF8String, window_index, isDesktop);
       }
     }
 
@@ -1532,8 +1547,12 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
         }
       }
       if (candidates.count == 0) {
-        errCode = @"window_not_found";
-        errMsg = @"No capturable window found for target application.";
+        [stateLock lock];
+        if (!timedOut) {
+          errCode = @"window_not_found";
+          errMsg = @"No capturable window found for target application.";
+        }
+        [stateLock unlock];
         dispatch_semaphore_signal(sem);
         return;
       }
@@ -1576,8 +1595,8 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
       }
     }
 
-    winFrame = chosen.frame;
-    capturedWid = chosen.windowID;
+    CGRect targetFrame = chosen.frame;
+    uint32_t targetWid = chosen.windowID;
     SCContentFilter *filter =
         [[SCContentFilter alloc] initWithDesktopIndependentWindow:chosen];
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
@@ -1594,17 +1613,24 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
         captureImageWithFilter:filter
                  configuration:cfg
              completionHandler:^(CGImageRef image, NSError *capErr) {
-               if (image) {
-                 captured = CGImageRetain(image);
-                 store_window_cache(bundle_id, window_index, isDesktop, pid,
-                                    capturedWid, winFrame);
-               } else {
-                 if (haveCache)
-                   invalidate_window_cache(bundle_id, window_index, isDesktop);
-                 errCode = @"capture_failed";
-                 errMsg = capErr.localizedDescription
-                              ?: @"SCScreenshotManager failed.";
+               [stateLock lock];
+               if (!timedOut) {
+                 if (image) {
+                   captured = CGImageRetain(image);
+                   winFrame = targetFrame;
+                   capturedWid = targetWid;
+                   store_window_cache(bid.UTF8String, window_index, isDesktop,
+                                      pid, targetWid, targetFrame);
+                 } else {
+                   if (cbHaveCache)
+                     invalidate_window_cache(bid.UTF8String, window_index,
+                                             isDesktop);
+                   errCode = @"capture_failed";
+                   errMsg = capErr.localizedDescription
+                                ?: @"SCScreenshotManager failed.";
+                 }
                }
+               [stateLock unlock];
                dispatch_semaphore_signal(sem);
              }];
   }];
@@ -1616,21 +1642,30 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
     touch_agent_cursor_ttl();
     pump_ui_ms(5);
   }
-  if (!captured) {
-    if (haveCache) {
-      invalidate_window_cache(bundle_id, window_index, isDesktop);
-    }
+  [stateLock lock];
+  CGImageRef localCaptured = captured;
+  captured = NULL;
+  CGRect localWinFrame = winFrame;
+  uint32_t localCapturedWid = capturedWid;
+  NSString *localErrCode = errCode;
+  NSString *localErrMsg = errMsg;
+  if (!localCaptured) {
+    timedOut = YES;
+  }
+  [stateLock unlock];
+  if (!localCaptured) {
+    invalidate_window_cache(bid.UTF8String, window_index, isDesktop);
     return dup_json(@{
       @"ok" : @NO,
-      @"code" : errCode ?: @"capture_timeout",
-      @"message" : errMsg ?: @"Timed out capturing window.",
+      @"code" : localErrCode ?: @"capture_timeout",
+      @"message" : localErrMsg ?: @"Timed out capturing window.",
     });
   }
 
-  NSString *capId = store_cached_capture(captured);
-  NSString *pixelDigest = compute_pixel_digest(captured);
+  NSString *capId = store_cached_capture(localCaptured);
+  NSString *pixelDigest = compute_pixel_digest(localCaptured);
   NSString *b64 =
-      encode_image ? encode_image_b64(captured, image_format, quality) : @"";
+      encode_image ? encode_image_b64(localCaptured, image_format, quality) : @"";
   NSMutableArray *ocrBoxes = [NSMutableArray array];
 
   if (ocr_mode > 0) {
@@ -1640,7 +1675,7 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
                                : VNRequestTextRecognitionLevelAccurate;
     req.usesLanguageCorrection = NO;
     VNImageRequestHandler *handler =
-        [[VNImageRequestHandler alloc] initWithCGImage:captured options:@{}];
+        [[VNImageRequestHandler alloc] initWithCGImage:localCaptured options:@{}];
     NSError *ocrErr = nil;
     if ([handler performRequests:@[ req ] error:&ocrErr]) {
       for (VNRecognizedTextObservation *obs in req.results) {
@@ -1650,10 +1685,10 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
         CGRect bb = obs.boundingBox;
         double nx = bb.origin.x;
         double ny = 1.0 - bb.origin.y - bb.size.height;
-        double sx = winFrame.origin.x + nx * winFrame.size.width;
-        double sy = winFrame.origin.y + ny * winFrame.size.height;
-        double sw = bb.size.width * winFrame.size.width;
-        double sh = bb.size.height * winFrame.size.height;
+        double sx = localWinFrame.origin.x + nx * localWinFrame.size.width;
+        double sy = localWinFrame.origin.y + ny * localWinFrame.size.height;
+        double sw = bb.size.width * localWinFrame.size.width;
+        double sh = bb.size.height * localWinFrame.size.height;
         if (sw < 4 || sh < 4)
           continue;
         [ocrBoxes addObject:@{
@@ -1668,9 +1703,9 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
     }
   }
 
-  size_t imgW = CGImageGetWidth(captured);
-  size_t imgH = CGImageGetHeight(captured);
-  CGImageRelease(captured);
+  size_t imgW = CGImageGetWidth(localCaptured);
+  size_t imgH = CGImageGetHeight(localCaptured);
+  CGImageRelease(localCaptured);
 
   if (encode_image && !b64)
     return dup_json(@{@"ok" : @NO, @"code" : @"image_encode_failed"});
@@ -1680,14 +1715,14 @@ char *apexuse_macos_capture_and_ocr(const char *bundle_id, int window_index,
     @"bundle_id" : isDesktop ? @"desktop" : (app.bundleIdentifier ?: bid),
     @"frontmost_bundle_id" : frontApp.bundleIdentifier ?: @"",
     @"pid" : @(pid),
-    @"window_id" : @(capturedWid),
+    @"window_id" : @(localCapturedWid),
     @"capture_id" : capId ?: @"",
     @"pixel_digest" : pixelDigest ?: @"",
     @"window_frame" : @{
-      @"x" : @(winFrame.origin.x),
-      @"y" : @(winFrame.origin.y),
-      @"w" : @(winFrame.size.width),
-      @"h" : @(winFrame.size.height),
+      @"x" : @(localWinFrame.origin.x),
+      @"y" : @(localWinFrame.origin.y),
+      @"w" : @(localWinFrame.size.width),
+      @"h" : @(localWinFrame.size.height),
     },
     @"image_width" : @(imgW),
     @"image_height" : @(imgH),
@@ -3015,7 +3050,8 @@ char *apexuse_macos_perform_action(const char *req_json) {
             editable, kAXSelectedTextRangeAttribute, valRef);
         CFRelease(valRef);
       }
-    } else if (rawStart >= 0 && (!hasEnd || rawEnd >= rawStart)) {
+    } else if ((haveLen || hasEnd) && rawStart >= 0 &&
+               (!hasEnd || rawEnd >= rawStart)) {
       CFRange range = CFRangeMake(rawStart, hasEnd ? (rawEnd - rawStart) : 0);
       AXValueRef valRef = AXValueCreate(kAXValueCFRangeType, &range);
       if (valRef) {
