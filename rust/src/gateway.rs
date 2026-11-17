@@ -806,6 +806,7 @@ impl Gateway {
         if self.stop_file.exists() {
             return Err(ToolOutput::json(err_json("panic_stop", "STOP file present")));
         }
+        self.invalidate_snapshot();
         let snap = self
             .driver
             .inspect_app(&target_app, window, 150, 12)
@@ -830,7 +831,6 @@ impl Gateway {
             )));
         }
 
-        self.invalidate_snapshot();
         self.record_snapshot_meta(&snap, window, 150, 12, false);
 
         match match_semantic_in_elements(&self.elements_by_ref, spec) {
@@ -6507,6 +6507,181 @@ mod tests {
             ]),
         );
         assert_eq!(stale.payload.get("code").and_then(|v| v.as_str()), Some("stale_ref"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semantic_target_refresh_failure_invalidates_prior_refs_and_marks() {
+        use std::sync::{
+            atomic::{AtomicU8, Ordering},
+            Arc,
+        };
+        struct EscalatingDriver {
+            // 0 = normal, 1 = secure field appears, 2 = protected frontmost app
+            mode: Arc<AtomicU8>,
+        }
+        impl OsDriver for EscalatingDriver {
+            fn doctor(&self) -> Result<DoctorStatus, crate::driver::DriverError> {
+                MockDriver::new().doctor()
+            }
+            fn list_apps(&self) -> Result<Vec<crate::driver::RunningApp>, crate::driver::DriverError> {
+                MockDriver::new().list_apps()
+            }
+            fn activate_app(&self, _: &str) -> Result<(), crate::driver::DriverError> {
+                Ok(())
+            }
+            fn launch_app(&self, _: &str) -> Result<(), crate::driver::DriverError> {
+                Ok(())
+            }
+            fn supports_fast_point_verify(&self) -> bool {
+                true
+            }
+            fn inspect_app(
+                &self,
+                bundle_id: &str,
+                w: Option<i32>,
+                me: i32,
+                md: i32,
+            ) -> Result<AppSnapshot, crate::driver::DriverError> {
+                let mut snap = MockDriver::new().inspect_app(bundle_id, w, me, md)?;
+                match self.mode.load(Ordering::SeqCst) {
+                    1 => snap.has_secure_field = true,
+                    2 => snap.frontmost_bundle_id = "com.1password.app".into(),
+                    _ => {}
+                }
+                Ok(snap)
+            }
+            fn window_state(&self, bundle_id: &str) -> Result<WindowState, crate::driver::DriverError> {
+                MockDriver::new().window_state(bundle_id)
+            }
+            fn capture_and_ocr(
+                &self,
+                bundle_id: &str,
+                w: Option<i32>,
+                ocr_mode: OcrMode,
+                encode_image: bool,
+                options: &ImageEncodeOptions,
+            ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
+                MockDriver::new().capture_and_ocr(bundle_id, w, ocr_mode, encode_image, options)
+            }
+            fn render_som_image(
+                &self,
+                b: &str,
+                m: &str,
+                wf: &Rect,
+                options: &ImageEncodeOptions,
+            ) -> Result<String, crate::driver::DriverError> {
+                MockDriver::new().render_som_image(b, m, wf, options)
+            }
+            fn perform_action(&self, req: &ActionRequest) -> Result<crate::driver::ActionResult, crate::driver::DriverError> {
+                MockDriver::new().perform_action(req)
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_sem_fail_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Case A: refresh encounters secure field -> unsafe_or_incomplete_tree invalidates prior ref & mark
+        let mode_a = Arc::new(AtomicU8::new(0));
+        let mut gw_sec = Gateway::new(
+            Box::new(EscalatingDriver { mode: mode_a.clone() }),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+        let vis_a = gw_sec.dispatch(
+            "visual_inspect",
+            &JsonValue::object(vec![("app", JsonValue::String("Calculator".into()))]),
+        );
+        assert_eq!(vis_a.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        mode_a.store(1, Ordering::SeqCst);
+        let err_sec = gw_sec.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![(
+                        "target",
+                        JsonValue::object(vec![
+                            ("query", JsonValue::String("7".into())),
+                            ("fresh", JsonValue::Bool(true)),
+                        ]),
+                    )]),
+                ),
+            ]),
+        );
+        assert_eq!(
+            err_sec.payload.get("code").and_then(|v| v.as_str()),
+            Some("unsafe_or_incomplete_tree")
+        );
+
+        let stale_ref_a = gw_sec.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                ("arguments", JsonValue::object(vec![("ref", JsonValue::String("e1".into()))])),
+            ]),
+        );
+        assert_eq!(stale_ref_a.payload.get("code").and_then(|v| v.as_str()), Some("stale_ref"));
+
+        let stale_mark_a = gw_sec.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                ("arguments", JsonValue::object(vec![("mark", JsonValue::String("m3".into()))])),
+            ]),
+        );
+        assert_eq!(stale_mark_a.payload.get("code").and_then(|v| v.as_str()), Some("stale_ref"));
+
+        // Case B: refresh encounters protected frontmost app -> invalid_app invalidates prior ref & mark
+        let mode_b = Arc::new(AtomicU8::new(0));
+        let mut gw_prot = Gateway::new(
+            Box::new(EscalatingDriver { mode: mode_b.clone() }),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+        let vis_b = gw_prot.dispatch(
+            "visual_inspect",
+            &JsonValue::object(vec![("app", JsonValue::String("Calculator".into()))]),
+        );
+        assert_eq!(vis_b.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        mode_b.store(2, Ordering::SeqCst);
+        let err_prot = gw_prot.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![(
+                        "target",
+                        JsonValue::object(vec![("query", JsonValue::String("MissingInCache".into()))]),
+                    )]),
+                ),
+            ]),
+        );
+        assert_eq!(err_prot.payload.get("code").and_then(|v| v.as_str()), Some("invalid_app"));
+
+        let stale_ref_b = gw_prot.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                ("arguments", JsonValue::object(vec![("ref", JsonValue::String("e1".into()))])),
+            ]),
+        );
+        assert_eq!(stale_ref_b.payload.get("code").and_then(|v| v.as_str()), Some("stale_ref"));
+
+        let stale_mark_b = gw_prot.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                ("arguments", JsonValue::object(vec![("mark", JsonValue::String("m3".into()))])),
+            ]),
+        );
+        assert_eq!(stale_mark_b.payload.get("code").and_then(|v| v.as_str()), Some("stale_ref"));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
