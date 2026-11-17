@@ -20,15 +20,19 @@ pub struct RawElement {
 
 pub fn normalize_role(raw: &str) -> &'static str {
     let lower = raw.trim().to_ascii_lowercase();
-    let clean = lower.strip_prefix("role_").unwrap_or(&lower);
+    let clean = lower
+        .strip_prefix("role_")
+        .or_else(|| lower.strip_prefix("ax"))
+        .unwrap_or(&lower);
     match clean {
         "button" | "push button" | "push-button" | "splitbutton" | "split button"
         | "toggle button" | "toggle-button" => "Button",
+        "popupbutton" | "pop up button" => "PopUpButton",
         "checkbox" | "check box" | "check-box" | "check menu item" => "CheckBox",
         "radiobutton" | "radio button" | "radio-button" | "radio menu item" => "RadioButton",
         "combobox" | "combo box" | "combo-box" => "ComboBox",
         "password text" | "password-text" | "securetextfield" => "SecureTextField",
-        "search" | "searchbox" | "search field" => "SearchField",
+        "search" | "searchbox" | "search field" | "searchfield" => "SearchField",
         "edit" | "entry" | "text" | "textfield" | "text field" | "spin button" | "spinner" => {
             "TextField"
         }
@@ -41,6 +45,9 @@ pub fn normalize_role(raw: &str) -> &'static str {
         "treeitem" | "tree item" | "tree-item" => "TreeItem",
         "statictext" | "static text" | "label" | "heading" | "caption" => "StaticText",
         "window" | "frame" | "dialog" | "alert" => "Window",
+        "sheet" => "Sheet",
+        "scrollarea" | "scroll area" | "scroll-area" => "ScrollArea",
+        "webarea" | "web area" => "WebArea",
         "scrollbar" | "scroll bar" | "scroll-bar" => "ScrollBar",
         "slider" | "scale" => "Slider",
         "image" | "icon" => "Image",
@@ -49,6 +56,9 @@ pub fn normalize_role(raw: &str) -> &'static str {
         "list" => "List",
         "tree" | "tree table" => "Tree",
         "table" | "datagrid" => "Table",
+        "row" => "Row",
+        "cell" => "Cell",
+        "columnheader" => "ColumnHeader",
         "header" | "headeritem" | "titlebar" => "StaticText",
         _ => "Element",
     }
@@ -441,5 +451,19 @@ mod tests {
         assert!((boxes[0].frame.x - 100.0).abs() < 0.01);
         assert!((boxes[0].frame.y - 140.0).abs() < 0.01);
         assert!((boxes[0].confidence - 0.92).abs() < 0.01);
+    }
+
+    #[test]
+    fn normalizes_macos_ax_prefixed_roles_uniformly() {
+        assert_eq!(normalize_role("AXButton"), "Button");
+        assert_eq!(normalize_role("Button"), "Button");
+        assert_eq!(normalize_role("AXTextField"), "TextField");
+        assert_eq!(normalize_role("AXTextArea"), "TextArea");
+        assert_eq!(normalize_role("AXSearchField"), "SearchField");
+        assert_eq!(normalize_role("AXPopUpButton"), "PopUpButton");
+        assert_eq!(normalize_role("AXStaticText"), "StaticText");
+        assert_eq!(normalize_role("AXScrollArea"), "ScrollArea");
+        assert_eq!(normalize_role("AXWebArea"), "WebArea");
+        assert_eq!(normalize_role("AXSheet"), "Sheet");
     }
 }
