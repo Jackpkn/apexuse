@@ -617,7 +617,7 @@ def run():
     print(json.dumps({
         "ok": True,
         "app": aid,
-        "frontmost_app": front_app or aid,
+        "frontmost_app": front_name or aid,
         "pid": chosen["pid"],
         "frontmost": chosen["active"],
         "windows": win_metas,
@@ -2112,16 +2112,16 @@ mod native {
                     AtspiActionOutcome::FallbackRequired => {
                         let _ = activate_app(bundle_id);
                         click_point_raw(*x, *y);
-                        let _ = perform_action(&ActionRequest::PressKey {
+                        perform_action(&ActionRequest::PressKey {
                             bundle_id: bundle_id.clone(),
                             key: "a".into(),
                             modifiers: vec!["ctrl".into()],
-                        });
-                        let _ = perform_action(&ActionRequest::PressKey {
+                        })?;
+                        perform_action(&ActionRequest::PressKey {
                             bundle_id: bundle_id.clone(),
                             key: "backspace".into(),
                             modifiers: vec![],
-                        });
+                        })?;
                         std::thread::sleep(Duration::from_millis(20));
                         if !text.is_empty() {
                             fast_type_linux(text, *key_delay_us)?;
@@ -2169,11 +2169,11 @@ mod native {
                     AtspiActionOutcome::FallbackRequired => {
                         let _ = activate_app(bundle_id);
                         click_point_raw(*x, *y);
-                        let _ = perform_action(&ActionRequest::PressKey {
+                        perform_action(&ActionRequest::PressKey {
                             bundle_id: bundle_id.clone(),
                             key: "a".into(),
                             modifiers: vec!["ctrl".into()],
-                        });
+                        })?;
                         Ok(ActionResult {
                             method: "linux_select_all_fallback".into(),
                         })
@@ -2376,6 +2376,8 @@ mod tests {
         assert!(py.contains("select_text"));
         assert!(py.contains("set_selection"));
         assert!(py.contains("select_text_failed"));
+        assert!(!py.contains("front_app"));
+        assert!(py.contains(r#""frontmost_app": front_name"#));
 
         assert_eq!(
             parse_atspi_action_response(r#"{"ok":true,"method":"atspi_set_value"}"#),

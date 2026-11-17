@@ -316,6 +316,22 @@ pub fn can_use_select_all_fallback(
     }
 }
 
+/// Verifies that an element's owning process matches the requested target `bundle_id`
+/// when `bundle_id` is not `"desktop"`.
+pub fn element_process_matches_target(
+    bundle_id: &str,
+    elem_pid: i64,
+    proc_exe_name: &str,
+) -> bool {
+    if bundle_id.trim().eq_ignore_ascii_case("desktop") {
+        return true;
+    }
+    if elem_pid <= 0 {
+        return false;
+    }
+    crate::driver::common::app_matches(bundle_id, proc_exe_name, None, None, elem_pid)
+}
+
 /// Proportionally downscales captured RGBA pixels if `options.max_width > 0` and
 /// computes digest + PNG/JPEG base64 using shared `som_png` helpers.
 pub fn prepare_capture_frame(
@@ -1996,7 +2012,35 @@ foreach ($line in $res.Lines) {
         Ok((role_editable || has_writable_value, false))
     }
 
+    unsafe fn verify_element_process(
+        bundle_id: &str,
+        el: *mut IUIAutomationElement,
+    ) -> Result<(), DriverError> {
+        if bundle_id.trim().eq_ignore_ascii_case("desktop") {
+            return Ok(());
+        }
+        let mut el_pid: i32 = 0;
+        let hr = ((*(*el).vtbl).get_current_process_id)(el, &mut el_pid);
+        if hr != S_OK || el_pid <= 0 {
+            return Err(DriverError::new(
+                "target_identity_unverified",
+                "Could not verify owning process for target UIA element",
+            ));
+        }
+        let proc_exe = get_process_exe_name(el_pid as u32);
+        if !element_process_matches_target(bundle_id, el_pid as i64, &proc_exe) {
+            return Err(DriverError::new(
+                "target_identity_unverified",
+                format!(
+                    "Target element belongs to '{proc_exe}' (pid {el_pid}), not '{bundle_id}'"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn verify_editable_element_at(
+        bundle_id: &str,
         x: f64,
         y: f64,
     ) -> Result<ComPtr<IUIAutomationElement>, DriverError> {
@@ -2030,6 +2074,7 @@ foreach ($line in $res.Lines) {
             ));
         }
         let el = ComPtr(el_ptr);
+        unsafe { verify_element_process(bundle_id, el.0)? };
         let (direct_ok, direct_ro) = unsafe { check_editable_candidate(el.0)? };
         if direct_ro {
             return Err(DriverError::new(
@@ -2080,6 +2125,7 @@ foreach ($line in $res.Lines) {
                             | UIA_CONTROL_TYPE_DOCUMENT
                     )
                 {
+                    unsafe { verify_element_process(bundle_id, parent.0)? };
                     return Ok(parent);
                 }
                 cur_ptr = parent.0;
@@ -2483,8 +2529,10 @@ foreach ($line in $res.Lines) {
                 text,
                 key_delay_us,
             } => {
-                let el = verify_editable_element_at(*x, *y)?;
-                let _ = activate_app(bundle_id);
+                if !bundle_id.trim().eq_ignore_ascii_case("desktop") {
+                    activate_app(bundle_id)?;
+                }
+                let el = verify_editable_element_at(bundle_id, *x, *y)?;
                 let _ = cursor_sender().send(CursorMove {
                     x: x.round() as i32,
                     y: y.round() as i32,
@@ -2532,8 +2580,10 @@ foreach ($line in $res.Lines) {
                 start,
                 end,
             } => {
-                let el = verify_editable_element_at(*x, *y)?;
-                let _ = activate_app(bundle_id);
+                if !bundle_id.trim().eq_ignore_ascii_case("desktop") {
+                    activate_app(bundle_id)?;
+                }
+                let el = verify_editable_element_at(bundle_id, *x, *y)?;
                 let _ = cursor_sender().send(CursorMove {
                     x: x.round() as i32,
                     y: y.round() as i32,
@@ -2777,6 +2827,17 @@ mod tests {
         assert!(!can_use_select_all_fallback(Some(2), Some(10), Some(10)));
         assert!(!can_use_select_all_fallback(Some(0), Some(10), None));
         assert!(!can_use_select_all_fallback(None, Some(5), Some(10)));
+
+        assert!(element_process_matches_target("notepad", 123, "notepad.exe"));
+        assert!(element_process_matches_target(
+            "com.google.Chrome",
+            456,
+            "chrome.exe"
+        ));
+        assert!(element_process_matches_target("pid:456", 456, "anything.exe"));
+        assert!(element_process_matches_target("desktop", 999, "chrome.exe"));
+        assert!(!element_process_matches_target("notepad", 456, "chrome.exe"));
+        assert!(!element_process_matches_target("notepad", 0, "notepad.exe"));
     }
 
     #[test]
