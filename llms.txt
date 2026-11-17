@@ -1,10 +1,11 @@
 # ApexUse — Computer Use MCP Server (apexuse-mcp)
 
-> ApexUse is a local-first, open-source Computer Use MCP server written in pure Rust and native OS APIs for macOS, Windows, and Linux. Gives AI coding agents (Claude Code, OpenAI Codex, Gemini CLI, Antigravity) hybrid Accessibility + Set-of-Mark (`[m1]..[mN]`) visual grounding, OCR, batched `run_actions`, local `wait_for` polling, `verify_change` auto-retry, an independent floating `AgentCursor`, and workflow memory over MCP stdio with zero external Rust crate dependencies and no external LLM keys.
+> ApexUse is a local-first, open-source Computer Use MCP server (v0.3.0) written in pure Rust and native OS APIs for macOS (`arm64` & `x86_64`), Windows (`x86_64`), and Linux (`x86_64`). Gives AI coding agents (Antigravity, Claude Code, Claude Desktop, OpenAI Codex, Gemini CLI, Cursor, Windsurf, VS Code, OpenCode) hybrid Accessibility + Set-of-Mark (`[m1]..[mN]`) visual grounding, native `set_value`/`select_text`, semantic `target` lookup, `keep_snapshot` form-ref reuse, default compact JPEG screenshots, batched `run_actions` (up to 24 steps), local `wait_for` polling, adaptive `verify_change` auto-retry, an independent floating `AgentCursor`, and workflow memory over MCP stdio with zero external Rust or npm dependencies.
 
 ## Repository & Links
 
 - Source: https://github.com/Jackpkn/apexuse
+- npm Launcher (`npx -y apexuse-mcp`): https://www.npmjs.com/package/apexuse-mcp
 - Crates.io: https://crates.io/crates/apexuse-mcp
 - README: https://github.com/Jackpkn/apexuse/blob/main/README.md
 - Agent Config Guide: https://github.com/Jackpkn/apexuse/blob/main/agent-configs/README.md
@@ -15,24 +16,26 @@
 ## Core MCP Tools (`apexuse-mcp`)
 
 - `inspect_app`: Read-only Accessibility snapshot (`e1..eN` refs, bounds, workflow hints) without taking a screenshot.
-- `visual_inspect`: Captures window or `"desktop"`, fuses Accessibility + OCR (`ocr="auto"|"fast"|"accurate"|"off"`), overlays `[m1]..[mN]` badges, and returns annotated PNG + mark index.
-- `computer`: `inspect`, `click`, `double_click`, `right_click`, `hover`, `drag`, `type`, `press_key`, target-scoped `scroll` (`ref`/`mark`/`x,y`), `run_actions` (up to 12 local chained steps), `wait_for` (local AX/OCR poll up to 60s), `confirm`; supports `verify_change`, `max_retries`, `settle_ms`, `retry_delay_ms`, `require_change`.
-- `desktop`: `list_applications`, `launch_application`, `activate_application`, `open_url`, `visual_click`, `double_click`, `right_click`, `hover`, `drag`.
-- `screenshot`: Unannotated PNG window capture after safety preflight.
+- `visual_inspect`: Captures window or `"desktop"`, fuses Accessibility + OCR (`ocr="auto"|"fast"|"accurate"|"off"`), overlays `[m1]..[mN]` badges, and returns annotated JPEG (`format="jpeg"`, `quality=80`, `max_width=1280` default) or opt-in PNG (`format="png"`) + mark index.
+- `computer`: `inspect`, `click`, `double_click`, `right_click`, `hover`, `drag`, `type`, `set_value` (direct native text write/clear on verified editable fields; `text=""` clears, fails closed on unverified coordinates/OCR-only marks), `select_text` (optional `start`/`end`), `press_key`, target-scoped `scroll` (`ref`/`mark`/`x,y`), `run_actions` (up to 24 chained steps including inline `set_value`, `select_text`, `wait_for`, `inspect`, and `target`), `wait_for` (local AX/OCR poll up to 60s), `confirm`; supports `target: { query, role?, fresh? }`, `keep_snapshot`, `verify_change`, `max_retries`, `settle_ms`, `poll_interval_ms`, `retry_delay_ms`, `require_change`.
+- `desktop`: `list_applications`, `launch_application`, `activate_application`, `open_url`, `visual_click`, `double_click`, `right_click`, `hover`, `drag` (supports `mark`, `ref`, `target`, or `x`/`y`).
+- `screenshot`: Unannotated JPEG (default) or PNG window capture after safety preflight.
 - `workflow_memory`: Non-secret structural macro recording and parameterized replay (`list`, `lookup`, `record`, `replay`, `clear`).
 
 ## OS Architecture
 
-- macOS 14+ (`rust/native/macos_bridge.m`): `AXUIElement`, `ScreenCaptureKit`, Apple `Vision` OCR, `ApexUseCursorView` overlay, `CGEvent`/`NSEvent`. Live verified.
-- Windows 10/11 (`rust/src/driver/windows.rs`): Pure-Rust Win32 FFI (`IUIAutomation` COM, `PrintWindow`/`BitBlt`, WinRT `Windows.Media.Ocr`, `SendInput`, layered `AgentCursor`, `som_png` overlay). Cross-checked; CI build configured.
-- Linux X11/Wayland (`rust/src/driver/linux.rs`): Runtime `dlopen` `libX11` / `libXtst`, `AT-SPI2` (`gi.repository.Atspi`), Wayland helpers (`grim`/`spectacle`/`gnome-screenshot`, `wtype`/`ydotool`), `tesseract` OCR, `som_png` overlay. Cross-checked; CI build configured.
+- macOS 14+ (`rust/native/macos_bridge.m`): `AXUIElement` (`kAXValueAttribute`/`kAXSelectedTextRangeAttribute`), `ScreenCaptureKit` (with resolution cap & 1500ms window cache), Apple `Vision` OCR, `ApexUseCursorView` overlay, per-PID `CGEvent`/`NSEvent` chunked Unicode typing. Live verified.
+- Windows 10/11 (`rust/src/driver/windows.rs`): Pure-Rust Win32 FFI (`IUIAutomation` COM `ValuePattern`/`TextPattern`, `PrintWindow`/`BitBlt`, WinRT `Windows.Media.Ocr`, batched `SendInput`, layered `AgentCursor`, `som_png` codec). Cross-checked; CI build configured.
+- Linux X11/Wayland (`rust/src/driver/linux.rs`): Runtime `dlopen` `libX11` / `libXtst`, `AT-SPI2` (`EditableText` / `Text` / `gi.repository.Atspi`), Wayland helpers (`grim`/`spectacle`/`gnome-screenshot`, `wtype`/`ydotool`), `tesseract` OCR, `som_png` codec. Cross-checked; CI build configured.
 
-## Build & Verify
+## Install, Wire & CLI
 
 ```sh
+npx -y apexuse-mcp install all --write --npx --with-skill
+npx -y apexuse-mcp doctor --check
+npx -y apexuse-mcp config show
+npx -y apexuse-mcp call inspect_app --args '{"app":"Calculator"}'
 cargo install apexuse-mcp
 cargo build --release --manifest-path rust/Cargo.toml
 cargo test --manifest-path rust/Cargo.toml
-./rust/target/release/apexuse-mcp doctor
-./rust/target/release/apexuse-mcp install antigravity
 ```

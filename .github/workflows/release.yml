@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.2.0)"
+        description: "Release tag (e.g. v0.3.0)"
         required: true
-        default: "v0.2.0"
+        default: "v0.3.0"
 
 permissions:
   contents: write
@@ -23,14 +23,22 @@ jobs:
         include:
           - os: macos-latest
             target: macos-arm64
+            rust_target: ""
             bin: rust/target/release/apexuse-mcp
+            archive: tar.gz
+          - os: macos-latest
+            target: macos-x86_64
+            rust_target: x86_64-apple-darwin
+            bin: rust/target/x86_64-apple-darwin/release/apexuse-mcp
             archive: tar.gz
           - os: ubuntu-latest
             target: linux-x86_64
+            rust_target: ""
             bin: rust/target/release/apexuse-mcp
             archive: tar.gz
           - os: windows-latest
             target: windows-x86_64
+            rust_target: ""
             bin: rust/target/release/apexuse-mcp.exe
             archive: zip
 
@@ -41,13 +49,24 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Add Rust cross-compile target
+        if: matrix.rust_target != ''
+        shell: bash
+        run: rustup target add "${{ matrix.rust_target }}"
+
       - name: Run Rust tests
+        if: matrix.rust_target == ''
         shell: bash
         run: cargo test --manifest-path rust/Cargo.toml
 
       - name: Build release binary
         shell: bash
-        run: cargo build --release --manifest-path rust/Cargo.toml
+        run: |
+          if [ -n "${{ matrix.rust_target }}" ]; then
+            cargo build --release --target "${{ matrix.rust_target }}" --manifest-path rust/Cargo.toml
+          else
+            cargo build --release --manifest-path rust/Cargo.toml
+          fi
 
       - name: Package release archive
         shell: bash
