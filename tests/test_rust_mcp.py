@@ -819,3 +819,91 @@ def test_rust_cli_codex_plugin_probe_and_onboard_end_to_end(tmp_path):
     doc_onboard_data = json.loads(doc_onboard_res.stdout)
     assert doc_onboard_data["ok"] is True
     assert doc_onboard_data["shown"] is False
+
+
+@pytest.mark.anyio
+async def test_rust_mcp_domain_policy_partial_batch_and_replay_preconditions_e2e(tmp_path):
+    if not RUST_BIN.is_file():
+        pytest.skip("Rust release binary not built")
+
+    dom_policy = tmp_path / "domain_policy.yaml"
+    dom_policy.write_text(
+        'mode: normal\nconfirmation: direct\nconfirm_destructive: true\n'
+        'allowed_apps: ["*"]\n'
+        'allowed_domains: ["example.com", "*.docs.org"]\n'
+        'blocked_domains: ["evil.docs.org"]\n',
+        encoding="utf-8",
+    )
+    env = dict(
+        os.environ,
+        APEXUSE_STATE_DIR=str(tmp_path / "state"),
+        APEXUSE_POLICY=str(dom_policy),
+    )
+    env.pop("APEXUSE_CONFIG", None)
+    params = StdioServerParameters(command=str(RUST_BIN), args=["--mock"], env=env)
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            # 1. Domain policy enforces blocked_domains & allowed_domains on open_url
+            bad_url = await session.call_tool(
+                "desktop",
+                {
+                    "action": "open_url",
+                    "arguments": {"app": "com.google.Chrome", "url": "https://evil.docs.org/phish"},
+                },
+            )
+            assert bad_url.structuredContent["ok"] is False
+            assert bad_url.structuredContent["code"] == "domain_blocked"
+
+            ok_url = await session.call_tool(
+                "desktop",
+                {
+                    "action": "open_url",
+                    "arguments": {"app": "com.google.Chrome", "url": "https://guide.docs.org/"},
+                },
+            )
+            assert ok_url.structuredContent["ok"] is True
+
+            # 2. run_actions reports failed_step, executed count, and completed results on mid-batch failure
+            insp = await session.call_tool("inspect_app", {"app": "Calculator"})
+            assert insp.structuredContent["ok"] is True
+
+            partial = await session.call_tool(
+                "computer",
+                {
+                    "action": "run_actions",
+                    "arguments": {
+                        "steps": [
+                            {"action": "press_key", "key": "return"},
+                            {"action": "click", "ref": "e999"},
+                        ]
+                    },
+                },
+            )
+            assert partial.structuredContent["ok"] is False
+            assert partial.structuredContent["code"] == "stale_ref"
+            assert partial.structuredContent["failed_step"] == 1
+            assert partial.structuredContent["executed"] == 1
+            assert len(partial.structuredContent["results"]) == 1
+            assert partial.structuredContent["results"][0]["step"] == 0
+
+            # 3. workflow_memory rejects replay when expected_window_contains precondition mismatches
+            rec = await session.call_tool(
+                "workflow_memory",
+                {
+                    "action": "record",
+                    "app": "Calculator",
+                    "goal": "Strict window replay",
+                    "expected_window_contains": "NonexistentModalTitle",
+                    "steps": [{"action": "click", "target_role": "Button", "target_label": "7", "note": "Press 7"}],
+                },
+            )
+            assert rec.structuredContent["ok"] is True
+
+            pre_fail = await session.call_tool(
+                "workflow_memory",
+                {"action": "replay", "app": "Calculator", "goal": "Strict window"},
+            )
+            assert pre_fail.structuredContent["ok"] is False
+            assert pre_fail.structuredContent["code"] == "precondition_failed"

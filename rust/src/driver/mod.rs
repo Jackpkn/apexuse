@@ -592,6 +592,14 @@ pub struct ActionResult {
     pub method: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PointSafetyInfo {
+    pub safe: bool,
+    pub role: Option<String>,
+    pub label: Option<String>,
+    pub frontmost_bundle_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DriverError {
     pub code: String,
@@ -676,6 +684,13 @@ pub trait OsDriver: Send + Sync {
     }
     fn verify_point_safe(&self, _bundle_id: &str, _x: f64, _y: f64) -> Result<bool, DriverError> {
         Ok(true)
+    }
+    fn probe_point_safe(&self, bundle_id: &str, x: f64, y: f64) -> Result<PointSafetyInfo, DriverError> {
+        let safe = self.verify_point_safe(bundle_id, x, y)?;
+        Ok(PointSafetyInfo {
+            safe,
+            ..Default::default()
+        })
     }
     fn open_url(&self, _bundle_id: &str, _url: &str) -> Result<(), DriverError> {
         Err(DriverError::new(

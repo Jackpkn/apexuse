@@ -1,15 +1,16 @@
 use crate::json::{parse_json, JsonValue};
-use crate::policy::{contains_secure_marker, valid_bundle_id};
+use crate::policy::{contains_secure_marker, valid_bundle_id, valid_domain_pattern};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WorkflowStep {
     pub action: String,
     pub target_role: String,
     pub target_label: String,
     pub note: String,
+    pub verify_change: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -17,6 +18,8 @@ pub struct WorkflowRecipe {
     pub id: String,
     pub app: String,
     pub goal: String,
+    pub expected_domain: Option<String>,
+    pub expected_window_contains: Option<String>,
     pub steps: Vec<WorkflowStep>,
     pub updated_at: u64,
 }
@@ -27,27 +30,50 @@ impl WorkflowRecipe {
             .steps
             .iter()
             .map(|s| {
-                JsonValue::object(vec![
+                let mut fields = vec![
                     ("action", JsonValue::String(s.action.clone())),
                     ("target_role", JsonValue::String(s.target_role.clone())),
                     ("target_label", JsonValue::String(s.target_label.clone())),
                     ("note", JsonValue::String(s.note.clone())),
-                ])
+                ];
+                if s.verify_change {
+                    fields.push(("verify_change", JsonValue::Bool(true)));
+                }
+                JsonValue::object(fields)
             })
             .collect();
-        JsonValue::object(vec![
+        let mut fields = vec![
             ("id", JsonValue::String(self.id.clone())),
             ("app", JsonValue::String(self.app.clone())),
             ("goal", JsonValue::String(self.goal.clone())),
-            ("steps", JsonValue::Array(steps_json)),
-            ("updated_at", JsonValue::Number(self.updated_at as f64)),
-        ])
+        ];
+        if let Some(ref dom) = self.expected_domain {
+            fields.push(("expected_domain", JsonValue::String(dom.clone())));
+        }
+        if let Some(ref win) = self.expected_window_contains {
+            fields.push(("expected_window_contains", JsonValue::String(win.clone())));
+        }
+        fields.push(("steps", JsonValue::Array(steps_json)));
+        fields.push(("updated_at", JsonValue::Number(self.updated_at as f64)));
+        JsonValue::object(fields)
     }
 
     fn from_json(v: &JsonValue) -> Option<Self> {
         let id = v.get("id")?.as_str()?.to_string();
         let app = v.get("app")?.as_str()?.to_string();
         let goal = v.get("goal")?.as_str()?.to_string();
+        let expected_domain = v
+            .get("expected_domain")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let expected_window_contains = v
+            .get("expected_window_contains")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let updated_at = v.get("updated_at").and_then(|x| x.as_i64()).unwrap_or(0) as u64;
         let arr = v.get("steps")?.as_array()?;
         let mut steps = Vec::new();
@@ -57,12 +83,18 @@ impl WorkflowRecipe {
                 target_role: item.get("target_role").and_then(|x| x.as_str()).unwrap_or("").to_string(),
                 target_label: item.get("target_label").and_then(|x| x.as_str()).unwrap_or("").to_string(),
                 note: item.get("note").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                verify_change: item
+                    .get("verify_change")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false),
             });
         }
         Some(Self {
             id,
             app,
             goal,
+            expected_domain,
+            expected_window_contains,
             steps,
             updated_at,
         })
@@ -108,6 +140,17 @@ impl WorkflowMemory {
     }
 
     pub fn record(&self, app: &str, goal: &str, steps: Vec<WorkflowStep>) -> Result<WorkflowRecipe, String> {
+        self.record_with_preconditions(app, goal, None, None, steps)
+    }
+
+    pub fn record_with_preconditions(
+        &self,
+        app: &str,
+        goal: &str,
+        expected_domain: Option<&str>,
+        expected_window_contains: Option<&str>,
+        steps: Vec<WorkflowStep>,
+    ) -> Result<WorkflowRecipe, String> {
         if !valid_bundle_id(app) {
             return Err("invalid or protected app bundle id".into());
         }
@@ -115,6 +158,20 @@ impl WorkflowMemory {
         if clean_goal.is_empty() || steps.is_empty() || steps.len() > 20 {
             return Err("invalid recipe goal or step count".into());
         }
+        let clean_domain = match expected_domain.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                let norm = raw.to_ascii_lowercase();
+                if !valid_domain_pattern(&norm) || norm == "*" {
+                    return Err(format!("invalid expected_domain pattern: {raw}"));
+                }
+                Some(norm)
+            }
+            None => None,
+        };
+        let clean_window = match expected_window_contains.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => Some(sanitize_field(raw, 120)?),
+            None => None,
+        };
         let mut clean_steps = Vec::with_capacity(steps.len());
         for s in steps {
             clean_steps.push(WorkflowStep {
@@ -122,6 +179,7 @@ impl WorkflowMemory {
                 target_role: sanitize_field(&s.target_role, 32)?,
                 target_label: sanitize_field(&s.target_label, 80)?,
                 note: sanitize_field(&s.note, 120)?,
+                verify_change: s.verify_change,
             });
         }
 
@@ -144,6 +202,8 @@ impl WorkflowMemory {
             id: id.clone(),
             app: app.to_string(),
             goal: clean_goal,
+            expected_domain: clean_domain,
+            expected_window_contains: clean_window,
             steps: clean_steps,
             updated_at: now,
         };
@@ -218,6 +278,7 @@ mod tests {
                     target_role: "Button".into(),
                     target_label: "All Clear".into(),
                     note: "Reset previous expression".into(),
+                    ..Default::default()
                 }],
             )
             .unwrap();
@@ -236,7 +297,73 @@ mod tests {
                     target_role: "TextArea".into(),
                     target_label: "secret".into(),
                     note: "".into(),
+                    ..Default::default()
                 }]
+            )
+            .is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_preconditions_and_legacy_json_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("apexuse_mem_pre_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.json");
+
+        // Legacy recipe JSON without expected_domain, expected_window_contains, or verify_change must load cleanly
+        fs::write(
+            &path,
+            r#"{"recipes":[{"id":"com.apple.TextEdit:old","app":"com.apple.TextEdit","goal":"Old","updated_at":1,"steps":[{"action":"click","target_role":"Button","target_label":"Save","note":""}]}]}"#,
+        )
+        .unwrap();
+
+        let mem = WorkflowMemory::new(path);
+        let legacy = mem.load_all().unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].expected_domain, None);
+        assert_eq!(legacy[0].expected_window_contains, None);
+        assert!(!legacy[0].steps[0].verify_change);
+
+        let rec = mem
+            .record_with_preconditions(
+                "com.google.Chrome",
+                "Submit form",
+                Some("Example.COM"),
+                Some("Billing Portal"),
+                vec![WorkflowStep {
+                    action: "click".into(),
+                    target_role: "Button".into(),
+                    target_label: "Submit".into(),
+                    note: "Commit".into(),
+                    verify_change: true,
+                }],
+            )
+            .unwrap();
+        assert_eq!(rec.expected_domain.as_deref(), Some("example.com"));
+        assert_eq!(rec.expected_window_contains.as_deref(), Some("Billing Portal"));
+        assert!(rec.steps[0].verify_change);
+
+        let loaded = mem.lookup("com.google.Chrome", Some("Submit")).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].expected_domain.as_deref(), Some("example.com"));
+        assert_eq!(loaded[0].expected_window_contains.as_deref(), Some("Billing Portal"));
+        assert!(loaded[0].steps[0].verify_change);
+
+        assert!(mem
+            .record_with_preconditions(
+                "com.google.Chrome",
+                "Bad dom",
+                Some("https://example.com"),
+                None,
+                vec![WorkflowStep {
+                    action: "click".into(),
+                    target_role: "Button".into(),
+                    target_label: "Go".into(),
+                    note: "".into(),
+                    verify_change: false,
+                }],
             )
             .is_err());
 

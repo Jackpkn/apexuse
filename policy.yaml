@@ -1,6 +1,9 @@
 # Restart the server after editing. Use exact bundle IDs or "*" for unrestricted app control.
 mode: normal # normal | read_only | dry_run
 confirmation: direct # direct | required
+confirm_destructive: false # set true to require token confirmation on destructive labels (Delete, Purchase, Send, etc.)
 rate_limit_per_minute: 1200
 confirmation_ttl_seconds: 120
 allowed_apps: ["*"] # all non-protected bundle IDs may be controlled without confirmation loops
+allowed_domains: [] # empty allows all non-blocked http/https hosts; e.g. ["example.com", "*.github.com"]
+blocked_domains: [] # takes precedence over allowed_domains; e.g. ["*.bank.example", "admin.internal"]

@@ -148,6 +148,134 @@ pub fn contains_secure_marker(content: &str) -> bool {
     false
 }
 
+pub fn valid_domain_pattern(pattern: &str) -> bool {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() || trimmed.len() > 253 {
+        return false;
+    }
+    if trimmed == "*" {
+        return true;
+    }
+    let host = trimmed.strip_prefix("*.").unwrap_or(trimmed);
+    if host.is_empty()
+        || host.contains('*')
+        || host.contains("://")
+        || host.contains('/')
+        || host.contains('?')
+        || host.contains('#')
+        || host.contains('@')
+        || host.contains('\\')
+        || host.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return false;
+    }
+    if host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+    host.split('.').all(|seg| {
+        !seg.is_empty()
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
+/// Extracts the normalized lowercase host from an `http://` or `https://` URL.
+pub fn extract_url_host(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+        || trimmed.contains('\\')
+    {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = if host_port.starts_with('[') {
+        let end = host_port.find(']')?;
+        let after = &host_port[end + 1..];
+        if !after.is_empty() && !after.starts_with(':') {
+            return None;
+        }
+        &host_port[..=end]
+    } else {
+        host_port.split(':').next()?
+    };
+    let clean = host.trim_end_matches('.');
+    if clean.is_empty() {
+        None
+    } else {
+        Some(clean.to_string())
+    }
+}
+
+pub fn domain_matches(host: &str, pattern: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let p = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+    if h.is_empty() || p.is_empty() {
+        return false;
+    }
+    if p == "*" {
+        return true;
+    }
+    if let Some(base) = p.strip_prefix("*.") {
+        return h == base || h.ends_with(&format!(".{base}"));
+    }
+    h == p
+}
+
+/// Returns true when a UI element label clearly indicates an irreversible or sensitive action.
+pub fn is_destructive_label(label: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "delete",
+        "remove",
+        "erase",
+        "destroy",
+        "wipe",
+        "purge",
+        "terminate",
+        "drop",
+        "revoke",
+        "purchase",
+        "buy",
+        "pay",
+        "payment",
+        "checkout",
+        "transfer",
+        "wire",
+        "send",
+        "publish",
+        "uninstall",
+        "trash",
+        "discard",
+    ];
+    const PHRASES: &[&str] = &[
+        "place order",
+        "submit order",
+        "submit payment",
+        "cancel subscription",
+        "format disk",
+    ];
+    let tokens: Vec<String> = label
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if tokens.iter().any(|tok| WORDS.contains(&tok.as_str())) {
+        return true;
+    }
+    let normalized = tokens.join(" ");
+    PHRASES.iter().any(|p| normalized.contains(p))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -169,9 +297,12 @@ impl Mode {
 pub struct PolicySettings {
     pub mode: Mode,
     pub require_confirmation: bool,
+    pub confirm_destructive: bool,
     pub rate_limit_per_minute: usize,
     pub confirmation_ttl_seconds: u64,
     pub allowed_apps: Vec<String>,
+    pub allowed_domains: Vec<String>,
+    pub blocked_domains: Vec<String>,
 }
 
 impl Default for PolicySettings {
@@ -179,9 +310,12 @@ impl Default for PolicySettings {
         Self {
             mode: Mode::Normal,
             require_confirmation: false,
+            confirm_destructive: false,
             rate_limit_per_minute: 1200,
             confirmation_ttl_seconds: 120,
             allowed_apps: vec!["*".into()],
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
         }
     }
 }
@@ -193,6 +327,24 @@ impl PolicySettings {
                 .allowed_apps
                 .iter()
                 .any(|item| item == "*" || item.eq_ignore_ascii_case(bundle))
+    }
+
+    pub fn has_domain_restrictions(&self) -> bool {
+        !self.allowed_domains.is_empty() || !self.blocked_domains.is_empty()
+    }
+
+    pub fn permits_domain(&self, host: &str) -> bool {
+        let clean = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if clean.is_empty() {
+            return false;
+        }
+        if self.blocked_domains.iter().any(|pat| domain_matches(&clean, pat)) {
+            return false;
+        }
+        if self.allowed_domains.is_empty() {
+            return true;
+        }
+        self.allowed_domains.iter().any(|pat| domain_matches(&clean, pat))
     }
 
     pub fn load_yaml(path: &Path) -> Result<Self, String> {
@@ -235,6 +387,14 @@ impl PolicySettings {
                         _ => return Err(format!("invalid require_confirmation: {clean}")),
                     };
                 }
+                "confirm_destructive" => {
+                    let clean = unquote(val).to_ascii_lowercase();
+                    settings.confirm_destructive = match clean.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(format!("invalid confirm_destructive: {clean}")),
+                    };
+                }
                 "rate_limit_per_minute" => {
                     let n: usize = val.parse().map_err(|_| "invalid rate_limit_per_minute")?;
                     if !(1..=3600).contains(&n) {
@@ -260,6 +420,12 @@ impl PolicySettings {
                         }
                     }
                     settings.allowed_apps = list;
+                }
+                "allowed_domains" => {
+                    settings.allowed_domains = parse_domain_list(val, "allowed_domains")?;
+                }
+                "blocked_domains" => {
+                    settings.blocked_domains = parse_domain_list(val, "blocked_domains")?;
                 }
                 other => return Err(format!("unknown policy field: {other}")),
             }
@@ -303,6 +469,19 @@ fn parse_inline_yaml_list(val: &str) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
     Ok(inner.split(',').map(|item| unquote(item)).collect())
+}
+
+fn parse_domain_list(val: &str, field: &str) -> Result<Vec<String>, String> {
+    let list = parse_inline_yaml_list(val)?;
+    if list.len() > 200 {
+        return Err(format!("too many {field}"));
+    }
+    for item in &list {
+        if !valid_domain_pattern(item) {
+            return Err(format!("invalid domain pattern: {item}"));
+        }
+    }
+    Ok(list)
 }
 
 pub struct RateLimiter {
@@ -576,5 +755,60 @@ mod tests {
         });
         assert!(store.consume(&tok).is_some());
         assert!(store.consume(&tok).is_none());
+    }
+
+    #[test]
+    fn domain_host_extraction_and_policy_filtering() {
+        assert_eq!(
+            extract_url_host("https://Sub.Example.COM:8443/path?x=1#top"),
+            Some("sub.example.com".to_string())
+        );
+        assert_eq!(
+            extract_url_host("http://user:pass@localhost:3000/login"),
+            Some("localhost".to_string())
+        );
+        assert_eq!(
+            extract_url_host("https://[::1]:8080/api"),
+            Some("[::1]".to_string())
+        );
+        assert_eq!(extract_url_host("javascript:alert(1)"), None);
+        assert_eq!(extract_url_host("https://bad host/a"), None);
+
+        let dir = std::env::temp_dir().join(format!("apexuse_pol_dom_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.yaml");
+        fs::write(
+            &path,
+            "mode: normal\nconfirm_destructive: true\nallowed_domains: [\"example.com\", \"*.github.com\"]\nblocked_domains: [\"admin.github.com\", \"*.evil.com\"]\n",
+        )
+        .unwrap();
+        let s = PolicySettings::load_yaml(&path).unwrap();
+        assert!(s.confirm_destructive);
+        assert!(s.permits_domain("example.com"));
+        assert!(!s.permits_domain("sub.example.com"));
+        assert!(s.permits_domain("docs.github.com"));
+        assert!(s.permits_domain("github.com"));
+        assert!(!s.permits_domain("admin.github.com"));
+        assert!(!s.permits_domain("google.com"));
+
+        fs::write(&path, "allowed_domains: [\"https://example.com\"]\n").unwrap();
+        assert!(PolicySettings::load_yaml(&path).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn destructive_label_token_detection() {
+        assert!(is_destructive_label("Delete Email"));
+        assert!(is_destructive_label("trash-icon"));
+        assert!(is_destructive_label("Place Order"));
+        assert!(is_destructive_label("Submit Payment"));
+        assert!(is_destructive_label("Transfer Funds"));
+        assert!(is_destructive_label("Send Message"));
+        assert!(is_destructive_label("Cancel Subscription"));
+        assert!(!is_destructive_label("Render Preview"));
+        assert!(!is_destructive_label("Sender Name"));
+        assert!(!is_destructive_label("Update Settings"));
+        assert!(!is_destructive_label("Save Draft"));
     }
 }

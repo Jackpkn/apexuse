@@ -1855,8 +1855,15 @@ foreach ($line in $res.Lines) {
     }
 
     pub fn verify_point_safe(x: f64, y: f64) -> Result<bool, DriverError> {
+        Ok(probe_point_safe(x, y)?.safe)
+    }
+
+    pub fn probe_point_safe(x: f64, y: f64) -> Result<crate::driver::PointSafetyInfo, DriverError> {
         let Ok(uia) = create_uia() else {
-            return Ok(true);
+            return Ok(crate::driver::PointSafetyInfo {
+                safe: true,
+                ..Default::default()
+            });
         };
         let mut el_ptr: *mut IUIAutomationElement = null_mut();
         let hr = unsafe {
@@ -1870,12 +1877,47 @@ foreach ($line in $res.Lines) {
             )
         };
         if hr != S_OK || el_ptr.is_null() {
-            return Ok(true);
+            return Ok(crate::driver::PointSafetyInfo {
+                safe: true,
+                ..Default::default()
+            });
         }
         let el = ComPtr(el_ptr);
         let mut is_pwd: Bool = 0;
         let _ = unsafe { ((*(*el.0).vtbl).get_current_is_password)(el.0, &mut is_pwd) };
-        Ok(is_pwd == 0)
+        if is_pwd != 0 {
+            return Ok(crate::driver::PointSafetyInfo {
+                safe: false,
+                ..Default::default()
+            });
+        }
+        let mut ctrl_type: i32 = 0;
+        let ctrl_ok = unsafe { ((*(*el.0).vtbl).get_current_control_type)(el.0, &mut ctrl_type) } == S_OK;
+        let mut name_bstr: Bstr = null_mut();
+        let name_ok = unsafe { ((*(*el.0).vtbl).get_current_name)(el.0, &mut name_bstr) } == S_OK;
+        let raw_label = if name_ok {
+            unsafe { bstr_to_string_free(name_bstr) }
+        } else {
+            String::new()
+        };
+        let role = if ctrl_ok {
+            let r = uia_control_type_name(ctrl_type);
+            if r.is_empty() { None } else { Some(r.to_string()) }
+        } else {
+            None
+        };
+        let trimmed_label = raw_label.trim();
+        let label = if trimmed_label.is_empty() {
+            None
+        } else {
+            Some(trimmed_label.to_string())
+        };
+        Ok(crate::driver::PointSafetyInfo {
+            safe: true,
+            role,
+            label,
+            frontmost_bundle_id: None,
+        })
     }
 
     fn send_mouse_abs(x: f64, y: f64, flags: Dword, data: Dword) {
@@ -2687,6 +2729,10 @@ impl OsDriver for WindowsDriver {
 
     fn verify_point_safe(&self, _bundle_id: &str, x: f64, y: f64) -> Result<bool, DriverError> {
         native::verify_point_safe(x, y)
+    }
+
+    fn probe_point_safe(&self, _bundle_id: &str, x: f64, y: f64) -> Result<crate::driver::PointSafetyInfo, DriverError> {
+        native::probe_point_safe(x, y)
     }
 
     fn open_url(&self, bundle_id: &str, url: &str) -> Result<(), DriverError> {
