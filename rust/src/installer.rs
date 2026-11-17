@@ -2140,8 +2140,18 @@ mod tests {
         assert!(updated.contains("[plugins.\"apexuse@apexuse-local\"]"));
         assert!(updated.contains("enabled = true"));
 
-        let marketplace_dir = home.join(".codex/plugins/marketplaces/apexuse-local");
-        let cache_dir = home.join(".codex/plugins/cache/apexuse-local/apexuse/0.3.0");
+        let marketplace_dir = home
+            .join(".codex")
+            .join("plugins")
+            .join("marketplaces")
+            .join("apexuse-local");
+        let cache_dir = home
+            .join(".codex")
+            .join("plugins")
+            .join("cache")
+            .join("apexuse-local")
+            .join("apexuse")
+            .join("0.3.0");
         assert_eq!(
             write_res.get("marketplace_path").and_then(|v| v.as_str()),
             Some(marketplace_dir.to_string_lossy().as_ref())
