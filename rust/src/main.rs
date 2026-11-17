@@ -78,7 +78,10 @@ fn print_usage() {
          Usage:\n\
          \x20 apexuse-mcp [--mock]                       Start MCP stdio server\n\
          \x20 apexuse-mcp --version | -V                 Print version\n\
-         \x20 apexuse-mcp doctor [--check] [--mock]      Check OS accessibility & screen capture readiness\n\
+         \x20 apexuse-mcp doctor [--onboard] [--force] [--no-auto-close] [--check] [--mock]\n\
+         \x20                                              Check OS readiness or open macOS permission setup\n\
+         \x20 apexuse-mcp onboard [--force] [--no-auto-close] [--check] [--mock]\n\
+         \x20                                              Open guided macOS permission onboarding window\n\
          \x20 apexuse-mcp probe [--mock] [--npx] [--policy <path>] [--timeout-ms <n>]\n\
          \x20                                              Run live MCP initialize + tools/list handshake probe\n\
          \x20 apexuse-mcp install <agent|{}|all> [flags]  Print or auto-merge MCP client/plugin config\n\
@@ -130,33 +133,104 @@ fn build_gateway(use_mock: bool, strict_config: bool) -> Gateway {
     Gateway::with_config(driver, settings, state_dir, config)
 }
 
-fn run_doctor(rest: &[String], mut use_mock: bool) {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoctorCliAction {
+    Help(&'static str),
+    Run {
+        onboard: bool,
+        force: bool,
+        auto_close: bool,
+        check: bool,
+        use_mock: bool,
+    },
+}
+
+fn parse_doctor_cli_args(
+    rest: &[String],
+    mut use_mock: bool,
+    default_onboard: bool,
+) -> Result<DoctorCliAction, String> {
+    let mut onboard = default_onboard;
+    let mut force = false;
+    let mut auto_close = true;
     let mut check = false;
+    let cmd_name = if default_onboard { "onboard" } else { "doctor" };
+    let help_text = if default_onboard {
+        "Usage: apexuse-mcp onboard [--force] [--no-auto-close] [--check] [--mock]"
+    } else {
+        "Usage: apexuse-mcp doctor [--onboard] [--force] [--no-auto-close] [--check] [--mock]"
+    };
+
     for arg in rest {
         match arg.as_str() {
+            "--onboard" if !default_onboard => onboard = true,
+            "--force" => force = true,
+            "--no-auto-close" => auto_close = false,
             "--check" => check = true,
             "--mock" => use_mock = true,
-            "-h" | "--help" => {
-                println!("Usage: apexuse-mcp doctor [--check] [--mock]");
-                return;
-            }
-            other => {
-                eprintln!("Unknown doctor argument: {other}");
-                process::exit(2);
+            "-h" | "--help" => return Ok(DoctorCliAction::Help(help_text)),
+            other => return Err(format!("Unknown {cmd_name} argument: {other}")),
+        }
+    }
+
+    if !onboard && (force || !auto_close) {
+        return Err("--force and --no-auto-close require --onboard".to_string());
+    }
+
+    Ok(DoctorCliAction::Run {
+        onboard,
+        force,
+        auto_close,
+        check,
+        use_mock,
+    })
+}
+
+fn status_permissions_ready(doc: &JsonValue) -> bool {
+    doc.get("ok").and_then(|v| v.as_bool()) == Some(true)
+        && doc.get("accessibility").and_then(|v| v.as_bool()) == Some(true)
+        && doc.get("screen_recording").and_then(|v| v.as_bool()) == Some(true)
+}
+
+fn run_doctor_or_onboard(rest: &[String], use_mock: bool, default_onboard: bool) {
+    let action = match parse_doctor_cli_args(rest, use_mock, default_onboard) {
+        Ok(a) => a,
+        Err(msg) => {
+            eprintln!("{msg}");
+            process::exit(2);
+        }
+    };
+    match action {
+        DoctorCliAction::Help(usage) => {
+            println!("{usage}");
+        }
+        DoctorCliAction::Run {
+            onboard,
+            force,
+            auto_close,
+            check,
+            use_mock,
+        } => {
+            let gw = build_gateway(use_mock, false);
+            let out = if onboard {
+                gw.onboard(force, auto_close)
+            } else {
+                gw.doctor()
+            };
+            println!("{}", out.to_json_string());
+            if check && !status_permissions_ready(&out) {
+                process::exit(1);
             }
         }
     }
-    let gw = build_gateway(use_mock, false);
-    let doc = gw.doctor();
-    println!("{}", doc.to_json_string());
-    if check {
-        let ready = doc.get("ok").and_then(|v| v.as_bool()) == Some(true)
-            && doc.get("accessibility").and_then(|v| v.as_bool()) == Some(true)
-            && doc.get("screen_recording").and_then(|v| v.as_bool()) == Some(true);
-        if !ready {
-            process::exit(1);
-        }
-    }
+}
+
+fn run_doctor(rest: &[String], use_mock: bool) {
+    run_doctor_or_onboard(rest, use_mock, false);
+}
+
+fn run_onboard(rest: &[String], use_mock: bool) {
+    run_doctor_or_onboard(rest, use_mock, true);
 }
 
 fn split_flag_value<'a>(arg: &'a str, name: &str) -> Option<&'a str> {
@@ -815,6 +889,9 @@ fn main() {
         "doctor" | "--doctor" => {
             run_doctor(&args[pos + 1..], use_mock);
         }
+        "onboard" | "--onboard" => {
+            run_onboard(&args[pos + 1..], use_mock);
+        }
         "probe" => {
             run_probe(&args[pos + 1..], cli_mock);
         }
@@ -895,5 +972,88 @@ mod tests {
         assert_eq!(fp.get("ok").and_then(|v| v.as_bool()), Some(false));
         assert_eq!(fp.get("code").and_then(|v| v.as_str()), Some("probe_failed"));
         assert_eq!(fp.get("message").and_then(|v| v.as_str()), Some("timed out"));
+    }
+
+    #[test]
+    fn parse_doctor_and_onboard_cli_args_handles_flags() {
+        let plain = parse_doctor_cli_args(&[], false, false).unwrap();
+        assert_eq!(
+            plain,
+            DoctorCliAction::Run {
+                onboard: false,
+                force: false,
+                auto_close: true,
+                check: false,
+                use_mock: false,
+            }
+        );
+
+        let doc_onboard = parse_doctor_cli_args(
+            &[
+                "--onboard".into(),
+                "--force".into(),
+                "--no-auto-close".into(),
+                "--check".into(),
+                "--mock".into(),
+            ],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            doc_onboard,
+            DoctorCliAction::Run {
+                onboard: true,
+                force: true,
+                auto_close: false,
+                check: true,
+                use_mock: true,
+            }
+        );
+
+        let ob = parse_doctor_cli_args(
+            &["--no-auto-close".into(), "--check".into()],
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            ob,
+            DoctorCliAction::Run {
+                onboard: true,
+                force: false,
+                auto_close: false,
+                check: true,
+                use_mock: true,
+            }
+        );
+
+        // --force without --onboard on doctor is rejected cleanly
+        assert!(parse_doctor_cli_args(&["--force".into()], false, false).is_err());
+        assert!(parse_doctor_cli_args(&["--bogus".into()], false, true).is_err());
+    }
+
+    #[test]
+    fn status_permissions_ready_checks_ok_ax_and_sr() {
+        let ok = JsonValue::object(vec![
+            ("ok", JsonValue::Bool(true)),
+            ("accessibility", JsonValue::Bool(true)),
+            ("screen_recording", JsonValue::Bool(true)),
+        ]);
+        assert!(status_permissions_ready(&ok));
+
+        let missing_sr = JsonValue::object(vec![
+            ("ok", JsonValue::Bool(true)),
+            ("accessibility", JsonValue::Bool(true)),
+            ("screen_recording", JsonValue::Bool(false)),
+        ]);
+        assert!(!status_permissions_ready(&missing_sr));
+
+        let err = JsonValue::object(vec![
+            ("ok", JsonValue::Bool(false)),
+            ("accessibility", JsonValue::Bool(true)),
+            ("screen_recording", JsonValue::Bool(true)),
+        ]);
+        assert!(!status_permissions_ready(&err));
     }
 }

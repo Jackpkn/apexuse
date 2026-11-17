@@ -3,8 +3,8 @@
 #[cfg(target_os = "macos")]
 use super::{
     ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError,
-    ImageEncodeOptions, OcrBox, OcrMode, OsDriver, Rect, RunningApp, UiElement, WindowMeta,
-    WindowState,
+    ImageEncodeOptions, OcrBox, OcrMode, OnboardStatus, OsDriver, Rect, RunningApp, UiElement,
+    WindowMeta, WindowState,
 };
 #[cfg(target_os = "macos")]
 use crate::config::ImageFormat;
@@ -19,6 +19,7 @@ use std::os::raw::{c_char, c_double, c_int};
 extern "C" {
     fn apexuse_free_cstr(ptr: *mut c_char);
     fn apexuse_macos_doctor() -> *mut c_char;
+    fn apexuse_macos_onboard(force: c_int, auto_close: c_int) -> *mut c_char;
     fn apexuse_macos_list_apps() -> *mut c_char;
     fn apexuse_macos_activate_app(bundle_id: *const c_char) -> *mut c_char;
     fn apexuse_macos_launch_app(bundle_id: *const c_char) -> *mut c_char;
@@ -116,6 +117,54 @@ impl OsDriver for MacosDriver {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             note: "macOS AXUIElement + ScreenCaptureKit + Apple Vision driver active".into(),
+        })
+    }
+
+    fn onboard(&self, force: bool, auto_close: bool) -> Result<OnboardStatus, DriverError> {
+        let val = take_json(unsafe {
+            apexuse_macos_onboard(i32::from(force), i32::from(auto_close))
+        })?;
+        let accessibility = val
+            .get("accessibility")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let screen_recording = val
+            .get("screen_recording")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let shown = val.get("shown").and_then(|v| v.as_bool()).unwrap_or(false);
+        let already_granted = val
+            .get("already_granted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(!shown && accessibility && screen_recording);
+        let completed = val
+            .get("completed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(accessibility && screen_recording);
+        let host_app = val
+            .get("host_app")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        let note = val
+            .get("note")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(OnboardStatus {
+            os: val
+                .get("os")
+                .and_then(|v| v.as_str())
+                .unwrap_or("macos")
+                .to_string(),
+            shown,
+            already_granted,
+            accessibility,
+            screen_recording,
+            completed,
+            host_app,
+            note,
         })
     }
 
@@ -646,5 +695,19 @@ mod tests {
         assert!(st.active_window_frame.is_some());
         let frame = st.active_window_frame.unwrap();
         assert!(frame.w > 0.0 && frame.h > 0.0);
+    }
+
+    #[test]
+    fn native_onboard_fast_path_runs_headless_when_already_granted() {
+        let doc = MacosDriver.doctor().unwrap();
+        if doc.accessibility && doc.screen_recording {
+            let ob = MacosDriver.onboard(false, true).unwrap();
+            assert_eq!(ob.os, "macos");
+            assert!(!ob.shown);
+            assert!(ob.already_granted);
+            assert!(ob.accessibility);
+            assert!(ob.screen_recording);
+            assert!(ob.completed);
+        }
     }
 }
