@@ -17,7 +17,12 @@ pub const SUPPORTED_AGENTS: &[&str] = &[
     "opencode",
 ];
 
+pub const CODEX_PLUGIN_TARGET: &str = "codex-plugin";
 pub const SKILL_MD: &str = include_str!("../assets/SKILL.md");
+pub const CODEX_MARKETPLACE_JSON: &str = include_str!("../assets/plugin/marketplace.json");
+pub const CODEX_PLUGIN_JSON: &str = include_str!("../assets/plugin/plugin.json");
+pub const CODEX_PLUGIN_SVG: &str = include_str!("../assets/plugin/apexuse.svg");
+pub const CODEX_PLUGIN_SMALL_SVG: &str = include_str!("../assets/plugin/apexuse-small.svg");
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -268,6 +273,12 @@ fn resolve_target_path(
         ),
         ("codex", InstallScope::User) => Ok(require_home(env)?.join(".codex").join("config.toml")),
         ("codex", InstallScope::Project) => Ok(env.project_dir.join(".codex").join("config.toml")),
+        (CODEX_PLUGIN_TARGET, InstallScope::User) => {
+            Ok(require_home(env)?.join(".codex").join("config.toml"))
+        }
+        (CODEX_PLUGIN_TARGET, InstallScope::Project) => {
+            Err("codex-plugin only supports --scope user".into())
+        }
         ("cursor", InstallScope::User) => Ok(require_home(env)?.join(".cursor").join("mcp.json")),
         ("cursor", InstallScope::Project) => Ok(env.project_dir.join(".cursor").join("mcp.json")),
         ("windsurf", InstallScope::User) => {
@@ -292,13 +303,19 @@ fn resolve_target_path(
         }
         ("opencode", InstallScope::Project) => Ok(env.project_dir.join("opencode.json")),
         _ => Err(format!(
-            "Unsupported agent '{agent}'. Supported: {}, all",
-            SUPPORTED_AGENTS.join(", ")
+            "Unsupported agent '{agent}'. Supported: {}, {}, all",
+            SUPPORTED_AGENTS.join(", "),
+            CODEX_PLUGIN_TARGET
         )),
     }
 }
 
-fn command_and_args(exe_path: &Path, opts: &InstallOptions) -> (String, Vec<String>) {
+pub(crate) fn resolved_install_invocation(
+    raw_target: &str,
+    exe_path: &Path,
+    opts: &InstallOptions,
+) -> (String, Vec<String>) {
+    let _target = raw_target.trim();
     if opts.use_npx {
         (
             "npx".to_string(),
@@ -444,6 +461,26 @@ fn render_codex_toml_block(cmd: &str, args: &[String], opts: &InstallOptions) ->
         ));
     }
     block
+}
+
+fn render_codex_marketplace_toml_block(marketplace_path: &Path) -> String {
+    format!(
+        "[marketplaces.apexuse-local]\nsource_type = \"local\"\nsource = {}",
+        toml_basic_string(&marketplace_path.to_string_lossy())
+    )
+}
+
+fn render_codex_plugin_toml_block() -> &'static str {
+    "[plugins.\"apexuse@apexuse-local\"]\nenabled = true"
+}
+
+fn render_codex_plugin_mcp_json(cmd: &str, args: &[String], opts: &InstallOptions) -> String {
+    let entry = build_server_entry(CODEX_PLUGIN_TARGET, cmd, args, opts);
+    let root = JsonValue::object(vec![(
+        "mcpServers",
+        JsonValue::object(vec![("apexuse", entry)]),
+    )]);
+    format!("{}\n", format_json_pretty(&root))
 }
 
 fn update_toml_multiline_state(line: &str, state: &mut Option<&'static str>) {
@@ -633,19 +670,47 @@ fn is_apexuse_codex_table(table: &[String]) -> bool {
             && table[2] == "env")
 }
 
+fn is_codex_marketplace_table(table: &[String]) -> bool {
+    table.len() == 2 && table[0] == "marketplaces" && table[1] == "apexuse-local"
+}
+
+fn is_codex_plugin_table(table: &[String]) -> bool {
+    table.len() == 2 && table[0] == "plugins" && table[1] == "apexuse@apexuse-local"
+}
+
 struct TomlSection {
     table: Option<Vec<String>>,
     lines: Vec<String>,
 }
 
-fn upsert_codex_toml(existing: Option<&str>, block: &str, path: &Path) -> Result<String, String> {
-    let Some(raw) = existing else {
-        return Ok(format!("{block}\n"));
-    };
-    if raw.trim().is_empty() {
-        return Ok(format!("{block}\n"));
-    }
+enum TomlSectionOp<'a> {
+    Upsert {
+        matcher: fn(&[String]) -> bool,
+        block: &'a str,
+    },
+    Remove {
+        matcher: fn(&[String]) -> bool,
+    },
+    Transform {
+        matcher: fn(&[String]) -> bool,
+        transform: fn(&mut Vec<String>),
+    },
+}
 
+fn trim_blank_edges(lines: Vec<String>) -> Vec<String> {
+    let start = lines
+        .iter()
+        .position(|l| !l.trim().is_empty())
+        .unwrap_or(lines.len());
+    let end = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(start);
+    lines[start..end].to_vec()
+}
+
+fn parse_toml_sections(raw: &str, path: &Path) -> Result<Vec<TomlSection>, String> {
     let mut sections = vec![TomlSection {
         table: None,
         lines: Vec::new(),
@@ -674,32 +739,220 @@ fn upsert_codex_toml(existing: Option<&str>, block: &str, path: &Path) -> Result
         ));
     }
 
-    let mut insert_at: Option<usize> = None;
-    let mut retained: Vec<String> = Vec::new();
-
-    for sec in sections {
-        let is_apex = sec.table.as_deref().is_some_and(is_apexuse_codex_table);
-        if is_apex {
-            if insert_at.is_none() {
-                insert_at = Some(retained.len());
+    Ok(sections
+        .into_iter()
+        .filter_map(|sec| {
+            let lines = trim_blank_edges(sec.lines);
+            if lines.is_empty() {
+                None
+            } else {
+                Some(TomlSection {
+                    table: sec.table,
+                    lines,
+                })
             }
+        })
+        .collect())
+}
+
+fn parse_toml_assignment(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+        return None;
+    }
+    let (lhs, rhs) = trimmed.split_once('=')?;
+    let k = lhs.trim();
+    let k = k
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| k.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(k);
+    Some((k, rhs))
+}
+
+fn strip_toml_inline_comment(rhs: &str) -> &str {
+    let mut quote: Option<u8> = None;
+    let bytes = rhs.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if q == b'"' && b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'#' {
+            return rhs[..i].trim();
+        }
+        i += 1;
+    }
+    rhs.trim()
+}
+
+fn read_toml_section_bool(lines: &[String], key: &str) -> Option<bool> {
+    let mut multiline: Option<&'static str> = None;
+    let mut found = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        if idx == 0 && line.trim().starts_with('[') {
             continue;
         }
-        let mut lines = sec.lines;
-        while lines.first().is_some_and(|l| l.trim().is_empty()) {
-            lines.remove(0);
+        if multiline.is_none() {
+            if let Some((k, rhs)) = parse_toml_assignment(line) {
+                if k == key {
+                    found = match strip_toml_inline_comment(rhs) {
+                        "true" => Some(true),
+                        "false" => Some(false),
+                        _ => None,
+                    };
+                }
+            }
         }
-        while lines.last().is_some_and(|l| l.trim().is_empty()) {
-            lines.pop();
+        update_toml_multiline_state(line, &mut multiline);
+    }
+
+    found
+}
+
+fn set_toml_section_bool(lines: &mut Vec<String>, key: &str, value: bool) {
+    let replacement = format!("{key} = {value}");
+    let mut multiline: Option<&'static str> = None;
+    let mut replaced = false;
+
+    for (idx, line) in lines.iter_mut().enumerate() {
+        if idx == 0 && line.trim().starts_with('[') {
+            continue;
         }
-        if !lines.is_empty() {
-            retained.push(lines.join("\n"));
+        if multiline.is_none() {
+            if let Some((k, _)) = parse_toml_assignment(line) {
+                if k == key {
+                    *line = replacement.clone();
+                    replaced = true;
+                    continue;
+                }
+            }
+        }
+        update_toml_multiline_state(line, &mut multiline);
+    }
+
+    if !replaced {
+        lines.push(replacement);
+    }
+}
+
+fn disable_codex_plugin_section(lines: &mut Vec<String>) {
+    set_toml_section_bool(lines, "enabled", false);
+}
+
+fn apply_toml_section_ops(
+    existing: Option<&str>,
+    ops: &[TomlSectionOp<'_>],
+    path: &Path,
+) -> Result<String, String> {
+    let mut sections = match existing {
+        Some(raw) if !raw.trim().is_empty() => parse_toml_sections(raw, path)?,
+        _ => Vec::new(),
+    };
+
+    for op in ops {
+        match op {
+            TomlSectionOp::Remove { matcher } => {
+                sections.retain(|s| !s.table.as_deref().is_some_and(matcher));
+            }
+            TomlSectionOp::Upsert { matcher, block } => {
+                let mut retained = Vec::with_capacity(sections.len() + 1);
+                let mut insert_at = None;
+                for sec in sections {
+                    if sec.table.as_deref().is_some_and(matcher) {
+                        if insert_at.is_none() {
+                            insert_at = Some(retained.len());
+                        }
+                        continue;
+                    }
+                    retained.push(sec);
+                }
+                let pos = insert_at.unwrap_or(retained.len()).min(retained.len());
+                retained.insert(
+                    pos,
+                    TomlSection {
+                        table: None,
+                        lines: block.lines().map(str::to_string).collect(),
+                    },
+                );
+                sections = retained;
+            }
+            TomlSectionOp::Transform { matcher, transform } => {
+                for sec in &mut sections {
+                    if sec.table.as_deref().is_some_and(matcher) {
+                        transform(&mut sec.lines);
+                    }
+                }
+            }
         }
     }
 
-    let pos = insert_at.unwrap_or(retained.len()).min(retained.len());
-    retained.insert(pos, block.to_string());
-    Ok(format!("{}\n", retained.join("\n\n")))
+    let rendered: Vec<String> = sections
+        .into_iter()
+        .filter_map(|s| {
+            let trimmed = trim_blank_edges(s.lines);
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.join("\n"))
+            }
+        })
+        .collect();
+    if rendered.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!("{}\n", rendered.join("\n\n")))
+    }
+}
+
+fn upsert_codex_toml(
+    existing: Option<&str>,
+    block: &str,
+    disable_plugin: bool,
+    path: &Path,
+) -> Result<String, String> {
+    let mut ops = vec![TomlSectionOp::Upsert {
+        matcher: is_apexuse_codex_table,
+        block,
+    }];
+    if disable_plugin {
+        ops.push(TomlSectionOp::Transform {
+            matcher: is_codex_plugin_table,
+            transform: disable_codex_plugin_section,
+        });
+    }
+    apply_toml_section_ops(existing, &ops, path)
+}
+
+fn upsert_codex_plugin_toml(
+    existing: Option<&str>,
+    marketplace_block: &str,
+    plugin_block: &str,
+    path: &Path,
+) -> Result<String, String> {
+    let ops = [
+        TomlSectionOp::Remove {
+            matcher: is_apexuse_codex_table,
+        },
+        TomlSectionOp::Upsert {
+            matcher: is_codex_marketplace_table,
+            block: marketplace_block,
+        },
+        TomlSectionOp::Upsert {
+            matcher: is_codex_plugin_table,
+            block: plugin_block,
+        },
+    ];
+    apply_toml_section_ops(existing, &ops, path)
 }
 
 fn append_bak_path(path: &Path) -> PathBuf {
@@ -781,6 +1034,15 @@ fn resolve_skill_paths(scope: InstallScope, env: &InstallEnv) -> Result<Vec<Path
     }
 }
 
+fn write_bytes_if_changed(path: &Path, content: &[u8]) -> Result<bool, String> {
+    let same = fs::read(path).map(|cur| cur == content).unwrap_or(false);
+    if same {
+        return Ok(false);
+    }
+    atomic_write_bytes(path, content)?;
+    Ok(true)
+}
+
 fn apply_skill_install(
     scope: InstallScope,
     do_write: bool,
@@ -790,12 +1052,7 @@ fn apply_skill_install(
     let mut written = false;
     if do_write {
         for p in &paths {
-            let same = fs::read_to_string(p)
-                .map(|cur| cur == SKILL_MD)
-                .unwrap_or(false);
-            if !same {
-                atomic_write_bytes(p, SKILL_MD.as_bytes())?;
-            }
+            let _ = write_bytes_if_changed(p, SKILL_MD.as_bytes())?;
         }
         written = true;
     }
@@ -808,6 +1065,215 @@ fn apply_skill_install(
     ))
 }
 
+fn install_mode_str(opts: &InstallOptions) -> &'static str {
+    if opts.dry_run {
+        "dry_run"
+    } else if opts.write {
+        "write"
+    } else {
+        "snippet"
+    }
+}
+
+fn read_existing_config(target_path: &Path, inspect_existing: bool) -> Result<Option<String>, String> {
+    if inspect_existing && target_path.exists() {
+        Ok(Some(fs::read_to_string(target_path).map_err(|e| {
+            format!("failed to read {}: {e}", target_path.display())
+        })?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn compute_dry_run_status(existing_raw: Option<&str>, new_content: &str) -> (&'static str, bool) {
+    let changed = existing_raw != Some(new_content);
+    let will_bak = changed && existing_raw.is_some_and(|s| !s.trim().is_empty());
+    let st = if changed { "would_write" } else { "unchanged" };
+    (st, will_bak)
+}
+
+fn build_install_result(
+    agent: &str,
+    opts: &InstallOptions,
+    status: &str,
+    format_name: &str,
+    target_path: &Path,
+    backup_path: Option<PathBuf>,
+    would_backup: bool,
+    snippet: String,
+    extra_fields: Vec<(&'static str, JsonValue)>,
+    env: &InstallEnv,
+) -> Result<JsonValue, String> {
+    let do_write = opts.write && !opts.dry_run;
+    let mut fields = vec![
+        ("ok", JsonValue::Bool(true)),
+        ("agent", JsonValue::String(agent.to_string())),
+        ("scope", JsonValue::String(opts.scope.as_str().into())),
+        ("mode", JsonValue::String(install_mode_str(opts).into())),
+        ("status", JsonValue::String(status.into())),
+        ("format", JsonValue::String(format_name.into())),
+        (
+            "target_path",
+            JsonValue::String(target_path.to_string_lossy().into_owned()),
+        ),
+        (
+            "backup_path",
+            match backup_path {
+                Some(p) => JsonValue::String(p.to_string_lossy().into_owned()),
+                None => JsonValue::Null,
+            },
+        ),
+        ("snippet", JsonValue::String(snippet)),
+    ];
+
+    if opts.dry_run {
+        fields.push(("would_backup", JsonValue::Bool(would_backup)));
+    }
+    fields.extend(extra_fields);
+
+    if opts.with_skill {
+        let (skill_paths, skill_written) = apply_skill_install(opts.scope, do_write, env)?;
+        fields.push((
+            "skill_paths",
+            JsonValue::Array(skill_paths.into_iter().map(JsonValue::String).collect()),
+        ));
+        fields.push(("skill_written", JsonValue::Bool(skill_written)));
+    }
+
+    Ok(JsonValue::object(fields))
+}
+
+fn install_codex_plugin_with_env(
+    exe_path: &Path,
+    opts: &InstallOptions,
+    env: &InstallEnv,
+) -> Result<JsonValue, String> {
+    let target_path = resolve_target_path(CODEX_PLUGIN_TARGET, opts.scope, env)?;
+    let home = require_home(env)?;
+    let plugins_root = home.join(".codex").join("plugins");
+    let marketplace_path = plugins_root.join("marketplaces").join("apexuse-local");
+    let cache_path = plugins_root
+        .join("cache")
+        .join("apexuse-local")
+        .join("apexuse")
+        .join(env!("CARGO_PKG_VERSION"));
+
+    let (cmd, args) = resolved_install_invocation(CODEX_PLUGIN_TARGET, exe_path, opts);
+    let do_write = opts.write && !opts.dry_run;
+    let inspect_existing = opts.write || opts.dry_run;
+    let existing_raw = read_existing_config(&target_path, inspect_existing)?;
+
+    let marketplace_block = render_codex_marketplace_toml_block(&marketplace_path);
+    let plugin_block = render_codex_plugin_toml_block();
+    let snippet_str = format!("{marketplace_block}\n\n{plugin_block}");
+    let new_content = if inspect_existing {
+        upsert_codex_plugin_toml(
+            existing_raw.as_deref(),
+            &marketplace_block,
+            plugin_block,
+            &target_path,
+        )?
+    } else {
+        format!("{snippet_str}\n")
+    };
+
+    let mcp_json_content = render_codex_plugin_mcp_json(&cmd, &args, opts);
+    let marketplace_plugin_dir = marketplace_path.join("plugins").join("apexuse");
+    let asset_files: [(PathBuf, &[u8]); 9] = [
+        (
+            marketplace_path
+                .join(".agents")
+                .join("plugins")
+                .join("marketplace.json"),
+            CODEX_MARKETPLACE_JSON.as_bytes(),
+        ),
+        (
+            marketplace_plugin_dir.join(".codex-plugin").join("plugin.json"),
+            CODEX_PLUGIN_JSON.as_bytes(),
+        ),
+        (
+            marketplace_plugin_dir.join(".mcp.json"),
+            mcp_json_content.as_bytes(),
+        ),
+        (
+            marketplace_plugin_dir.join("assets").join("apexuse.svg"),
+            CODEX_PLUGIN_SVG.as_bytes(),
+        ),
+        (
+            marketplace_plugin_dir
+                .join("assets")
+                .join("apexuse-small.svg"),
+            CODEX_PLUGIN_SMALL_SVG.as_bytes(),
+        ),
+        (
+            cache_path.join(".codex-plugin").join("plugin.json"),
+            CODEX_PLUGIN_JSON.as_bytes(),
+        ),
+        (cache_path.join(".mcp.json"), mcp_json_content.as_bytes()),
+        (
+            cache_path.join("assets").join("apexuse.svg"),
+            CODEX_PLUGIN_SVG.as_bytes(),
+        ),
+        (
+            cache_path.join("assets").join("apexuse-small.svg"),
+            CODEX_PLUGIN_SMALL_SVG.as_bytes(),
+        ),
+    ];
+
+    let (status, backup_path, would_backup) = if do_write {
+        let mut any_asset_written = false;
+        for (path, bytes) in &asset_files {
+            if write_bytes_if_changed(path, bytes)? {
+                any_asset_written = true;
+            }
+        }
+        let (toml_status, bak) =
+            write_config_safely(&target_path, existing_raw.as_deref(), &new_content)?;
+        let combined_status = if toml_status == "written" || any_asset_written {
+            "written"
+        } else {
+            "unchanged"
+        };
+        (combined_status, bak, false)
+    } else if opts.dry_run {
+        let (toml_status, will_bak) =
+            compute_dry_run_status(existing_raw.as_deref(), &new_content);
+        let assets_changed = asset_files
+            .iter()
+            .any(|(path, bytes)| fs::read(path).ok().as_deref() != Some(*bytes));
+        let st = if toml_status == "would_write" || assets_changed {
+            "would_write"
+        } else {
+            "unchanged"
+        };
+        (st, None, will_bak)
+    } else {
+        ("preview", None, false)
+    };
+
+    build_install_result(
+        CODEX_PLUGIN_TARGET,
+        opts,
+        status,
+        "toml",
+        &target_path,
+        backup_path,
+        would_backup,
+        snippet_str,
+        vec![
+            (
+                "marketplace_path",
+                JsonValue::String(marketplace_path.to_string_lossy().into_owned()),
+            ),
+            (
+                "cache_path",
+                JsonValue::String(cache_path.to_string_lossy().into_owned()),
+            ),
+        ],
+        env,
+    )
+}
+
 pub(crate) fn install_agent_with_env(
     raw_agent: &str,
     exe_path: &Path,
@@ -818,37 +1284,32 @@ pub(crate) fn install_agent_with_env(
     if agent == "all" {
         return Err("use install_all for 'all', or specify a concrete agent name".into());
     }
+    if agent == CODEX_PLUGIN_TARGET {
+        return install_codex_plugin_with_env(exe_path, opts, env);
+    }
     if !SUPPORTED_AGENTS.contains(&agent.as_str()) {
         return Err(format!(
-            "Unsupported agent '{raw_agent}'. Supported: {}, all",
-            SUPPORTED_AGENTS.join(", ")
+            "Unsupported agent '{raw_agent}'. Supported: {}, {}, all",
+            SUPPORTED_AGENTS.join(", "),
+            CODEX_PLUGIN_TARGET
         ));
     }
 
     let target_path = resolve_target_path(&agent, opts.scope, env)?;
-    let (cmd, args) = command_and_args(exe_path, opts);
-    let mode = if opts.dry_run {
-        "dry_run"
-    } else if opts.write {
-        "write"
-    } else {
-        "snippet"
-    };
+    let (cmd, args) = resolved_install_invocation(&agent, exe_path, opts);
     let do_write = opts.write && !opts.dry_run;
     let inspect_existing = opts.write || opts.dry_run;
-
-    let existing_raw = if inspect_existing && target_path.exists() {
-        Some(fs::read_to_string(&target_path).map_err(|e| {
-            format!("failed to read {}: {e}", target_path.display())
-        })?)
-    } else {
-        None
-    };
+    let existing_raw = read_existing_config(&target_path, inspect_existing)?;
 
     let (format_name, new_content, config_json_opt, snippet_str) = if agent == "codex" {
         let block = render_codex_toml_block(&cmd, &args, opts);
         let merged = if inspect_existing {
-            upsert_codex_toml(existing_raw.as_deref(), &block, &target_path)?
+            upsert_codex_toml(
+                existing_raw.as_deref(),
+                &block,
+                opts.scope == InstallScope::User,
+                &target_path,
+            )?
         } else {
             format!("{block}\n")
         };
@@ -904,58 +1365,35 @@ pub(crate) fn install_agent_with_env(
         let (st, bak) = write_config_safely(&target_path, existing_raw.as_deref(), &new_content)?;
         (st, bak, false)
     } else if opts.dry_run {
-        let changed = existing_raw.as_deref() != Some(new_content.as_str());
-        let will_bak =
-            changed && existing_raw.as_deref().is_some_and(|s| !s.trim().is_empty());
-        let st = if changed { "would_write" } else { "unchanged" };
+        let (st, will_bak) = compute_dry_run_status(existing_raw.as_deref(), &new_content);
         (st, None, will_bak)
     } else {
         ("preview", None, false)
     };
 
-    let mut fields = vec![
-        ("ok", JsonValue::Bool(true)),
-        ("agent", JsonValue::String(agent.clone())),
-        ("scope", JsonValue::String(opts.scope.as_str().into())),
-        ("mode", JsonValue::String(mode.into())),
-        ("status", JsonValue::String(status.into())),
-        ("format", JsonValue::String(format_name.into())),
-        (
-            "target_path",
-            JsonValue::String(target_path.to_string_lossy().into_owned()),
-        ),
-        (
-            "backup_path",
-            match backup_path {
-                Some(p) => JsonValue::String(p.to_string_lossy().into_owned()),
-                None => JsonValue::Null,
-            },
-        ),
-        ("snippet", JsonValue::String(snippet_str)),
-    ];
-
-    if opts.dry_run {
-        fields.push(("would_backup", JsonValue::Bool(would_backup)));
-    }
+    let mut extra_fields = Vec::new();
     if let Some(cfg_val) = config_json_opt {
-        fields.push(("config", cfg_val));
+        extra_fields.push(("config", cfg_val));
     }
     if agent == "claude" && !opts.write && !opts.dry_run {
-        fields.push((
+        extra_fields.push((
             "cli_hint",
             JsonValue::String(build_claude_cli_hint(&cmd, &args, opts)),
         ));
     }
-    if opts.with_skill {
-        let (skill_paths, skill_written) = apply_skill_install(opts.scope, do_write, env)?;
-        fields.push((
-            "skill_paths",
-            JsonValue::Array(skill_paths.into_iter().map(JsonValue::String).collect()),
-        ));
-        fields.push(("skill_written", JsonValue::Bool(skill_written)));
-    }
 
-    Ok(JsonValue::object(fields))
+    build_install_result(
+        &agent,
+        opts,
+        status,
+        format_name,
+        &target_path,
+        backup_path,
+        would_backup,
+        snippet_str,
+        extra_fields,
+        env,
+    )
 }
 
 fn has_cli_on_path(bin_name: &str, env: &InstallEnv) -> bool {
@@ -1070,6 +1508,25 @@ fn detect_agent(agent: &str, scope: InstallScope, env: &InstallEnv) -> Result<()
     }
 }
 
+fn should_preserve_codex_plugin(scope: InstallScope, env: &InstallEnv) -> bool {
+    if scope != InstallScope::User {
+        return false;
+    }
+    let Ok(config_path) = resolve_target_path(CODEX_PLUGIN_TARGET, scope, env) else {
+        return false;
+    };
+    let Ok(raw) = fs::read_to_string(&config_path) else {
+        return false;
+    };
+    let Ok(sections) = parse_toml_sections(&raw, &config_path) else {
+        return false;
+    };
+    sections
+        .iter()
+        .filter(|s| s.table.as_deref().is_some_and(is_codex_plugin_table))
+        .any(|s| read_toml_section_bool(&s.lines, "enabled") == Some(true))
+}
+
 pub(crate) fn install_all_with_env(
     exe_path: &Path,
     opts: &InstallOptions,
@@ -1098,10 +1555,15 @@ pub(crate) fn install_all_with_env(
             ]));
             continue;
         }
-        match install_agent_with_env(agent, exe_path, &per_agent_opts, env) {
+        let effective_agent = if agent == "codex" && should_preserve_codex_plugin(opts.scope, env) {
+            CODEX_PLUGIN_TARGET
+        } else {
+            agent
+        };
+        match install_agent_with_env(effective_agent, exe_path, &per_agent_opts, env) {
             Ok(val) => wired.push(val),
             Err(err) => errors.push(JsonValue::object(vec![
-                ("agent", JsonValue::String(agent.into())),
+                ("agent", JsonValue::String(effective_agent.into())),
                 ("error", JsonValue::String(err)),
             ])),
         }
@@ -1572,6 +2034,368 @@ mod tests {
         let errors = all_res.get("errors").and_then(|v| v.as_array()).unwrap();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].get("agent").and_then(|v| v.as_str()), Some("cursor"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_plugin_upserts_marketplace_materializes_cache_and_clears_mcp_server() {
+        let (root, env) = make_temp_env("codex_plugin_upsert", TargetOs::Macos);
+        let home = env.home.as_ref().unwrap();
+        let codex_toml = home.join(".codex/config.toml");
+        fs::create_dir_all(codex_toml.parent().unwrap()).unwrap();
+        let initial = concat!(
+            "model = \"gpt-5\"\n",
+            "notes = \"\"\"\n",
+            "[mcp_servers.apexuse]\n",
+            "[plugins.\"apexuse@apexuse-local\"]\n",
+            "\"\"\"\n\n",
+            "[mcp_servers.apexuse]\n",
+            "command = \"/old/apexuse-mcp\"\n",
+            "args = []\n\n",
+            "[mcp_servers.apexuse.env]\n",
+            "APEXUSE_POLICY = \"/old/policy.yaml\"\n\n",
+            "[mcp_servers.context7]\n",
+            "command = \"npx\"\n\n",
+            "[plugins.\"other@marketplace\"]\n",
+            "enabled = true\n"
+        );
+        fs::write(&codex_toml, initial).unwrap();
+
+        let dry_opts = InstallOptions {
+            dry_run: true,
+            use_npx: true,
+            policy_path: Some(PathBuf::from("/new/policy.yaml")),
+            with_skill: true,
+            ..InstallOptions::default()
+        };
+        let dry_res =
+            install_agent_with_env(CODEX_PLUGIN_TARGET, Path::new("/bin/apex"), &dry_opts, &env)
+                .expect("dry run should succeed");
+        assert_eq!(dry_res.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            dry_res.get("agent").and_then(|v| v.as_str()),
+            Some(CODEX_PLUGIN_TARGET)
+        );
+        assert_eq!(dry_res.get("mode").and_then(|v| v.as_str()), Some("dry_run"));
+        assert_eq!(
+            dry_res.get("status").and_then(|v| v.as_str()),
+            Some("would_write")
+        );
+        assert_eq!(dry_res.get("format").and_then(|v| v.as_str()), Some("toml"));
+        assert_eq!(
+            dry_res.get("would_backup").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            dry_res.get("skill_written").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(!home.join(".codex/plugins").exists());
+        assert_eq!(fs::read_to_string(&codex_toml).unwrap(), initial);
+
+        let write_opts = InstallOptions {
+            write: true,
+            dry_run: false,
+            ..dry_opts.clone()
+        };
+        let write_res =
+            install_agent_with_env(CODEX_PLUGIN_TARGET, Path::new("/bin/apex"), &write_opts, &env)
+                .expect("write should succeed");
+        assert_eq!(write_res.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            write_res.get("status").and_then(|v| v.as_str()),
+            Some("written")
+        );
+        assert_eq!(
+            write_res.get("skill_written").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        let bak = PathBuf::from(format!("{}.bak", codex_toml.display()));
+        assert_eq!(fs::read_to_string(&bak).unwrap(), initial);
+
+        let updated = fs::read_to_string(&codex_toml).unwrap();
+        assert!(updated.contains("model = \"gpt-5\""));
+        assert!(updated.contains("notes = \"\"\""));
+        assert!(updated.contains("[mcp_servers.context7]"));
+        assert!(updated.contains("[plugins.\"other@marketplace\"]"));
+        assert!(!updated.contains("/old/apexuse-mcp"));
+        assert!(!updated.contains("[mcp_servers.apexuse.env]"));
+        assert_eq!(updated.matches("[mcp_servers.apexuse]").count(), 1);
+        assert!(updated.contains("[marketplaces.apexuse-local]"));
+        assert!(updated.contains("source_type = \"local\""));
+        assert!(updated.contains("[plugins.\"apexuse@apexuse-local\"]"));
+        assert!(updated.contains("enabled = true"));
+
+        let marketplace_dir = home.join(".codex/plugins/marketplaces/apexuse-local");
+        let cache_dir = home.join(".codex/plugins/cache/apexuse-local/apexuse/0.3.0");
+        assert_eq!(
+            write_res.get("marketplace_path").and_then(|v| v.as_str()),
+            Some(marketplace_dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            write_res.get("cache_path").and_then(|v| v.as_str()),
+            Some(cache_dir.to_string_lossy().as_ref())
+        );
+
+        assert_eq!(
+            fs::read_to_string(marketplace_dir.join(".agents/plugins/marketplace.json")).unwrap(),
+            CODEX_MARKETPLACE_JSON
+        );
+        for base in [marketplace_dir.join("plugins/apexuse"), cache_dir.clone()] {
+            assert_eq!(
+                fs::read_to_string(base.join(".codex-plugin/plugin.json")).unwrap(),
+                CODEX_PLUGIN_JSON
+            );
+            assert_eq!(
+                fs::read_to_string(base.join("assets/apexuse.svg")).unwrap(),
+                CODEX_PLUGIN_SVG
+            );
+            assert_eq!(
+                fs::read_to_string(base.join("assets/apexuse-small.svg")).unwrap(),
+                CODEX_PLUGIN_SMALL_SVG
+            );
+            let mcp = parse_json(&fs::read_to_string(base.join(".mcp.json")).unwrap()).unwrap();
+            let entry = mcp.get("mcpServers").unwrap().get("apexuse").unwrap();
+            assert_eq!(entry.get("command").and_then(|v| v.as_str()), Some("npx"));
+            let args: Vec<&str> = entry
+                .get("args")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(args, vec!["-y", "apexuse-mcp"]);
+            assert_eq!(
+                entry
+                    .get("env")
+                    .and_then(|e| e.get("APEXUSE_POLICY"))
+                    .and_then(|v| v.as_str()),
+                Some("/new/policy.yaml")
+            );
+        }
+
+        // Idempotent rerun reports unchanged without replacing backup
+        let rerun =
+            install_agent_with_env(CODEX_PLUGIN_TARGET, Path::new("/bin/apex"), &write_opts, &env)
+                .unwrap();
+        assert_eq!(rerun.get("status").and_then(|v| v.as_str()), Some("unchanged"));
+        assert!(rerun.get("backup_path").is_some_and(|v| v.is_null()));
+
+        // Reconfigure without --npx or --policy updates .mcp.json and omits env
+        let bin_opts = InstallOptions {
+            write: true,
+            use_npx: false,
+            policy_path: None,
+            ..InstallOptions::default()
+        };
+        assert_eq!(
+            resolved_install_invocation(
+                CODEX_PLUGIN_TARGET,
+                Path::new("/usr/local/bin/apexuse-mcp"),
+                &bin_opts
+            ),
+            ("/usr/local/bin/apexuse-mcp".to_string(), Vec::new())
+        );
+        let bin_res = install_agent_with_env(
+            CODEX_PLUGIN_TARGET,
+            Path::new("/usr/local/bin/apexuse-mcp"),
+            &bin_opts,
+            &env,
+        )
+        .unwrap();
+        assert_eq!(bin_res.get("status").and_then(|v| v.as_str()), Some("written"));
+        let cache_mcp =
+            parse_json(&fs::read_to_string(cache_dir.join(".mcp.json")).unwrap()).unwrap();
+        let cache_entry = cache_mcp.get("mcpServers").unwrap().get("apexuse").unwrap();
+        assert_eq!(
+            cache_entry.get("command").and_then(|v| v.as_str()),
+            Some("/usr/local/bin/apexuse-mcp")
+        );
+        assert!(cache_entry.get("env").is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_plugin_rejects_project_scope_and_install_all_preserves_active_plugin() {
+        let (root, env) = make_temp_env("codex_plugin_switch", TargetOs::Macos);
+        let home = env.home.as_ref().unwrap();
+
+        let proj_opts = InstallOptions {
+            write: true,
+            scope: InstallScope::Project,
+            ..InstallOptions::default()
+        };
+        let err = install_agent_with_env(
+            CODEX_PLUGIN_TARGET,
+            Path::new("/usr/local/bin/apexuse-mcp"),
+            &proj_opts,
+            &env,
+        )
+        .expect_err("project scope must be rejected");
+        assert_eq!(err, "codex-plugin only supports --scope user");
+
+        // Install codex-plugin in user scope
+        let plugin_opts = InstallOptions {
+            write: true,
+            use_npx: true,
+            ..InstallOptions::default()
+        };
+        install_agent_with_env(
+            CODEX_PLUGIN_TARGET,
+            Path::new("/usr/local/bin/apexuse-mcp"),
+            &plugin_opts,
+            &env,
+        )
+        .unwrap();
+
+        // Add another key in [plugins."apexuse@apexuse-local"] and sibling plugin to check preservation
+        let codex_toml = home.join(".codex/config.toml");
+        let seeded = format!(
+            "{}\npinned_note = \"keep\"\n\n[plugins.\"other@other\"]\nenabled = true\n",
+            fs::read_to_string(&codex_toml).unwrap().trim_end()
+        );
+        fs::write(&codex_toml, &seeded).unwrap();
+
+        // install all refreshes codex-plugin instead of overwriting with [mcp_servers.apexuse]
+        let all_res = install_all_with_env(
+            Path::new("/opt/apexuse-mcp"),
+            &InstallOptions {
+                write: true,
+                use_npx: false,
+                ..InstallOptions::default()
+            },
+            &env,
+        )
+        .unwrap();
+        let wired_agents: Vec<&str> = all_res
+            .get("wired")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("agent").and_then(|v| v.as_str()))
+            .collect();
+        assert!(wired_agents.contains(&CODEX_PLUGIN_TARGET));
+        assert!(!wired_agents.contains(&"codex"));
+        let after_all = fs::read_to_string(&codex_toml).unwrap();
+        assert!(!after_all.contains("[mcp_servers.apexuse]"));
+        assert!(after_all.contains("[plugins.\"apexuse@apexuse-local\"]"));
+        assert!(after_all.contains("enabled = true"));
+        let cache_mcp = parse_json(
+            &fs::read_to_string(
+                home.join(".codex/plugins/cache/apexuse-local/apexuse/0.3.0/.mcp.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cache_mcp
+                .get("mcpServers")
+                .and_then(|s| s.get("apexuse"))
+                .and_then(|e| e.get("command"))
+                .and_then(|v| v.as_str()),
+            Some("/opt/apexuse-mcp")
+        );
+
+        // Switching back explicitly to `codex` disables [plugins."apexuse@apexuse-local"] cleanly
+        let with_extra = after_all.replace(
+            "[plugins.\"apexuse@apexuse-local\"]\nenabled = true",
+            "[plugins.\"apexuse@apexuse-local\"]\nenabled = true\npinned_note = \"keep\"",
+        );
+        fs::write(&codex_toml, with_extra).unwrap();
+        install_agent_with_env(
+            "codex",
+            Path::new("/opt/apexuse-mcp"),
+            &InstallOptions {
+                write: true,
+                ..InstallOptions::default()
+            },
+            &env,
+        )
+        .unwrap();
+        let after_codex = fs::read_to_string(&codex_toml).unwrap();
+        assert!(after_codex.contains("[mcp_servers.apexuse]"));
+        assert!(after_codex.contains("pinned_note = \"keep\""));
+        assert!(after_codex.contains("enabled = false"));
+        assert!(after_codex.contains("[plugins.\"other@other\"]"));
+
+        // Now install all switches to direct `codex` instead of `codex-plugin`
+        let all_res2 = install_all_with_env(
+            Path::new("/opt/apexuse-mcp"),
+            &InstallOptions {
+                write: true,
+                ..InstallOptions::default()
+            },
+            &env,
+        )
+        .unwrap();
+        let wired_agents2: Vec<&str> = all_res2
+            .get("wired")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("agent").and_then(|v| v.as_str()))
+            .collect();
+        assert!(wired_agents2.contains(&"codex"));
+        assert!(!wired_agents2.contains(&CODEX_PLUGIN_TARGET));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_plugin_escapes_windows_paths_in_toml_and_mcp_json() {
+        let (root, env) = make_temp_env("codex_plugin_win", TargetOs::Windows);
+        let exe = Path::new(r"C:\Program Files\ApexUse\apexuse-mcp.exe");
+        let policy = PathBuf::from(r"C:\Users\alice\My Policies\policy.yaml");
+        let opts = InstallOptions {
+            write: true,
+            policy_path: Some(policy),
+            ..InstallOptions::default()
+        };
+
+        let res = install_agent_with_env(CODEX_PLUGIN_TARGET, exe, &opts, &env).unwrap();
+        assert_eq!(res.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let cache_mcp_path = env
+            .home
+            .as_ref()
+            .unwrap()
+            .join(".codex/plugins/cache/apexuse-local/apexuse/0.3.0/.mcp.json");
+        let mcp_raw = fs::read_to_string(&cache_mcp_path).unwrap();
+        assert!(mcp_raw.contains(r#"C:\\Program Files\\ApexUse\\apexuse-mcp.exe"#));
+        assert!(mcp_raw.contains(r#"C:\\Users\\alice\\My Policies\\policy.yaml"#));
+        let mcp_parsed = parse_json(&mcp_raw).unwrap();
+        let entry = mcp_parsed.get("mcpServers").unwrap().get("apexuse").unwrap();
+        assert_eq!(
+            entry.get("command").and_then(|v| v.as_str()),
+            Some(r"C:\Program Files\ApexUse\apexuse-mcp.exe")
+        );
+        assert_eq!(
+            entry
+                .get("env")
+                .and_then(|e| e.get("APEXUSE_POLICY"))
+                .and_then(|v| v.as_str()),
+            Some(r"C:\Users\alice\My Policies\policy.yaml")
+        );
+
+        let win_marketplace = Path::new(r"C:\Users\alice\.codex\plugins\marketplaces\apexuse-local");
+        let rendered = render_codex_marketplace_toml_block(win_marketplace);
+        assert!(rendered.contains(
+            r#"source = "C:\\Users\\alice\\.codex\\plugins\\marketplaces\\apexuse-local""#
+        ));
+        let merged = upsert_codex_plugin_toml(
+            None,
+            &rendered,
+            render_codex_plugin_toml_block(),
+            Path::new("config.toml"),
+        )
+        .unwrap();
+        assert!(merged.contains(
+            r#"source = "C:\\Users\\alice\\.codex\\plugins\\marketplaces\\apexuse-local""#
+        ));
+        assert!(parse_toml_sections(&merged, Path::new("config.toml")).is_ok());
 
         let _ = fs::remove_dir_all(&root);
     }

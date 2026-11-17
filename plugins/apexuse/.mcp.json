@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "apexuse": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "apexuse-mcp"
+      ]
+    }
+  }
+}

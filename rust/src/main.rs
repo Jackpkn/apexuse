@@ -2,7 +2,8 @@ use apexuse_mcp::config::{resolve_config_path, AppConfig};
 use apexuse_mcp::driver::{default_driver, OsDriver};
 use apexuse_mcp::gateway::{Gateway, MockDriver};
 use apexuse_mcp::installer::{
-    format_json_pretty, install_agent, install_all, InstallOptions, InstallScope, SUPPORTED_AGENTS,
+    format_json_pretty, install_agent, install_all, InstallOptions, InstallScope,
+    CODEX_PLUGIN_TARGET, SUPPORTED_AGENTS,
 };
 use apexuse_mcp::json::{parse_json, JsonValue};
 use apexuse_mcp::mcp::run_stdio_loop;
@@ -76,7 +77,7 @@ fn print_usage() {
          \x20 apexuse-mcp [--mock]                       Start MCP stdio server\n\
          \x20 apexuse-mcp --version | -V                 Print version\n\
          \x20 apexuse-mcp doctor [--check] [--mock]      Check OS accessibility & screen capture readiness\n\
-         \x20 apexuse-mcp install <agent|all> [flags]    Print or auto-merge MCP client configuration\n\
+         \x20 apexuse-mcp install <agent|{}|all> [flags]  Print or auto-merge MCP client/plugin config\n\
          \x20     --write                                Merge safely into target config (creates .bak)\n\
          \x20     --dry-run                              Preview merged config without writing\n\
          \x20     --scope <user|project>                 Config scope (default: user)\n\
@@ -91,9 +92,11 @@ fn print_usage() {
          \x20     --save-image <path>                    Decode and write returned image to <path>\n\
          \x20     --mock                                 Use deterministic offline MockDriver\n\
          \n\
-         Supported install targets: {}, all",
+         Supported install targets: {}, {}, all",
         env!("CARGO_PKG_VERSION"),
-        SUPPORTED_AGENTS.join(", ")
+        CODEX_PLUGIN_TARGET,
+        SUPPORTED_AGENTS.join(", "),
+        CODEX_PLUGIN_TARGET
     );
 }
 
@@ -204,8 +207,10 @@ fn run_install(rest: &[String]) {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "Usage: apexuse-mcp install <agent|all> [--write] [--dry-run] [--scope user|project] [--npx] [--policy <path>] [--with-skill]\nSupported agents: {}, all",
-                        SUPPORTED_AGENTS.join(", ")
+                        "Usage: apexuse-mcp install <agent|{}|all> [--write] [--dry-run] [--scope user|project] [--npx] [--policy <path>] [--with-skill]\nSupported targets: {}, {}, all",
+                        CODEX_PLUGIN_TARGET,
+                        SUPPORTED_AGENTS.join(", "),
+                        CODEX_PLUGIN_TARGET
                     );
                     return;
                 }
@@ -230,8 +235,10 @@ fn run_install(rest: &[String]) {
         fail_json(
             "invalid_argument",
             &format!(
-                "Missing agent target. Usage: apexuse-mcp install <agent|all>. Supported: {}, all",
-                SUPPORTED_AGENTS.join(", ")
+                "Missing agent target. Usage: apexuse-mcp install <agent|{}|all>. Supported: {}, {}, all",
+                CODEX_PLUGIN_TARGET,
+                SUPPORTED_AGENTS.join(", "),
+                CODEX_PLUGIN_TARGET
             ),
         );
     };

@@ -1,0 +1,41 @@
+{
+  "name": "apexuse",
+  "version": "0.3.0",
+  "description": "Local-first cross-platform Computer Use MCP server using native Accessibility, Set-of-Mark visual grounding, OCR, and workflow memory",
+  "author": {
+    "name": "ApexUse",
+    "url": "https://github.com/Jackpkn/apexuse"
+  },
+  "homepage": "https://github.com/Jackpkn/apexuse#readme",
+  "repository": "https://github.com/Jackpkn/apexuse",
+  "license": "MIT",
+  "keywords": [
+    "computer-use",
+    "accessibility",
+    "set-of-mark",
+    "mcp",
+    "desktop-automation"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ApexUse",
+    "shortDescription": "Native Accessibility + Set-of-Mark desktop and browser control",
+    "longDescription": "Local-first cross-platform Computer Use MCP server for macOS, Windows, and Linux. Inspects apps via batched native Accessibility trees with incremental AX diffs, fuses Set-of-Mark [m1]..[mN] visual grounding and OCR, runs batched multi-step run_actions, and records reusable local workflow macros.",
+    "developerName": "ApexUse",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "List running desktop applications and inspect the frontmost window with ApexUse.",
+      "Use visual_inspect Set-of-Mark grounding and semantic target actions to complete a multi-step UI flow.",
+      "Check ApexUse workflow memory for matching macros or record a repeatable desktop workflow."
+    ],
+    "brandColor": "#0E7490",
+    "composerIcon": "./assets/apexuse-small.svg",
+    "logo": "./assets/apexuse.svg",
+    "screenshots": []
+  }
+}

@@ -400,7 +400,7 @@ pub fn handle_rpc_line(gw: &mut Gateway, line: &str) -> Option<String> {
                     "serverInfo",
                     JsonValue::object(vec![
                         ("name", JsonValue::String("apexuse-mcp".into())),
-                        ("version", JsonValue::String("0.3.0".into())),
+                        ("version", JsonValue::String(env!("CARGO_PKG_VERSION").into())),
                     ]),
                 ),
             ]))
@@ -529,6 +529,22 @@ mod tests {
         assert_eq!(
             init_v.get("result").and_then(|r| r.get("protocolVersion")).and_then(|v| v.as_str()),
             Some("2025-03-26")
+        );
+        assert_eq!(
+            init_v
+                .get("result")
+                .and_then(|r| r.get("serverInfo"))
+                .and_then(|s| s.get("name"))
+                .and_then(|v| v.as_str()),
+            Some("apexuse-mcp")
+        );
+        assert_eq!(
+            init_v
+                .get("result")
+                .and_then(|r| r.get("serverInfo"))
+                .and_then(|s| s.get("version"))
+                .and_then(|v| v.as_str()),
+            Some(env!("CARGO_PKG_VERSION"))
         );
 
         // Notifications must produce no response
