@@ -49,6 +49,8 @@ pub struct InstallOptions {
     pub use_npx: bool,
     pub policy_path: Option<PathBuf>,
     pub with_skill: bool,
+    pub probe: bool,
+    pub probe_timeout_ms: u64,
 }
 
 impl Default for InstallOptions {
@@ -60,6 +62,8 @@ impl Default for InstallOptions {
             use_npx: false,
             policy_path: None,
             with_skill: false,
+            probe: false,
+            probe_timeout_ms: 10_000,
         }
     }
 }
@@ -310,7 +314,7 @@ fn resolve_target_path(
     }
 }
 
-pub(crate) fn resolved_install_invocation(
+pub fn resolved_install_invocation(
     raw_target: &str,
     exe_path: &Path,
     opts: &InstallOptions,
@@ -1646,6 +1650,7 @@ mod tests {
             use_npx: false,
             policy_path: Some(PathBuf::from("/tmp/policy.autonomous.yaml")),
             with_skill: false,
+            ..InstallOptions::default()
         };
         let exe = Path::new("/usr/local/bin/apexuse-mcp");
         let res = install_agent_with_env("cursor", exe, &opts, &env).expect("merge should succeed");
@@ -1697,6 +1702,7 @@ mod tests {
             use_npx: false,
             policy_path: None,
             with_skill: false,
+            ..InstallOptions::default()
         };
         let err = install_agent_with_env("opencode", Path::new("apexuse-mcp"), &opts, &env)
             .expect_err("commented JSON must fail closed");
@@ -1746,6 +1752,7 @@ mod tests {
             use_npx: true,
             policy_path: Some(PathBuf::from("/new/policy.yaml")),
             with_skill: false,
+            ..InstallOptions::default()
         };
         let res = install_agent_with_env("codex", Path::new("/unused"), &opts, &env)
             .expect("codex upsert should succeed");
@@ -1794,6 +1801,7 @@ mod tests {
             use_npx: true,
             policy_path: Some(PathBuf::from("/etc/apexuse/policy.yaml")),
             with_skill: false,
+            ..InstallOptions::default()
         };
 
         // OpenCode
@@ -1848,6 +1856,7 @@ mod tests {
             use_npx: true,
             policy_path: Some(PathBuf::from("/p.yaml")),
             with_skill: false,
+            ..InstallOptions::default()
         };
         let claude_bare = install_agent_with_env("claude", Path::new("/bin/apex"), &opts_bare, &env_mac)
             .unwrap();
@@ -1895,6 +1904,7 @@ mod tests {
             use_npx: false,
             policy_path: None,
             with_skill: true,
+            ..InstallOptions::default()
         };
         let dry_res = install_agent_with_env("claude", Path::new("/bin/apex"), &dry_opts, &env).unwrap();
         assert_eq!(dry_res.get("skill_written").and_then(|v| v.as_bool()), Some(false));
@@ -1957,6 +1967,7 @@ mod tests {
             use_npx: true,
             policy_path: None,
             with_skill: true,
+            ..InstallOptions::default()
         };
         let res = install_all_with_env(Path::new("/bin/apex"), &opts, &env).unwrap();
         assert_eq!(res.get("ok").and_then(|v| v.as_bool()), Some(true));
@@ -1994,6 +2005,7 @@ mod tests {
             use_npx: false,
             policy_path: None,
             with_skill: false,
+            ..InstallOptions::default()
         };
 
         // OpenCode without --policy omits "environment"
@@ -2398,5 +2410,26 @@ mod tests {
         assert!(parse_toml_sections(&merged, Path::new("config.toml")).is_ok());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_options_defaults_and_resolved_invocation() {
+        let defaults = InstallOptions::default();
+        assert!(!defaults.probe);
+        assert_eq!(defaults.probe_timeout_ms, 10_000);
+
+        let exe = Path::new("/opt/bin/apexuse-mcp");
+        assert_eq!(
+            resolved_install_invocation("codex", exe, &defaults),
+            ("/opt/bin/apexuse-mcp".to_string(), Vec::new())
+        );
+        let npx_opts = InstallOptions {
+            use_npx: true,
+            ..InstallOptions::default()
+        };
+        assert_eq!(
+            resolved_install_invocation("codex", exe, &npx_opts),
+            ("npx".to_string(), vec!["-y".to_string(), "apexuse-mcp".to_string()])
+        );
     }
 }

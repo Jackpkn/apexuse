@@ -2,13 +2,15 @@ use apexuse_mcp::config::{resolve_config_path, AppConfig};
 use apexuse_mcp::driver::{default_driver, OsDriver};
 use apexuse_mcp::gateway::{Gateway, MockDriver};
 use apexuse_mcp::installer::{
-    format_json_pretty, install_agent, install_all, InstallOptions, InstallScope,
-    CODEX_PLUGIN_TARGET, SUPPORTED_AGENTS,
+    format_json_pretty, install_agent, install_all, resolved_install_invocation, InstallOptions,
+    InstallScope, CODEX_PLUGIN_TARGET, SUPPORTED_AGENTS,
 };
 use apexuse_mcp::json::{parse_json, JsonValue};
 use apexuse_mcp::mcp::run_stdio_loop;
 use apexuse_mcp::policy::PolicySettings;
+use apexuse_mcp::probe::probe_mcp_server;
 use apexuse_mcp::som_png::base64_decode;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -77,6 +79,8 @@ fn print_usage() {
          \x20 apexuse-mcp [--mock]                       Start MCP stdio server\n\
          \x20 apexuse-mcp --version | -V                 Print version\n\
          \x20 apexuse-mcp doctor [--check] [--mock]      Check OS accessibility & screen capture readiness\n\
+         \x20 apexuse-mcp probe [--mock] [--npx] [--policy <path>] [--timeout-ms <n>]\n\
+         \x20                                              Run live MCP initialize + tools/list handshake probe\n\
          \x20 apexuse-mcp install <agent|{}|all> [flags]  Print or auto-merge MCP client/plugin config\n\
          \x20     --write                                Merge safely into target config (creates .bak)\n\
          \x20     --dry-run                              Preview merged config without writing\n\
@@ -84,6 +88,9 @@ fn print_usage() {
          \x20     --npx                                  Use `npx -y apexuse-mcp` instead of binary path\n\
          \x20     --policy <path>                        Inject APEXUSE_POLICY env var into client config\n\
          \x20     --with-skill                           Install bundled SKILL.md into agent skill directories\n\
+         \x20     --probe                                Run live MCP handshake probe after install\n\
+         \x20     --timeout-ms <n>                       Probe timeout in milliseconds (default: 10000)\n\
+         \x20     --mock                                 Use --mock for temporary --probe invocation only\n\
          \x20 apexuse-mcp config [show|get|set|reset]    Manage persistent runtime defaults\n\
          \x20 apexuse-mcp call <tool> [flags]            Invoke a single MCP tool from the CLI\n\
          \x20 apexuse-mcp call (--calls <json> | --calls-file <path>) [flags]\n\
@@ -156,7 +163,137 @@ fn split_flag_value<'a>(arg: &'a str, name: &str) -> Option<&'a str> {
     arg.strip_prefix(name).and_then(|s| s.strip_prefix('='))
 }
 
-fn run_install(rest: &[String]) {
+fn parse_timeout_ms_value(raw: &str) -> Result<u64, String> {
+    let ms: u64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| "invalid integer for --timeout-ms".to_string())?;
+    if ms == 0 {
+        return Err("--timeout-ms must be > 0".to_string());
+    }
+    Ok(ms)
+}
+
+fn parse_timeout_ms(raw: &str) -> u64 {
+    parse_timeout_ms_value(raw).unwrap_or_else(|e| fail_json("invalid_argument", &e))
+}
+
+fn build_probe_cli_output(cmd: &str, args: &[String], probe_val: JsonValue) -> JsonValue {
+    let mut map = match probe_val {
+        JsonValue::Object(m) => m,
+        _ => BTreeMap::new(),
+    };
+    map.insert("ok".to_string(), JsonValue::Bool(true));
+    map.insert("command".to_string(), JsonValue::String(cmd.to_string()));
+    map.insert(
+        "args".to_string(),
+        JsonValue::Array(args.iter().cloned().map(JsonValue::String).collect()),
+    );
+    JsonValue::Object(map)
+}
+
+fn attach_probe_result(
+    val: &mut JsonValue,
+    cmd: &str,
+    args: &[String],
+    probe_res: Result<JsonValue, String>,
+) {
+    let (probe_ok, probe_obj) = match probe_res {
+        Ok(p) => (true, build_probe_cli_output(cmd, args, p)),
+        Err(msg) => (
+            false,
+            JsonValue::object(vec![
+                ("ok", JsonValue::Bool(false)),
+                ("code", JsonValue::String("probe_failed".into())),
+                ("message", JsonValue::String(msg)),
+                ("command", JsonValue::String(cmd.to_string())),
+                (
+                    "args",
+                    JsonValue::Array(args.iter().cloned().map(JsonValue::String).collect()),
+                ),
+            ]),
+        ),
+    };
+    if let JsonValue::Object(ref mut map) = val {
+        map.insert("probe".to_string(), probe_obj);
+        if !probe_ok {
+            map.insert("ok".to_string(), JsonValue::Bool(false));
+        }
+    }
+}
+
+fn run_probe(rest: &[String], mut probe_mock: bool) {
+    let mut opts = InstallOptions::default();
+
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = rest[i].as_str();
+        if let Some(val) = split_flag_value(arg, "--policy") {
+            if val.trim().is_empty() {
+                fail_json("invalid_argument", "--policy requires a non-empty path");
+            }
+            opts.policy_path = Some(PathBuf::from(val));
+        } else if let Some(val) = split_flag_value(arg, "--timeout-ms") {
+            opts.probe_timeout_ms = parse_timeout_ms(val);
+        } else {
+            match arg {
+                "--mock" => probe_mock = true,
+                "--npx" => opts.use_npx = true,
+                "--policy" => {
+                    i += 1;
+                    if i >= rest.len() || rest[i].trim().is_empty() {
+                        fail_json("invalid_argument", "--policy requires a path");
+                    }
+                    opts.policy_path = Some(PathBuf::from(&rest[i]));
+                }
+                "--timeout-ms" => {
+                    i += 1;
+                    if i >= rest.len() {
+                        fail_json("invalid_argument", "--timeout-ms requires an integer");
+                    }
+                    opts.probe_timeout_ms = parse_timeout_ms(&rest[i]);
+                }
+                "-h" | "--help" => {
+                    println!(
+                        "Usage: apexuse-mcp probe [--mock] [--npx] [--policy <path>] [--timeout-ms <n>]"
+                    );
+                    return;
+                }
+                other if other.starts_with('-') => {
+                    fail_json("invalid_argument", &format!("Unknown probe flag: {other}"));
+                }
+                positional => {
+                    fail_json(
+                        "invalid_argument",
+                        &format!("Unexpected positional argument for probe: {positional}"),
+                    );
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("apexuse-mcp"));
+    let (cmd, mut probe_args) = resolved_install_invocation("codex", &exe, &opts);
+    if probe_mock {
+        probe_args.push("--mock".to_string());
+    }
+
+    match probe_mcp_server(
+        &cmd,
+        &probe_args,
+        opts.policy_path.as_deref(),
+        Duration::from_millis(opts.probe_timeout_ms),
+    ) {
+        Ok(probe_val) => {
+            let out = build_probe_cli_output(&cmd, &probe_args, probe_val);
+            println!("{}", format_json_pretty(&out));
+        }
+        Err(err) => fail_json("probe_failed", &err),
+    }
+}
+
+fn run_install(rest: &[String], mut probe_mock: bool) {
     let mut opts = InstallOptions::default();
     let mut agent: Option<String> = None;
 
@@ -175,12 +312,23 @@ fn run_install(rest: &[String]) {
                 fail_json("invalid_argument", "multiple agent arguments provided");
             }
             agent = Some(val.to_string());
+        } else if let Some(val) = split_flag_value(arg, "--timeout-ms") {
+            opts.probe_timeout_ms = parse_timeout_ms(val);
         } else {
             match arg {
                 "--write" => opts.write = true,
                 "--dry-run" => opts.dry_run = true,
                 "--npx" => opts.use_npx = true,
                 "--with-skill" => opts.with_skill = true,
+                "--probe" => opts.probe = true,
+                "--mock" => probe_mock = true,
+                "--timeout-ms" => {
+                    i += 1;
+                    if i >= rest.len() {
+                        fail_json("invalid_argument", "--timeout-ms requires an integer");
+                    }
+                    opts.probe_timeout_ms = parse_timeout_ms(&rest[i]);
+                }
                 "--scope" => {
                     i += 1;
                     if i >= rest.len() {
@@ -207,7 +355,7 @@ fn run_install(rest: &[String]) {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "Usage: apexuse-mcp install <agent|{}|all> [--write] [--dry-run] [--scope user|project] [--npx] [--policy <path>] [--with-skill]\nSupported targets: {}, {}, all",
+                        "Usage: apexuse-mcp install <agent|{}|all> [--write] [--dry-run] [--scope user|project] [--npx] [--policy <path>] [--with-skill] [--probe] [--timeout-ms <n>] [--mock]\nSupported targets: {}, {}, all",
                         CODEX_PLUGIN_TARGET,
                         SUPPORTED_AGENTS.join(", "),
                         CODEX_PLUGIN_TARGET
@@ -251,7 +399,26 @@ fn run_install(rest: &[String]) {
     };
 
     match res {
-        Ok(val) => {
+        Ok(mut val) => {
+            if opts.probe {
+                let probe_target = if target_agent.eq_ignore_ascii_case("all") {
+                    "codex"
+                } else {
+                    target_agent.as_str()
+                };
+                let (cmd, mut probe_args) =
+                    resolved_install_invocation(probe_target, &exe, &opts);
+                if probe_mock {
+                    probe_args.push("--mock".to_string());
+                }
+                let probe_res = probe_mcp_server(
+                    &cmd,
+                    &probe_args,
+                    opts.policy_path.as_deref(),
+                    Duration::from_millis(opts.probe_timeout_ms),
+                );
+                attach_probe_result(&mut val, &cmd, &probe_args, probe_res);
+            }
             println!("{}", format_json_pretty(&val));
             if val.get("ok").and_then(|v| v.as_bool()) != Some(true) {
                 process::exit(1);
@@ -622,8 +789,10 @@ fn main() {
         .unwrap_or(false);
 
     let mut pos = 1;
+    let mut cli_mock = false;
     while pos < args.len() && args[pos] == "--mock" {
         use_mock = true;
+        cli_mock = true;
         pos += 1;
     }
 
@@ -646,8 +815,11 @@ fn main() {
         "doctor" | "--doctor" => {
             run_doctor(&args[pos + 1..], use_mock);
         }
+        "probe" => {
+            run_probe(&args[pos + 1..], cli_mock);
+        }
         "install" | "--install" => {
-            run_install(&args[pos + 1..]);
+            run_install(&args[pos + 1..], cli_mock);
         }
         "config" => {
             run_config(&args[pos + 1..]);
@@ -659,5 +831,69 @@ fn main() {
             eprintln!("Unknown argument: {other}");
             process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_timeout_ms_value_validates_positive_integers() {
+        assert_eq!(parse_timeout_ms_value("10000"), Ok(10_000));
+        assert_eq!(parse_timeout_ms_value(" 250 "), Ok(250));
+        assert!(parse_timeout_ms_value("0").is_err());
+        assert!(parse_timeout_ms_value("-10").is_err());
+        assert!(parse_timeout_ms_value("abc").is_err());
+    }
+
+    #[test]
+    fn attach_probe_result_handles_success_failure_and_existing_install_failure() {
+        let args = vec!["--mock".to_string()];
+        let probe_ok = JsonValue::object(vec![
+            ("ok", JsonValue::Bool(true)),
+            ("server_name", JsonValue::String("apexuse-mcp".into())),
+            ("server_version", JsonValue::String("0.3.0".into())),
+            ("tools_count", JsonValue::Number(6.0)),
+            ("tools", JsonValue::Array(vec![JsonValue::String("inspect_app".into())])),
+        ]);
+
+        // Success preserves ok: true and attaches probe metadata
+        let mut ok_install = JsonValue::object(vec![("ok", JsonValue::Bool(true))]);
+        attach_probe_result(&mut ok_install, "/bin/apexuse-mcp", &args, Ok(probe_ok.clone()));
+        assert_eq!(ok_install.get("ok").and_then(|v| v.as_bool()), Some(true));
+        let p = ok_install.get("probe").unwrap();
+        assert_eq!(p.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            p.get("command").and_then(|v| v.as_str()),
+            Some("/bin/apexuse-mcp")
+        );
+        assert_eq!(p.get("tools_count").and_then(|v| v.as_i64()), Some(6));
+
+        // Success does not flip already-false install_all ok: false to true
+        let mut partial_fail = JsonValue::object(vec![("ok", JsonValue::Bool(false))]);
+        attach_probe_result(&mut partial_fail, "/bin/apexuse-mcp", &args, Ok(probe_ok));
+        assert_eq!(partial_fail.get("ok").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            partial_fail
+                .get("probe")
+                .and_then(|v| v.get("ok"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        // Probe failure flips top-level ok to false and sets probe.code = "probe_failed"
+        let mut failed_probe = JsonValue::object(vec![("ok", JsonValue::Bool(true))]);
+        attach_probe_result(
+            &mut failed_probe,
+            "npx",
+            &["-y".into(), "apexuse-mcp".into()],
+            Err("timed out".into()),
+        );
+        assert_eq!(failed_probe.get("ok").and_then(|v| v.as_bool()), Some(false));
+        let fp = failed_probe.get("probe").unwrap();
+        assert_eq!(fp.get("ok").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(fp.get("code").and_then(|v| v.as_str()), Some("probe_failed"));
+        assert_eq!(fp.get("message").and_then(|v| v.as_str()), Some("timed out"));
     }
 }

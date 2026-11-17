@@ -6,5 +6,6 @@ pub mod json;
 pub mod mcp;
 pub mod memory;
 pub mod policy;
+pub mod probe;
 pub mod som;
 pub mod som_png;
