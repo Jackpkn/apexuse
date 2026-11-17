@@ -4,11 +4,56 @@ use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
+fn bool_schema(desc: &str) -> JsonValue {
+    JsonValue::object(vec![
+        ("type", JsonValue::String("boolean".into())),
+        ("description", JsonValue::String(desc.into())),
+    ])
+}
+
+fn str_enum_schema(values: &[&str], desc: &str) -> JsonValue {
+    JsonValue::object(vec![
+        ("type", JsonValue::String("string".into())),
+        (
+            "enum",
+            JsonValue::Array(
+                values
+                    .iter()
+                    .map(|v| JsonValue::String((*v).into()))
+                    .collect(),
+            ),
+        ),
+        ("description", JsonValue::String(desc.into())),
+    ])
+}
+
+fn return_state_schema() -> JsonValue {
+    str_enum_schema(
+        &["none", "diff", "full"],
+        "Post-action AX state mode ('none' default, 'diff' returns incremental AX diff and keeps new refs live, 'full' returns full AX tree).",
+    )
+}
+
+fn verify_mode_schema() -> JsonValue {
+    str_enum_schema(
+        &["auto", "ax", "visual"],
+        "Verification signal when verify_change=true ('auto' AX+visual, 'ax' Accessibility-only skipping screenshots, 'visual' pixel-only).",
+    )
+}
+
+fn include_bounds_schema() -> JsonValue {
+    bool_schema("Include @(x,y,wxh) element coordinates in AX outlines (defaults to config snapshot.include_bounds, false).")
+}
+
+fn diff_schema() -> JsonValue {
+    bool_schema("Enable incremental AX tree diffing vs prior snapshot of the same app/window (defaults to config snapshot.ax_diff, true).")
+}
+
 fn tool_defs() -> Vec<JsonValue> {
     vec![
         JsonValue::object(vec![
             ("name", JsonValue::String("inspect_app".into())),
-            ("description", JsonValue::String("Read-only semantic inspection of a permitted app bundle ID or 'desktop' (frontmost app). Returns compact accessibility tree with refs (e1, e2...), bounding boxes, and learned workflow hints.".into())),
+            ("description", JsonValue::String("AX-first semantic inspection of a permitted app bundle ID or 'desktop' (frontmost app). Auto-diffs repeat views (state_mode='full'|'diff'|'unchanged'|'filtered') to minimize tokens while keeping refs live; pass diff=false for full baseline, include_bounds=true for @(x,y,wxh), or query for filtered lookup. Returns compact accessibility tree with refs (e1, e2...) and learned workflow hints.".into())),
             (
                 "annotations",
                 JsonValue::object(vec![
@@ -27,6 +72,8 @@ fn tool_defs() -> Vec<JsonValue> {
                             ("app", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
                             ("window", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
                             ("query", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
+                            ("diff", diff_schema()),
+                            ("include_bounds", include_bounds_schema()),
                         ]),
                     ),
                     ("required", JsonValue::Array(vec![JsonValue::String("app".into())])),
@@ -78,7 +125,7 @@ fn tool_defs() -> Vec<JsonValue> {
         ]),
         JsonValue::object(vec![
             ("name", JsonValue::String("computer".into())),
-            ("description", JsonValue::String("Semantic & Set-of-Mark interaction: action=inspect, click, double_click, right_click, hover (accepts ref, mark, target: {query, role?, fresh?}, or x/y after unfiltered snapshot), drag (from_ref/from_mark/x1,y1 -> to_ref/to_mark/x2,y2), type (ref, mark, or target), set_value (direct native text assignment/clearing on verified editable ref, mark, or target; text='' clears), select_text (optional start/end offsets on verified editable ref, mark, or target), press_key, scroll (direction, amount, optional target ref/mark/x,y), run_actions (up to 24 chained steps including inline wait_for, inspect, set_value, select_text, and target), wait_for (local AX/OCR poll up to 60s, optional window/role), or confirm (token). Actions & steps support optional keep_snapshot, verify_change, max_retries (0..=3), settle_ms, poll_interval_ms, retry_delay_ms, and require_change.".into())),
+            ("description", JsonValue::String("AX-first semantic & Set-of-Mark interaction: action=inspect (supports diff, include_bounds, window, query), click, double_click, right_click, hover (accepts ref, mark, target: {query, role?, fresh?}, or x/y after unfiltered snapshot), drag (from_ref/from_mark/x1,y1 -> to_ref/to_mark/x2,y2), type (ref, mark, or target), set_value (direct native text assignment/clearing on verified editable ref, mark, or target; text='' clears), select_text (optional start/end offsets on verified editable ref, mark, or target), press_key, scroll (direction, amount, optional target ref/mark/x,y), run_actions (up to 24 chained steps including inline wait_for, inspect, set_value, select_text, target, and per-step verify_mode/diff/include_bounds), wait_for (local AX/OCR poll up to 60s, optional window/role), or confirm (token). Pass return_state='diff'|'full' on actions & run_actions to capture updated AX state inline and keep refreshed refs live without extra inspect_app round-trips; pass verify_mode='ax' with verify_change=true to skip screenshots. Also supports keep_snapshot, max_retries (0..=3), settle_ms, poll_interval_ms, retry_delay_ms, and require_change.".into())),
             (
                 "inputSchema",
                 JsonValue::object(vec![
@@ -120,8 +167,15 @@ fn tool_defs() -> Vec<JsonValue> {
                                             ("modifiers", JsonValue::object(vec![("type", JsonValue::String("array".into()))])),
                                             ("direction", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
                                             ("amount", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
-                                            ("steps", JsonValue::object(vec![("type", JsonValue::String("array".into()))])),
+                                            ("steps", JsonValue::object(vec![
+                                                ("type", JsonValue::String("array".into())),
+                                                ("description", JsonValue::String("Up to 24 action steps; each step supports verify_mode, verify_change, diff, and include_bounds.".into())),
+                                            ])),
                                             ("inspect_after", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
+                                            ("diff", diff_schema()),
+                                            ("include_bounds", include_bounds_schema()),
+                                            ("return_state", return_state_schema()),
+                                            ("verify_mode", verify_mode_schema()),
                                             ("keep_snapshot", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
                                             ("verify_change", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
                                             ("require_change", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
@@ -156,7 +210,7 @@ fn tool_defs() -> Vec<JsonValue> {
         ]),
         JsonValue::object(vec![
             ("name", JsonValue::String("desktop".into())),
-            ("description", JsonValue::String("Desktop-level operations: action=list_applications, launch_application, activate_application, open_url (instant http/https URL open in permitted browser/app), visual_click, double_click, right_click, hover, or drag (using mark, ref, target, or x/y coordinates; supports optional verify_change, max_retries, settle_ms, poll_interval_ms, retry_delay_ms, require_change).".into())),
+            ("description", JsonValue::String("Desktop-level operations: action=list_applications, launch_application, activate_application, open_url (instant http/https URL open in permitted browser/app), visual_click, double_click, right_click, hover, or drag (using mark, ref, target, or x/y coordinates). Supports return_state='none'|'diff'|'full' (eliminates extra inspect_app calls after activate/open_url/click), include_bounds, verify_change, verify_mode='auto'|'ax'|'visual' ('ax' skips screenshots), max_retries, settle_ms, poll_interval_ms, retry_delay_ms, and require_change.".into())),
             (
                 "inputSchema",
                 JsonValue::object(vec![
@@ -165,7 +219,33 @@ fn tool_defs() -> Vec<JsonValue> {
                         "properties",
                         JsonValue::object(vec![
                             ("action", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
-                            ("arguments", JsonValue::object(vec![("type", JsonValue::String("object".into()))])),
+                            (
+                                "arguments",
+                                JsonValue::object(vec![
+                                    ("type", JsonValue::String("object".into())),
+                                    (
+                                        "properties",
+                                        JsonValue::object(vec![
+                                            ("app", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
+                                            ("url", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
+                                            ("ref", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
+                                            ("mark", JsonValue::object(vec![("type", JsonValue::String("string".into()))])),
+                                            ("target", JsonValue::object(vec![("type", JsonValue::String("object".into()))])),
+                                            ("return_state", return_state_schema()),
+                                            ("include_bounds", include_bounds_schema()),
+                                            ("verify_change", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
+                                            ("verify_mode", verify_mode_schema()),
+                                            ("require_change", JsonValue::object(vec![("type", JsonValue::String("boolean".into()))])),
+                                            ("max_retries", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
+                                            ("settle_ms", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
+                                            ("poll_interval_ms", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
+                                            ("retry_delay_ms", JsonValue::object(vec![("type", JsonValue::String("integer".into()))])),
+                                            ("x", JsonValue::object(vec![("type", JsonValue::String("number".into()))])),
+                                            ("y", JsonValue::object(vec![("type", JsonValue::String("number".into()))])),
+                                        ]),
+                                    ),
+                                ]),
+                            ),
                         ]),
                     ),
                     (
@@ -507,6 +587,43 @@ mod tests {
         let list_str = list_v.to_json_string();
         for needle in ["set_value", "select_text", "target", "keep_snapshot", "max_width", "24"] {
             assert!(list_str.contains(needle), "tools/list missing {needle}");
+        }
+
+        // Verify Task 9 schema options: diff, include_bounds, return_state, verify_mode
+        let by_name = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+                .expect("tool missing")
+        };
+        let inspect_props = by_name("inspect_app")
+            .get("inputSchema")
+            .and_then(|s| s.get("properties"))
+            .unwrap();
+        assert!(inspect_props.get("diff").is_some(), "inspect_app missing diff");
+        assert!(
+            inspect_props.get("include_bounds").is_some(),
+            "inspect_app missing include_bounds"
+        );
+
+        let computer_props = by_name("computer")
+            .get("inputSchema")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.get("arguments"))
+            .and_then(|a| a.get("properties"))
+            .unwrap();
+        for key in ["diff", "include_bounds", "return_state", "verify_mode"] {
+            assert!(computer_props.get(key).is_some(), "computer missing {key}");
+        }
+
+        let desktop_props = by_name("desktop")
+            .get("inputSchema")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.get("arguments"))
+            .and_then(|a| a.get("properties"))
+            .unwrap();
+        for key in ["return_state", "verify_mode", "include_bounds"] {
+            assert!(desktop_props.get(key).is_some(), "desktop missing {key}");
         }
         let _ = fs::remove_dir_all(&dir);
     }
