@@ -1,13 +1,12 @@
-#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
-
 use super::common::{build_snapshot_from_raw, RawElement};
 use super::{
     ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError,
     ImageEncodeOptions, OcrMode, OsDriver, Rect, RunningApp, WindowMeta, WindowState,
 };
-use crate::config::ImageFormat;
 use crate::json::{parse_json, JsonValue};
-use crate::som_png::render_som_rgba_to_b64;
+use crate::som_png::{
+    compute_pixel_digest, downscale_rgba, encode_rgba_image_b64, render_som_image_to_b64,
+};
 
 fn mask_shift_and_bits(mask: u64) -> (u32, u8) {
     if mask == 0 {
@@ -222,6 +221,497 @@ pub fn map_x11_keysym_name(key: &str) -> Option<&'static str> {
     }
 }
 
+pub const ATSPI_HELPER_PY: &str = r#"
+import json, os, sys
+
+def read_comm(pid):
+    try:
+        with open(f"/proc/{pid}/comm", "r") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+def run():
+    try:
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi
+    except Exception as e:
+        print(json.dumps({"ok": False, "code": "accessibility_unavailable", "message": str(e)}))
+        return
+
+    ROLE_PASSWORD_TEXT = Atspi.Role.PASSWORD_TEXT
+    EDITABLE_ROLES = (
+        Atspi.Role.ENTRY,
+        Atspi.Role.TEXT,
+        Atspi.Role.SPIN_BUTTON,
+        Atspi.Role.COMBO_BOX,
+    )
+    WEB_ROLES = (
+        Atspi.Role.DOCUMENT_WEB,
+        Atspi.Role.DOCUMENT_FRAME,
+    )
+    WEB_APP_NAMES = (
+        "chrome", "google-chrome", "chromium", "firefox",
+        "msedge", "microsoft-edge", "brave", "opera", "vivaldi", "electron", "code",
+    )
+
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "list"
+    target = sys.argv[2] if len(sys.argv) > 2 else ""
+    max_el = int(sys.argv[3]) if cmd == "inspect" and len(sys.argv) > 3 else 150
+    max_depth = int(sys.argv[4]) if cmd == "inspect" and len(sys.argv) > 4 else 12
+
+    desktop = Atspi.get_desktop(0)
+    n_apps = desktop.get_child_count()
+
+    if cmd == "doctor":
+        print(json.dumps({"ok": True, "apps_count": n_apps}))
+        return
+
+    def app_entry(app):
+        name = (app.get_name() or "").strip()
+        pid = 0
+        try:
+            pid = app.get_process_id()
+        except Exception:
+            pass
+        comm = read_comm(pid)
+        active = False
+        windows = []
+        wc = app.get_child_count()
+        for i in range(wc):
+            w = app.get_child_at_index(i)
+            if not w:
+                continue
+            try:
+                ss = w.get_state_set()
+                is_active = ss.contains(Atspi.StateType.ACTIVE)
+                showing = ss.contains(Atspi.StateType.SHOWING)
+                if not showing and not is_active:
+                    continue
+                if is_active:
+                    active = True
+                rect = w.get_extents(Atspi.CoordType.SCREEN)
+                if rect.width <= 1 or rect.height <= 1:
+                    continue
+                windows.append((len(windows), w, w.get_name() or "", rect, is_active))
+            except Exception:
+                continue
+        return {
+            "name": name,
+            "comm": comm,
+            "pid": pid,
+            "active": active,
+            "windows": windows,
+        }
+
+    entries = []
+    front_name = ""
+    for i in range(n_apps):
+        a = desktop.get_child_at_index(i)
+        if not a:
+            continue
+        ent = app_entry(a)
+        if ent["windows"]:
+            if ent["active"]:
+                front_name = ent["comm"] or ent["name"]
+            entries.append(ent)
+
+    if cmd == "list":
+        apps = []
+        seen = set()
+        for ent in entries:
+            aid = ent["comm"] or ent["name"] or f"pid:{ent['pid']}"
+            k = aid.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            apps.append({"bundle_id": aid, "pid": ent["pid"], "active": ent["active"]})
+        print(json.dumps({"ok": True, "apps": apps}))
+        return
+
+    cands = [c.lower() for c in json.loads(os.environ.get("APEXUSE_CANDS", "[]"))]
+    chosen = None
+    if target.lower() == "desktop":
+        chosen = next((e for e in entries if e["active"]), entries[0] if entries else None)
+    elif target.startswith("pid:"):
+        tpid = int(target[4:])
+        chosen = next((e for e in entries if e["pid"] == tpid), None)
+    else:
+        for ent in entries:
+            nm = ent["name"].lower()
+            cm = ent["comm"].lower()
+            if nm in cands or cm in cands or any(w[2].lower().find(c) >= 0 and len(c) >= 4 for w in ent["windows"] for c in cands):
+                chosen = ent
+                break
+
+    if not chosen:
+        print(json.dumps({"ok": False, "code": "app_not_running", "message": f"App '{target}' not found in AT-SPI"}))
+        return
+
+    win_metas = []
+    elements = []
+    for idx, w, title, rect, is_active in chosen["windows"]:
+        win_metas.append({"index": idx, "title": title, "x": rect.x, "y": rect.y, "w": rect.width, "h": rect.height})
+
+    def is_node_editable(node):
+        try:
+            role_obj = node.get_role()
+            if role_obj == ROLE_PASSWORD_TEXT:
+                return False
+            ss = node.get_state_set()
+            ro_state = getattr(Atspi.StateType, "READ_ONLY", None)
+            if ro_state is not None and ss.contains(ro_state):
+                return False
+            if ss.contains(Atspi.StateType.EDITABLE):
+                return True
+            if node.get_editable_text_iface() is not None:
+                return True
+            return role_obj in EDITABLE_ROLES
+        except Exception:
+            return False
+
+    def is_web_context(node):
+        nm = (chosen["comm"] or chosen["name"] or "").lower()
+        if any(w in nm for w in WEB_APP_NAMES):
+            return True
+        cur = node
+        for _ in range(16):
+            if not cur:
+                break
+            try:
+                if cur.get_role() in WEB_ROLES:
+                    return True
+                cur = cur.get_parent()
+            except Exception:
+                break
+        return False
+
+    def resolve_editable_at_point(x, y):
+        pwd_hit = False
+        hit_node = None
+        editable_node = None
+
+        def visit(node, nearest_editable, depth):
+            nonlocal pwd_hit, hit_node, editable_node
+            if pwd_hit or not node or depth > 64:
+                return
+            try:
+                ss = node.get_state_set()
+                if depth > 0 and not ss.contains(Atspi.StateType.SHOWING):
+                    return
+                ci = node.get_component_iface()
+                in_box = True
+                if ci:
+                    r = ci.get_extents(Atspi.CoordType.SCREEN)
+                    if r.width <= 0 or r.height <= 0:
+                        return
+                    in_box = (r.x <= x <= r.x + r.width and r.y <= y <= r.y + r.height)
+                if not in_box:
+                    return
+                role_obj = node.get_role()
+                if role_obj == ROLE_PASSWORD_TEXT:
+                    pwd_hit = True
+                    return
+                cur_editable = node if is_node_editable(node) else nearest_editable
+                if role_obj in (Atspi.Role.FRAME, Atspi.Role.WINDOW, Atspi.Role.DIALOG):
+                    cur_editable = None
+                hit_node = node
+                editable_node = cur_editable
+                cc = min(node.get_child_count(), 200)
+                for i in range(cc):
+                    visit(node.get_child_at_index(i), cur_editable, depth + 1)
+                    if pwd_hit:
+                        return
+            except Exception:
+                pass
+
+        for _, w, _, _, _ in sorted(chosen["windows"], key=lambda item: 0 if item[4] else 1):
+            visit(w, None, 0)
+            if pwd_hit or editable_node is not None:
+                break
+        if pwd_hit:
+            return ("password", None)
+        if editable_node is not None:
+            return ("editable", editable_node)
+        if hit_node is not None:
+            return ("not_editable", hit_node)
+        return ("miss", None)
+
+    def walk(node, win_idx, depth):
+        if len(elements) >= max_el + 40 or depth > max_depth + 1 or not node:
+            return
+        try:
+            role_obj = node.get_role()
+            role = (node.get_role_name() or "").strip()
+            label = (node.get_name() or "").strip()
+            ss = node.get_state_set()
+            enabled = ss.contains(Atspi.StateType.ENABLED) and ss.contains(Atspi.StateType.SENSITIVE)
+            focused = ss.contains(Atspi.StateType.FOCUSED)
+            showing = ss.contains(Atspi.StateType.SHOWING)
+            is_pwd = (role_obj == ROLE_PASSWORD_TEXT)
+            val = None
+            if not is_pwd:
+                try:
+                    ti = node.get_text_iface()
+                    if ti:
+                        cnt = min(ti.get_character_count(), 256)
+                        if cnt > 0:
+                            val = ti.get_text(0, cnt)
+                except Exception:
+                    pass
+            acts = []
+            try:
+                ai = node.get_action_iface()
+                if ai:
+                    for k in range(ai.get_n_actions()):
+                        an = ai.get_action_name(k)
+                        if an:
+                            acts.append(an)
+            except Exception:
+                pass
+            rect = None
+            try:
+                ci = node.get_component_iface()
+                if ci:
+                    r = ci.get_extents(Atspi.CoordType.SCREEN)
+                    if r.width > 0 and r.height > 0:
+                        rect = (r.x, r.y, r.width, r.height)
+            except Exception:
+                pass
+            item = {
+                "role": role,
+                "label": label,
+                "value": val,
+                "window": win_idx,
+                "depth": depth,
+                "enabled": bool(enabled),
+                "focused": bool(focused),
+                "is_password": bool(is_pwd),
+                "offscreen": not bool(showing),
+                "actions": acts,
+            }
+            if rect:
+                item["x"], item["y"], item["w"], item["h"] = rect
+            elements.append(item)
+            cc = min(node.get_child_count(), 120)
+            for ci in range(cc):
+                walk(node.get_child_at_index(ci), win_idx, depth + 1)
+        except Exception:
+            pass
+
+    if cmd == "inspect":
+        for idx, w, title, rect, _ in chosen["windows"]:
+            walk(w, idx, 1)
+    elif cmd == "do_action":
+        x, y = float(sys.argv[3]), float(sys.argv[4])
+        done = False
+        def find_click(node):
+            nonlocal done
+            if done or not node:
+                return
+            try:
+                ci = node.get_component_iface()
+                if ci:
+                    r = ci.get_extents(Atspi.CoordType.SCREEN)
+                    if r.x <= x <= r.x + r.width and r.y <= y <= r.y + r.height:
+                        if node.get_role() == ROLE_PASSWORD_TEXT:
+                            done = "password"
+                            return
+                        cc = node.get_child_count()
+                        for i in range(cc):
+                            find_click(node.get_child_at_index(i))
+                            if done:
+                                return
+                        ai = node.get_action_iface()
+                        if ai and ai.get_n_actions() > 0:
+                            ai.do_action(0)
+                            done = "ok"
+                            return
+            except Exception:
+                pass
+        for _, w, _, _, _ in chosen["windows"]:
+            find_click(w)
+            if done:
+                break
+        print(json.dumps({"ok": done == "ok", "status": done or "miss"}))
+        return
+    elif cmd == "set_value":
+        x, y = float(sys.argv[3]), float(sys.argv[4])
+        text = os.environ.get("APEXUSE_TEXT", sys.argv[5] if len(sys.argv) > 5 else "")
+        status, node = resolve_editable_at_point(x, y)
+        if status == "password":
+            print(json.dumps({"ok": False, "code": "unsafe_target_field", "message": "Target element is a password field"}))
+            return
+        if status != "editable" or node is None:
+            print(json.dumps({"ok": False, "code": "target_identity_unverified", "message": "Target element is not an editable control"}))
+            return
+        try:
+            ci = node.get_component_iface()
+            if ci:
+                ci.grab_focus()
+        except Exception:
+            pass
+        try:
+            et = node.get_editable_text_iface()
+            if et is not None and et.set_text_contents(text):
+                print(json.dumps({"ok": True, "method": "atspi_set_value"}))
+                return
+        except Exception:
+            pass
+        if is_web_context(node):
+            print(json.dumps({"ok": False, "code": "needs_fallback", "editable": True, "is_web": True}))
+        else:
+            print(json.dumps({"ok": False, "code": "replacement_set_failed", "message": "AT-SPI EditableText.set_text_contents failed"}))
+        return
+    elif cmd == "select_text":
+        x, y = float(sys.argv[3]), float(sys.argv[4])
+        start = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] != "" else None
+        end = int(sys.argv[6]) if len(sys.argv) > 6 and sys.argv[6] != "" else None
+        status, node = resolve_editable_at_point(x, y)
+        if status == "password":
+            print(json.dumps({"ok": False, "code": "unsafe_target_field", "message": "Target element is a password field"}))
+            return
+        if status != "editable" or node is None:
+            print(json.dumps({"ok": False, "code": "target_identity_unverified", "message": "Target element is not an editable control"}))
+            return
+        try:
+            ci = node.get_component_iface()
+            if ci:
+                ci.grab_focus()
+        except Exception:
+            pass
+        ti = None
+        char_count = None
+        try:
+            ti = node.get_text_iface()
+            if ti is not None:
+                char_count = ti.get_character_count()
+        except Exception:
+            pass
+        if char_count is not None:
+            s = max(0, min(char_count, 0 if start is None else start))
+            e = max(s, min(char_count, char_count if end is None else end))
+            is_full = (start is None or start == 0) and (end is None or end == char_count)
+        else:
+            s = 0 if start is None else max(0, start)
+            e = end
+            is_full = (start is None and end is None) or (start == 0 and end is None)
+        if ti is not None and (char_count is not None or (start is not None and end is not None)):
+            try:
+                if ti.set_selection(0, s, e):
+                    print(json.dumps({"ok": True, "method": "atspi_select_text"}))
+                    return
+                if ti.get_n_selections() == 0 and ti.add_selection(s, e):
+                    print(json.dumps({"ok": True, "method": "atspi_select_text"}))
+                    return
+            except Exception:
+                pass
+        if is_full:
+            print(json.dumps({"ok": False, "code": "needs_select_all_fallback", "editable": True, "is_full": True}))
+        else:
+            print(json.dumps({"ok": False, "code": "select_text_failed", "message": "Partial range selection requires AT-SPI Text.set_selection"}))
+        return
+
+    aid = chosen["comm"] or chosen["name"] or target
+    print(json.dumps({
+        "ok": True,
+        "app": aid,
+        "frontmost_app": front_app or aid,
+        "pid": chosen["pid"],
+        "frontmost": chosen["active"],
+        "windows": win_metas,
+        "elements": elements,
+    }))
+
+run()
+"#;
+
+pub fn atspi_helper_source() -> &'static str {
+    ATSPI_HELPER_PY
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AtspiActionOutcome {
+    Success(String),
+    FallbackRequired,
+    Error { code: String, message: String },
+}
+
+pub fn parse_atspi_action_response(raw_json: &str) -> AtspiActionOutcome {
+    let val = match parse_json(raw_json) {
+        Ok(v) => v,
+        Err(e) => {
+            return AtspiActionOutcome::Error {
+                code: "atspi_parse_error".into(),
+                message: format!("Invalid AT-SPI JSON: {e}"),
+            }
+        }
+    };
+    if val.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        let method = val
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("linux_atspi")
+            .to_string();
+        return AtspiActionOutcome::Success(method);
+    }
+    let code = val
+        .get("code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("target_identity_unverified");
+    let message = val
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("AT-SPI verification failed");
+    if (code == "needs_fallback" || code == "needs_select_all_fallback")
+        && val.get("editable").and_then(|v| v.as_bool()) == Some(true)
+    {
+        return AtspiActionOutcome::FallbackRequired;
+    }
+    AtspiActionOutcome::Error {
+        code: code.to_string(),
+        message: message.to_string(),
+    }
+}
+
+pub fn build_xdotool_type_args(text: &str, key_delay_us: u64) -> Vec<String> {
+    let delay_ms = if key_delay_us == 0 {
+        0
+    } else {
+        key_delay_us / 1000
+    };
+    vec![
+        "type".into(),
+        "--clearmodifiers".into(),
+        "--delay".into(),
+        delay_ms.to_string(),
+        "--".into(),
+        text.into(),
+    ]
+}
+
+pub fn prepare_capture_frame(
+    raw_w: usize,
+    raw_h: usize,
+    raw_rgba: Vec<u8>,
+    encode_image: bool,
+    options: &ImageEncodeOptions,
+) -> (usize, usize, Vec<u8>, String, String) {
+    let (w, h, rgba) = if options.max_width > 0 && raw_w > options.max_width {
+        downscale_rgba(&raw_rgba, raw_w, raw_h, options.max_width)
+    } else {
+        (raw_w, raw_h, raw_rgba)
+    };
+    let pixel_digest = compute_pixel_digest(w, h, &rgba);
+    let image_base64 = if encode_image {
+        encode_rgba_image_b64(w, h, &rgba, options.format, options.quality)
+    } else {
+        String::new()
+    };
+    (w, h, rgba, pixel_digest, image_base64)
+}
+
 pub struct LinuxDriver;
 
 #[cfg(target_os = "linux")]
@@ -229,10 +719,7 @@ mod native {
     use super::*;
     use crate::driver::common::{alias_candidates, app_matches, parse_tesseract_tsv};
     use crate::driver::OcrBox;
-    use crate::som_png::{
-        cache_rgba_frame, compute_pixel_digest, decode_png_rgba, encode_rgba_png_b64,
-        encode_rgba_png_bytes,
-    };
+    use crate::som_png::{cache_rgba_frame, decode_png_rgba, encode_rgba_png_bytes};
     use std::ffi::CString;
     use std::io::Write;
     use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
@@ -490,10 +977,75 @@ mod native {
         Some((actual_format, vec))
     }
 
-    fn list_x11_windows() -> Vec<XWin> {
-        let Some(g) = DisplayGuard::open() else {
-            return Vec::new();
+    unsafe fn xwin_from_xid(
+        g: &DisplayGuard,
+        root: c_ulong,
+        xid: c_ulong,
+        active_xid: c_ulong,
+    ) -> Option<XWin> {
+        if xid == 0 {
+            return None;
+        }
+        let stride = std::mem::size_of::<c_long>();
+        let mut attrs: XWindowAttributes = std::mem::zeroed();
+        if (g.api.x_get_window_attributes)(g.dpy, xid, &mut attrs) == 0 || attrs.map_state != 2 {
+            return None;
+        }
+        if attrs.width <= 1 || attrs.height <= 1 {
+            return None;
+        }
+        let mut rx = 0i32;
+        let mut ry = 0i32;
+        let mut child = 0;
+        (g.api.x_translate_coordinates)(g.dpy, xid, root, 0, 0, &mut rx, &mut ry, &mut child);
+        let pid = x11_get_prop_bytes(g.api, g.dpy, xid, b"_NET_WM_PID\0")
+            .and_then(|(_, b)| {
+                b.get(..stride)
+                    .and_then(|s| s.try_into().ok())
+                    .map(|a| c_long::from_ne_bytes(a) as i64)
+            })
+            .unwrap_or(0);
+        let wm_class = x11_get_prop_bytes(g.api, g.dpy, xid, b"WM_CLASS\0")
+            .map(|(_, b)| {
+                let parts: Vec<&str> = b
+                    .split(|&c| c == 0)
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| std::str::from_utf8(s).ok())
+                    .collect();
+                parts.last().copied().unwrap_or("").to_string()
+            })
+            .unwrap_or_default();
+        let title = x11_get_prop_bytes(g.api, g.dpy, xid, b"_NET_WM_NAME\0")
+            .or_else(|| x11_get_prop_bytes(g.api, g.dpy, xid, b"WM_NAME\0"))
+            .map(|(_, b)| String::from_utf8_lossy(&b).trim_end_matches('\0').to_string())
+            .unwrap_or_default();
+
+        let comm = read_proc_comm(pid);
+        let app_id = if !comm.is_empty() {
+            comm
+        } else if !wm_class.is_empty() {
+            wm_class.clone()
+        } else {
+            format!("pid:{pid}")
         };
+
+        Some(XWin {
+            xid,
+            pid,
+            app_id,
+            wm_class,
+            title,
+            rect: Rect {
+                x: rx as f64,
+                y: ry as f64,
+                w: attrs.width as f64,
+                h: attrs.height as f64,
+            },
+            active: xid == active_xid,
+        })
+    }
+
+    fn list_x11_windows_with_guard(g: &DisplayGuard) -> (Option<XWin>, Vec<XWin>) {
         unsafe {
             let root = (g.api.x_default_root_window)(g.dpy);
             let active_xid = x11_get_prop_bytes(g.api, g.dpy, root, b"_NET_ACTIVE_WINDOW\0")
@@ -506,305 +1058,39 @@ mod native {
                 })
                 .unwrap_or(0);
 
-            let Some((_, list_bytes)) = x11_get_prop_bytes(g.api, g.dpy, root, b"_NET_CLIENT_LIST\0") else {
-                return Vec::new();
-            };
-            let stride = std::mem::size_of::<c_long>();
             let mut wins = Vec::new();
-            for chunk in list_bytes.chunks_exact(stride) {
-                let Ok(arr) = chunk.try_into() else { continue };
-                let xid = c_long::from_ne_bytes(arr) as c_ulong;
-                let mut attrs: XWindowAttributes = std::mem::zeroed();
-                if (g.api.x_get_window_attributes)(g.dpy, xid, &mut attrs) == 0 || attrs.map_state != 2 {
-                    continue;
-                }
-                let mut rx = 0i32;
-                let mut ry = 0i32;
-                let mut child = 0;
-                (g.api.x_translate_coordinates)(g.dpy, xid, root, 0, 0, &mut rx, &mut ry, &mut child);
-                let pid = x11_get_prop_bytes(g.api, g.dpy, xid, b"_NET_WM_PID\0")
-                    .and_then(|(_, b)| {
-                        b.get(..stride)
-                            .and_then(|s| s.try_into().ok())
-                            .map(|a| c_long::from_ne_bytes(a) as i64)
-                    })
-                    .unwrap_or(0);
-                let wm_class = x11_get_prop_bytes(g.api, g.dpy, xid, b"WM_CLASS\0")
-                    .map(|(_, b)| {
-                        let parts: Vec<&str> = b
-                            .split(|&c| c == 0)
-                            .filter(|s| !s.is_empty())
-                            .filter_map(|s| std::str::from_utf8(s).ok())
-                            .collect();
-                        parts.last().copied().unwrap_or("").to_string()
-                    })
-                    .unwrap_or_default();
-                let title = x11_get_prop_bytes(g.api, g.dpy, xid, b"_NET_WM_NAME\0")
-                    .or_else(|| x11_get_prop_bytes(g.api, g.dpy, xid, b"WM_NAME\0"))
-                    .map(|(_, b)| String::from_utf8_lossy(&b).trim_end_matches('\0').to_string())
-                    .unwrap_or_default();
-
-                let comm = read_proc_comm(pid);
-                let app_id = if !comm.is_empty() {
-                    comm
-                } else if !wm_class.is_empty() {
-                    wm_class.clone()
-                } else {
-                    format!("pid:{pid}")
-                };
-
-                if attrs.width > 1 && attrs.height > 1 {
-                    wins.push(XWin {
-                        xid,
-                        pid,
-                        app_id,
-                        wm_class,
-                        title,
-                        rect: Rect {
-                            x: rx as f64,
-                            y: ry as f64,
-                            w: attrs.width as f64,
-                            h: attrs.height as f64,
-                        },
-                        active: xid == active_xid,
-                    });
+            if let Some((_, list_bytes)) = x11_get_prop_bytes(g.api, g.dpy, root, b"_NET_CLIENT_LIST\0") {
+                let stride = std::mem::size_of::<c_long>();
+                for chunk in list_bytes.chunks_exact(stride) {
+                    let Ok(arr) = chunk.try_into() else { continue };
+                    let xid = c_long::from_ne_bytes(arr) as c_ulong;
+                    if let Some(w) = xwin_from_xid(g, root, xid, active_xid) {
+                        wins.push(w);
+                    }
                 }
             }
-            wins
+            let active_win = wins
+                .iter()
+                .find(|w| w.active)
+                .cloned()
+                .or_else(|| xwin_from_xid(g, root, active_xid, active_xid));
+            (active_win, wins)
         }
     }
 
-    const ATSPI_HELPER_PY: &str = r#"
-import json, os, sys
+    fn list_x11_windows() -> Vec<XWin> {
+        let Some(g) = DisplayGuard::open() else {
+            return Vec::new();
+        };
+        list_x11_windows_with_guard(&g).1
+    }
 
-def read_comm(pid):
-    try:
-        with open(f"/proc/{pid}/comm", "r") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
-
-def run():
-    try:
-        import gi
-        gi.require_version("Atspi", "2.0")
-        from gi.repository import Atspi
-    except Exception as e:
-        print(json.dumps({"ok": False, "code": "accessibility_unavailable", "message": str(e)}))
-        return
-
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "list"
-    target = sys.argv[2] if len(sys.argv) > 2 else ""
-    max_el = int(sys.argv[3]) if len(sys.argv) > 3 else 150
-    max_depth = int(sys.argv[4]) if len(sys.argv) > 4 else 12
-
-    desktop = Atspi.get_desktop(0)
-    n_apps = desktop.get_child_count()
-
-    if cmd == "doctor":
-        print(json.dumps({"ok": True, "apps_count": n_apps}))
-        return
-
-    def app_entry(app):
-        name = (app.get_name() or "").strip()
-        pid = 0
-        try:
-            pid = app.get_process_id()
-        except Exception:
-            pass
-        comm = read_comm(pid)
-        active = False
-        windows = []
-        wc = app.get_child_count()
-        for i in range(wc):
-            w = app.get_child_at_index(i)
-            if not w:
-                continue
-            try:
-                ss = w.get_state_set()
-                is_active = ss.contains(Atspi.StateType.ACTIVE)
-                showing = ss.contains(Atspi.StateType.SHOWING)
-                if not showing and not is_active:
-                    continue
-                if is_active:
-                    active = True
-                rect = w.get_extents(Atspi.CoordType.SCREEN)
-                if rect.width <= 1 or rect.height <= 1:
-                    continue
-                windows.append((len(windows), w, w.get_name() or "", rect, is_active))
-            except Exception:
-                continue
-        return {
-            "name": name,
-            "comm": comm,
-            "pid": pid,
-            "active": active,
-            "windows": windows,
-        }
-
-    entries = []
-    front_name = ""
-    for i in range(n_apps):
-        a = desktop.get_child_at_index(i)
-        if not a:
-            continue
-        ent = app_entry(a)
-        if ent["windows"]:
-            if ent["active"]:
-                front_name = ent["comm"] or ent["name"]
-            entries.append(ent)
-
-    if cmd == "list":
-        apps = []
-        seen = set()
-        for ent in entries:
-            aid = ent["comm"] or ent["name"] or f"pid:{ent['pid']}"
-            k = aid.lower()
-            if k in seen:
-                continue
-            seen.add(k)
-            apps.append({"bundle_id": aid, "pid": ent["pid"], "active": ent["active"]})
-        print(json.dumps({"ok": True, "apps": apps}))
-        return
-
-    cands = [c.lower() for c in json.loads(os.environ.get("APEXUSE_CANDS", "[]"))]
-    chosen = None
-    if target.lower() == "desktop":
-        chosen = next((e for e in entries if e["active"]), entries[0] if entries else None)
-    elif target.startswith("pid:"):
-        tpid = int(target[4:])
-        chosen = next((e for e in entries if e["pid"] == tpid), None)
-    else:
-        for ent in entries:
-            nm = ent["name"].lower()
-            cm = ent["comm"].lower()
-            if nm in cands or cm in cands or any(w[2].lower().find(c) >= 0 and len(c) >= 4 for w in ent["windows"] for c in cands):
-                chosen = ent
-                break
-
-    if not chosen:
-        print(json.dumps({"ok": False, "code": "app_not_running", "message": f"App '{target}' not found in AT-SPI"}))
-        return
-
-    win_metas = []
-    elements = []
-    for idx, w, title, rect, is_active in chosen["windows"]:
-        win_metas.append({"index": idx, "title": title, "x": rect.x, "y": rect.y, "w": rect.width, "h": rect.height})
-
-    def walk(node, win_idx, depth):
-        if len(elements) >= max_el + 40 or depth > max_depth + 1 or not node:
-            return
-        try:
-            role_obj = node.get_role()
-            role = (node.get_role_name() or "").strip()
-            label = (node.get_name() or "").strip()
-            ss = node.get_state_set()
-            enabled = ss.contains(Atspi.StateType.ENABLED) and ss.contains(Atspi.StateType.SENSITIVE)
-            focused = ss.contains(Atspi.StateType.FOCUSED)
-            showing = ss.contains(Atspi.StateType.SHOWING)
-            is_pwd = (role_obj == Atspi.Role.PASSWORD_TEXT)
-            val = None
-            if not is_pwd:
-                try:
-                    ti = node.get_text_iface()
-                    if ti:
-                        cnt = min(ti.get_character_count(), 256)
-                        if cnt > 0:
-                            val = ti.get_text(0, cnt)
-                except Exception:
-                    pass
-            acts = []
-            try:
-                ai = node.get_action_iface()
-                if ai:
-                    for k in range(ai.get_n_actions()):
-                        an = ai.get_action_name(k)
-                        if an:
-                            acts.append(an)
-            except Exception:
-                pass
-            rect = None
-            try:
-                ci = node.get_component_iface()
-                if ci:
-                    r = ci.get_extents(Atspi.CoordType.SCREEN)
-                    if r.width > 0 and r.height > 0:
-                        rect = (r.x, r.y, r.width, r.height)
-            except Exception:
-                pass
-            item = {
-                "role": role,
-                "label": label,
-                "value": val,
-                "window": win_idx,
-                "depth": depth,
-                "enabled": bool(enabled),
-                "focused": bool(focused),
-                "is_password": bool(is_pwd),
-                "offscreen": not bool(showing),
-                "actions": acts,
-            }
-            if rect:
-                item["x"], item["y"], item["w"], item["h"] = rect
-            elements.append(item)
-            cc = min(node.get_child_count(), 120)
-            for ci in range(cc):
-                walk(node.get_child_at_index(ci), win_idx, depth + 1)
-        except Exception:
-            pass
-
-    if cmd == "inspect":
-        for idx, w, title, rect, _ in chosen["windows"]:
-            walk(w, idx, 1)
-    elif cmd == "do_action":
-        x, y = float(sys.argv[3]), float(sys.argv[4])
-        done = False
-        def find_click(node):
-            nonlocal done
-            if done or not node:
-                return
-            try:
-                ci = node.get_component_iface()
-                if ci:
-                    r = ci.get_extents(Atspi.CoordType.SCREEN)
-                    if r.x <= x <= r.x + r.width and r.y <= y <= r.y + r.height:
-                        if node.get_role() == Atspi.Role.PASSWORD_TEXT:
-                            done = "password"
-                            return
-                        cc = node.get_child_count()
-                        for i in range(cc):
-                            find_click(node.get_child_at_index(i))
-                            if done:
-                                return
-                        ai = node.get_action_iface()
-                        if ai and ai.get_n_actions() > 0:
-                            ai.do_action(0)
-                            done = "ok"
-                            return
-            except Exception:
-                pass
-        for _, w, _, _, _ in chosen["windows"]:
-            find_click(w)
-            if done:
-                break
-        print(json.dumps({"ok": done == "ok", "status": done or "miss"}))
-        return
-
-    aid = chosen["comm"] or chosen["name"] or target
-    print(json.dumps({
-        "ok": True,
-        "app": aid,
-        "frontmost_app": front_app or aid,
-        "pid": chosen["pid"],
-        "frontmost": chosen["active"],
-        "windows": win_metas,
-        "elements": elements,
-    }))
-
-run()
-"#;
-
-    fn run_atspi_py(cmd: &str, args: &[&str], cands_json: Option<&str>) -> Option<String> {
+    fn run_atspi_py_with_env(
+        cmd: &str,
+        args: &[&str],
+        cands_json: Option<&str>,
+        extra_env: Option<(&str, &str)>,
+    ) -> Option<String> {
         let mut command = Command::new("python3");
         command.arg("-c").arg(ATSPI_HELPER_PY).arg(cmd);
         for a in args {
@@ -813,9 +1099,16 @@ run()
         if let Some(cj) = cands_json {
             command.env("APEXUSE_CANDS", cj);
         }
+        if let Some((k, v)) = extra_env {
+            command.env(k, v);
+        }
         let out = command.output().ok()?;
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if s.is_empty() { None } else { Some(s) }
+    }
+
+    fn run_atspi_py(cmd: &str, args: &[&str], cands_json: Option<&str>) -> Option<String> {
+        run_atspi_py_with_env(cmd, args, cands_json, None)
     }
 
     pub fn doctor() -> DoctorStatus {
@@ -1203,7 +1496,16 @@ run()
         ))
     }
 
-    fn run_tesseract(w: usize, h: usize, rgba: &[u8], origin_x: f64, origin_y: f64, mode: OcrMode) -> Vec<OcrBox> {
+    fn run_tesseract(
+        w: usize,
+        h: usize,
+        rgba: &[u8],
+        origin_x: f64,
+        origin_y: f64,
+        scale_x: f64,
+        scale_y: f64,
+        mode: OcrMode,
+    ) -> Vec<OcrBox> {
         if mode == OcrMode::Off || !cmd_exists("tesseract") {
             return Vec::new();
         }
@@ -1227,17 +1529,134 @@ run()
         match child.wait_with_output() {
             Ok(out) if out.status.success() => {
                 let tsv = String::from_utf8_lossy(&out.stdout);
-                parse_tesseract_tsv(&tsv, origin_x, origin_y, 1.0, 1.0)
+                parse_tesseract_tsv(&tsv, origin_x, origin_y, scale_x, scale_y)
             }
             _ => Vec::new(),
         }
+    }
+
+    fn wayland_window_state_fallback(bundle_id: &str) -> Result<WindowState, DriverError> {
+        if bundle_id.eq_ignore_ascii_case("desktop") {
+            let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "wayland".into());
+            return Ok(WindowState {
+                frontmost_bundle_id: desktop,
+                pid: 0,
+                windows_total: 0,
+                active_window_frame: None,
+            });
+        }
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for ent in entries.flatten() {
+                let name = ent.file_name();
+                let Some(s) = name.to_str() else { continue };
+                let Ok(pid) = s.parse::<i64>() else { continue };
+                let comm = read_proc_comm(pid);
+                if !comm.is_empty() && app_matches(bundle_id, &comm, None, None, pid) {
+                    return Ok(WindowState {
+                        frontmost_bundle_id: comm,
+                        pid,
+                        windows_total: 1,
+                        active_window_frame: None,
+                    });
+                }
+            }
+        }
+        Err(DriverError::new(
+            "app_not_running",
+            format!("No running Linux window matching '{bundle_id}'"),
+        ))
+    }
+
+    pub fn window_state(bundle_id: &str) -> Result<WindowState, DriverError> {
+        if let Some(g) = DisplayGuard::open() {
+            let (active_win, xwins) = list_x11_windows_with_guard(&g);
+            if bundle_id.eq_ignore_ascii_case("desktop") {
+                if xwins.is_empty() && active_win.is_none() && is_wayland_session() {
+                    return wayland_window_state_fallback(bundle_id);
+                }
+                let primary = active_win.as_ref().or_else(|| xwins.first());
+                let frontmost = primary.map(|w| w.app_id.clone()).unwrap_or_default();
+                let pid = primary.map(|w| w.pid).unwrap_or(0);
+                let windows_total = xwins.len().max(if active_win.is_some() { 1 } else { 0 });
+                let active_window_frame = primary.map(|w| w.rect.clone()).or_else(|| unsafe {
+                    let scr = (g.api.x_default_screen)(g.dpy);
+                    let w = (g.api.x_display_width)(g.dpy, scr);
+                    let h = (g.api.x_display_height)(g.dpy, scr);
+                    if w > 0 && h > 0 {
+                        Some(Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            w: w as f64,
+                            h: h as f64,
+                        })
+                    } else {
+                        None
+                    }
+                });
+                return Ok(WindowState {
+                    frontmost_bundle_id: frontmost,
+                    pid,
+                    windows_total,
+                    active_window_frame,
+                });
+            }
+
+            let mut matched: Vec<XWin> = xwins
+                .iter()
+                .filter(|w| app_matches(bundle_id, &w.app_id, Some(&w.wm_class), Some(&w.title), w.pid))
+                .cloned()
+                .collect();
+            if matched.is_empty() {
+                if let Some(ref aw) = active_win {
+                    if app_matches(bundle_id, &aw.app_id, Some(&aw.wm_class), Some(&aw.title), aw.pid) {
+                        matched.push(aw.clone());
+                    }
+                }
+            }
+            if !matched.is_empty() {
+                let primary = matched
+                    .iter()
+                    .find(|w| w.active)
+                    .unwrap_or_else(|| {
+                        matched
+                            .iter()
+                            .max_by(|a, b| (a.rect.w * a.rect.h).total_cmp(&(b.rect.w * b.rect.h)))
+                            .unwrap()
+                    });
+                let frontmost = active_win
+                    .map(|w| w.app_id)
+                    .or_else(|| xwins.iter().find(|w| w.active).map(|w| w.app_id.clone()))
+                    .unwrap_or_else(|| primary.app_id.clone());
+                return Ok(WindowState {
+                    frontmost_bundle_id: frontmost,
+                    pid: primary.pid,
+                    windows_total: matched.len(),
+                    active_window_frame: Some(primary.rect.clone()),
+                });
+            }
+            if !is_wayland_session() {
+                return Err(DriverError::new(
+                    "app_not_running",
+                    format!("No visible X11 window matching '{bundle_id}'"),
+                ));
+            }
+        }
+
+        if is_wayland_session() {
+            return wayland_window_state_fallback(bundle_id);
+        }
+        Err(DriverError::new(
+            "window_state_unavailable",
+            "No X11 or Wayland display available",
+        ))
     }
 
     pub fn capture_and_ocr(
         bundle_id: &str,
         window: Option<i32>,
         ocr_mode: OcrMode,
-        encode_png: bool,
+        encode_image: bool,
+        options: &ImageEncodeOptions,
     ) -> Result<CaptureResult, DriverError> {
         let is_desktop = bundle_id.eq_ignore_ascii_case("desktop");
         let (target_rect, out_bundle, front_bundle, pid, wid) = if is_desktop && window.is_none() {
@@ -1263,19 +1682,26 @@ run()
             )
         };
 
-        let (frame, w, h, rgba) = if DisplayGuard::open().is_some() && !is_wayland_session() {
+        let (frame, raw_w, raw_h, raw_rgba) = if DisplayGuard::open().is_some() && !is_wayland_session() {
             capture_x11_rect(target_rect.clone())?
         } else {
             capture_wayland_png(target_rect.clone()).or_else(|_| capture_x11_rect(target_rect))?
         };
 
-        let pixel_digest = compute_pixel_digest(w, h, &rgba);
-        let ocr_boxes = run_tesseract(w, h, &rgba, frame.x, frame.y, ocr_mode);
-        let png_base64 = if encode_png {
-            encode_rgba_png_b64(w, h, &rgba)
-        } else {
-            String::new()
-        };
+        let scale_x = if frame.w > 0.0 { raw_w as f64 / frame.w } else { 1.0 };
+        let scale_y = if frame.h > 0.0 { raw_h as f64 / frame.h } else { 1.0 };
+        let ocr_boxes = run_tesseract(
+            raw_w,
+            raw_h,
+            &raw_rgba,
+            frame.x,
+            frame.y,
+            scale_x,
+            scale_y,
+            ocr_mode,
+        );
+        let (w, h, rgba, pixel_digest, image_base64) =
+            prepare_capture_frame(raw_w, raw_h, raw_rgba, encode_image, options);
         let capture_id = cache_rgba_frame("lin", w, h, rgba);
 
         Ok(CaptureResult {
@@ -1288,9 +1714,9 @@ run()
             window_frame: frame,
             image_width: w,
             image_height: h,
-            image_format: ImageFormat::Png,
-            image_base64: png_base64.clone(),
-            png_base64,
+            image_format: options.format,
+            image_base64: image_base64.clone(),
+            png_base64: image_base64,
             ocr_boxes,
         })
     }
@@ -1329,6 +1755,91 @@ run()
             (g.api.x_sync)(g.dpy, 0);
         }
         Ok(())
+    }
+
+    fn click_point_raw(x: f64, y: f64) {
+        if xtest_click(x, y, 1, 1).is_err() && cmd_exists("ydotool") {
+            let _ = Command::new("ydotool")
+                .args(["mousemove", "--absolute", "-x", &x.round().to_string(), "-y", &y.round().to_string()])
+                .status();
+            let _ = Command::new("ydotool").args(["click", "0xC0"]).status();
+        }
+        std::thread::sleep(Duration::from_millis(35));
+    }
+
+    fn fast_type_linux(text: &str, key_delay_us: u64) -> Result<ActionResult, DriverError> {
+        if text.is_empty() {
+            return Ok(ActionResult {
+                method: "linux_fast_type_empty".into(),
+            });
+        }
+        if cmd_exists("wtype") && is_wayland_session() {
+            let status = Command::new("wtype").args(["--", text]).status();
+            if status.map(|s| s.success()).unwrap_or(false) {
+                return Ok(ActionResult {
+                    method: "linux_wtype".into(),
+                });
+            }
+        }
+        if cmd_exists("xdotool") {
+            let args = build_xdotool_type_args(text, key_delay_us);
+            let status = Command::new("xdotool").args(&args).status();
+            if status.map(|s| s.success()).unwrap_or(false) {
+                return Ok(ActionResult {
+                    method: "linux_xdotool_type".into(),
+                });
+            }
+        }
+        if let Some(g) = DisplayGuard::open() {
+            let mut batch_count = 0usize;
+            for ch in text.chars() {
+                if ch == '\r' {
+                    continue;
+                }
+                let sym = if ch == '\n' {
+                    "Return".to_string()
+                } else if ch == '\t' {
+                    "Tab".to_string()
+                } else if ch == ' ' {
+                    "space".to_string()
+                } else if let Some(named) = map_x11_keysym_name(&ch.to_string()) {
+                    named.to_string()
+                } else if ch.is_ascii_alphanumeric() {
+                    ch.to_string()
+                } else {
+                    format!("U{:04x}", ch as u32)
+                };
+                let need_shift = ch.is_ascii_uppercase();
+                if need_shift {
+                    send_xtest_key_sym(&g, "Shift_L", true);
+                }
+                send_xtest_key_sym(&g, &sym, true);
+                send_xtest_key_sym(&g, &sym, false);
+                if need_shift {
+                    send_xtest_key_sym(&g, "Shift_L", false);
+                }
+                batch_count += 1;
+                if batch_count >= 32 {
+                    unsafe {
+                        (g.api.x_flush)(g.dpy);
+                    }
+                    batch_count = 0;
+                    if key_delay_us > 0 {
+                        std::thread::sleep(Duration::from_micros(key_delay_us));
+                    }
+                }
+            }
+            unsafe {
+                (g.api.x_sync)(g.dpy, 0);
+            }
+            return Ok(ActionResult {
+                method: "linux_xtest_type".into(),
+            });
+        }
+        Err(DriverError::new(
+            "input_failed",
+            "Text input requires wtype, xdotool, or X11 display",
+        ))
     }
 
     pub fn perform_action(req: &ActionRequest) -> Result<ActionResult, DriverError> {
@@ -1445,12 +1956,11 @@ run()
                 text,
                 mode,
                 click_first,
-                ..
+                key_delay_us,
             } => {
                 let _ = activate_app(bundle_id);
                 if *click_first {
-                    let _ = xtest_click(*x, *y, 1, 1);
-                    std::thread::sleep(Duration::from_millis(35));
+                    click_point_raw(*x, *y);
                 }
                 if mode == "replace" {
                     let _ = perform_action(&ActionRequest::PressKey {
@@ -1465,52 +1975,7 @@ run()
                     });
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                if cmd_exists("wtype") && is_wayland_session() {
-                    let status = Command::new("wtype").args(["--", text]).status();
-                    if status.map(|s| s.success()).unwrap_or(false) {
-                        return Ok(ActionResult { method: "linux_wtype".into() });
-                    }
-                }
-                if cmd_exists("xdotool") {
-                    let status = Command::new("xdotool")
-                        .args(["type", "--clearmodifiers", "--delay", "2", "--", text])
-                        .status();
-                    if status.map(|s| s.success()).unwrap_or(false) {
-                        return Ok(ActionResult { method: "linux_xdotool_type".into() });
-                    }
-                }
-                if let Some(g) = DisplayGuard::open() {
-                    for ch in text.chars() {
-                        let sym = if ch == '\n' {
-                            "Return".to_string()
-                        } else if ch == ' ' {
-                            "space".to_string()
-                        } else if let Some(named) = map_x11_keysym_name(&ch.to_string()) {
-                            named.to_string()
-                        } else if ch.is_ascii_alphanumeric() {
-                            ch.to_string()
-                        } else {
-                            format!("U{:04x}", ch as u32)
-                        };
-                        let need_shift = ch.is_ascii_uppercase();
-                        if need_shift {
-                            send_xtest_key_sym(&g, "Shift_L", true);
-                        }
-                        send_xtest_key_sym(&g, &sym, true);
-                        send_xtest_key_sym(&g, &sym, false);
-                        if need_shift {
-                            send_xtest_key_sym(&g, "Shift_L", false);
-                        }
-                    }
-                    unsafe {
-                        (g.api.x_sync)(g.dpy, 0);
-                    }
-                    return Ok(ActionResult { method: "linux_xtest_type".into() });
-                }
-                Err(DriverError::new(
-                    "input_failed",
-                    "Text input requires wtype, xdotool, or X11 display",
-                ))
+                fast_type_linux(text, *key_delay_us)
             }
             ActionRequest::PressKey {
                 bundle_id,
@@ -1611,14 +2076,110 @@ run()
                 }
                 Ok(ActionResult { method: "linux_scroll".into() })
             }
-            ActionRequest::SetValue { .. } => Err(DriverError::new(
-                "unsupported_on_platform",
-                "SetValue will be implemented in Task 4",
-            )),
-            ActionRequest::SelectText { .. } => Err(DriverError::new(
-                "unsupported_on_platform",
-                "SelectText will be implemented in Task 4",
-            )),
+            ActionRequest::SetValue {
+                bundle_id,
+                x,
+                y,
+                text,
+                key_delay_us,
+            } => {
+                let cands = JsonValue::Array(
+                    alias_candidates(bundle_id)
+                        .into_iter()
+                        .map(JsonValue::String)
+                        .collect(),
+                )
+                .to_json_string();
+                let xs = x.round().to_string();
+                let ys = y.round().to_string();
+                let raw = run_atspi_py_with_env(
+                    "set_value",
+                    &[bundle_id, &xs, &ys],
+                    Some(&cands),
+                    Some(("APEXUSE_TEXT", text)),
+                )
+                .ok_or_else(|| {
+                    DriverError::new(
+                        "target_identity_unverified",
+                        "AT-SPI2 verification unavailable for SetValue",
+                    )
+                })?;
+                match parse_atspi_action_response(&raw) {
+                    AtspiActionOutcome::Success(method) => Ok(ActionResult { method }),
+                    AtspiActionOutcome::Error { code, message } => {
+                        Err(DriverError::new(code, message))
+                    }
+                    AtspiActionOutcome::FallbackRequired => {
+                        let _ = activate_app(bundle_id);
+                        click_point_raw(*x, *y);
+                        let _ = perform_action(&ActionRequest::PressKey {
+                            bundle_id: bundle_id.clone(),
+                            key: "a".into(),
+                            modifiers: vec!["ctrl".into()],
+                        });
+                        let _ = perform_action(&ActionRequest::PressKey {
+                            bundle_id: bundle_id.clone(),
+                            key: "backspace".into(),
+                            modifiers: vec![],
+                        });
+                        std::thread::sleep(Duration::from_millis(20));
+                        if !text.is_empty() {
+                            fast_type_linux(text, *key_delay_us)?;
+                        }
+                        Ok(ActionResult {
+                            method: "linux_set_value_fallback".into(),
+                        })
+                    }
+                }
+            }
+            ActionRequest::SelectText {
+                bundle_id,
+                x,
+                y,
+                start,
+                end,
+            } => {
+                let cands = JsonValue::Array(
+                    alias_candidates(bundle_id)
+                        .into_iter()
+                        .map(JsonValue::String)
+                        .collect(),
+                )
+                .to_json_string();
+                let xs = x.round().to_string();
+                let ys = y.round().to_string();
+                let start_s = start.map(|v| v.to_string()).unwrap_or_default();
+                let end_s = end.map(|v| v.to_string()).unwrap_or_default();
+                let raw = run_atspi_py(
+                    "select_text",
+                    &[bundle_id, &xs, &ys, &start_s, &end_s],
+                    Some(&cands),
+                )
+                .ok_or_else(|| {
+                    DriverError::new(
+                        "target_identity_unverified",
+                        "AT-SPI2 verification unavailable for SelectText",
+                    )
+                })?;
+                match parse_atspi_action_response(&raw) {
+                    AtspiActionOutcome::Success(method) => Ok(ActionResult { method }),
+                    AtspiActionOutcome::Error { code, message } => {
+                        Err(DriverError::new(code, message))
+                    }
+                    AtspiActionOutcome::FallbackRequired => {
+                        let _ = activate_app(bundle_id);
+                        click_point_raw(*x, *y);
+                        let _ = perform_action(&ActionRequest::PressKey {
+                            bundle_id: bundle_id.clone(),
+                            key: "a".into(),
+                            modifiers: vec!["ctrl".into()],
+                        });
+                        Ok(ActionResult {
+                            method: "linux_select_all_fallback".into(),
+                        })
+                    }
+                }
+            }
         }
     }
 }
@@ -1651,11 +2212,8 @@ impl OsDriver for LinuxDriver {
         native::inspect_app(bundle_id, window, max_elements, max_depth)
     }
 
-    fn window_state(&self, _bundle_id: &str) -> Result<WindowState, DriverError> {
-        Err(DriverError::new(
-            "unsupported_on_platform",
-            "window_state will be implemented in Task 4",
-        ))
+    fn window_state(&self, bundle_id: &str) -> Result<WindowState, DriverError> {
+        native::window_state(bundle_id)
     }
 
     fn capture_and_ocr(
@@ -1664,9 +2222,9 @@ impl OsDriver for LinuxDriver {
         window: Option<i32>,
         ocr_mode: OcrMode,
         encode_image: bool,
-        _options: &ImageEncodeOptions,
+        options: &ImageEncodeOptions,
     ) -> Result<CaptureResult, DriverError> {
-        native::capture_and_ocr(bundle_id, window, ocr_mode, encode_image)
+        native::capture_and_ocr(bundle_id, window, ocr_mode, encode_image, options)
     }
 
     fn render_som_image(
@@ -1674,9 +2232,16 @@ impl OsDriver for LinuxDriver {
         image_b64: &str,
         marks_json: &str,
         win_frame: &Rect,
-        _options: &ImageEncodeOptions,
+        options: &ImageEncodeOptions,
     ) -> Result<String, DriverError> {
-        render_som_rgba_to_b64(image_b64, marks_json, win_frame)
+        render_som_image_to_b64(
+            image_b64,
+            marks_json,
+            win_frame,
+            options.format,
+            options.quality,
+            options.max_width,
+        )
     }
 
     fn perform_action(&self, req: &ActionRequest) -> Result<ActionResult, DriverError> {
@@ -1744,9 +2309,16 @@ impl OsDriver for LinuxDriver {
         image_b64: &str,
         marks_json: &str,
         win_frame: &Rect,
-        _options: &ImageEncodeOptions,
+        options: &ImageEncodeOptions,
     ) -> Result<String, DriverError> {
-        render_som_rgba_to_b64(image_b64, marks_json, win_frame)
+        render_som_image_to_b64(
+            image_b64,
+            marks_json,
+            win_frame,
+            options.format,
+            options.quality,
+            options.max_width,
+        )
     }
 
     fn perform_action(&self, _req: &ActionRequest) -> Result<ActionResult, DriverError> {
@@ -1757,6 +2329,7 @@ impl OsDriver for LinuxDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ImageFormat;
 
     #[test]
     fn extracts_x11_bgrx_and_parses_atspi_json() {
@@ -1791,5 +2364,108 @@ mod tests {
         assert_eq!(map_x11_keysym_name("enter"), Some("Return"));
         assert_eq!(map_x11_keysym_name("/"), Some("slash"));
         assert_eq!(map_x11_keysym_name("pagedown"), Some("Next"));
+    }
+
+    #[test]
+    fn atspi_helper_embeds_set_value_select_text_and_password_guards() {
+        let py = atspi_helper_source();
+        assert!(py.contains("set_value"));
+        assert!(py.contains("set_text_contents"));
+        assert!(py.contains("ROLE_PASSWORD_TEXT"));
+        assert!(py.contains("target_identity_unverified"));
+        assert!(py.contains("select_text"));
+        assert!(py.contains("set_selection"));
+        assert!(py.contains("select_text_failed"));
+
+        assert_eq!(
+            parse_atspi_action_response(r#"{"ok":true,"method":"atspi_set_value"}"#),
+            AtspiActionOutcome::Success("atspi_set_value".into())
+        );
+        assert_eq!(
+            parse_atspi_action_response(
+                r#"{"ok":false,"code":"target_identity_unverified","message":"Not editable"}"#
+            ),
+            AtspiActionOutcome::Error {
+                code: "target_identity_unverified".into(),
+                message: "Not editable".into(),
+            }
+        );
+        assert_eq!(
+            parse_atspi_action_response(
+                r#"{"ok":false,"code":"unsafe_target_field","message":"Password"}"#
+            ),
+            AtspiActionOutcome::Error {
+                code: "unsafe_target_field".into(),
+                message: "Password".into(),
+            }
+        );
+        assert_eq!(
+            parse_atspi_action_response(
+                r#"{"ok":false,"code":"needs_fallback","editable":true,"is_web":true}"#
+            ),
+            AtspiActionOutcome::FallbackRequired
+        );
+        assert_eq!(
+            parse_atspi_action_response(r#"{"ok":false}"#),
+            AtspiActionOutcome::Error {
+                code: "target_identity_unverified".into(),
+                message: "AT-SPI verification failed".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn fast_typing_args_remove_delay_2_and_honor_zero_delay() {
+        assert_eq!(
+            build_xdotool_type_args("hello", 0),
+            vec!["type", "--clearmodifiers", "--delay", "0", "--", "hello"]
+        );
+        assert_eq!(
+            build_xdotool_type_args("hello", 500),
+            vec!["type", "--clearmodifiers", "--delay", "0", "--", "hello"]
+        );
+        assert_eq!(
+            build_xdotool_type_args("hello", 5000),
+            vec!["type", "--clearmodifiers", "--delay", "5", "--", "hello"]
+        );
+    }
+
+    #[test]
+    fn capture_downscale_jpeg_and_render_som_image_dispatch_properly() {
+        let w = 1600usize;
+        let h = 900usize;
+        let rgba = vec![96u8; w * h * 4];
+        let opts = ImageEncodeOptions {
+            format: ImageFormat::Jpeg,
+            quality: 80,
+            max_width: 800,
+        };
+        let (out_w, out_h, out_rgba, digest, b64) =
+            prepare_capture_frame(w, h, rgba, true, &opts);
+        assert_eq!((out_w, out_h), (800, 450));
+        assert_eq!(out_rgba.len(), 800 * 450 * 4);
+        assert_eq!(digest.len(), 128);
+        assert!(b64.starts_with("/9j/"));
+
+        let cap_id = crate::som_png::cache_rgba_frame("lin", 1600, 900, vec![64u8; 1600 * 900 * 4]);
+        let marks = r#"[{"id":"m1","source":"ax","x":20,"y":20,"w":80,"h":30}]"#;
+        let wf = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1600.0,
+            h: 900.0,
+        };
+        let som_opts = ImageEncodeOptions {
+            format: ImageFormat::Jpeg,
+            quality: 80,
+            max_width: 1280,
+        };
+        let som_b64 = LinuxDriver
+            .render_som_image(&cap_id, marks, &wf, &som_opts)
+            .unwrap();
+        assert!(
+            som_b64.starts_with("/9j/"),
+            "render_som_image should honor ImageFormat::Jpeg"
+        );
     }
 }

@@ -1,11 +1,10 @@
-#![cfg_attr(not(target_os = "windows"), allow(dead_code, unused_imports))]
-
 use super::{
     ActionRequest, ActionResult, AppSnapshot, CaptureResult, DoctorStatus, DriverError,
     ImageEncodeOptions, OcrBox, OcrMode, OsDriver, Rect, RunningApp, WindowState,
 };
-use crate::config::ImageFormat;
-use crate::som_png::render_som_rgba_to_b64;
+use crate::som_png::{
+    compute_pixel_digest, downscale_rgba, encode_rgba_image_b64, render_som_image_to_b64,
+};
 
 /// Maps Microsoft UI Automation `UIA_ControlTypeId` (50000..=50040) to ApexUse role strings.
 pub fn uia_control_type_name(ctrl_type: i32) -> &'static str {
@@ -212,14 +211,144 @@ pub fn build_cursor_argb_bitmap(size: usize, is_click: bool) -> Vec<u32> {
     pixels
 }
 
+pub const MAX_UNICODE_BATCH_INPUTS: usize = 32;
+pub const WIN_KEYEVENTF_KEYUP: u32 = 0x0002;
+pub const WIN_KEYEVENTF_UNICODE: u32 = 0x0004;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WinKeyInputStep {
+    pub vk: u16,
+    pub scan: u16,
+    pub flags: u32,
+}
+
+pub fn effective_key_delay_us(key_delay_us: u64) -> u64 {
+    key_delay_us
+}
+
+/// Splits `text` into batches of at most `MAX_UNICODE_BATCH_INPUTS` `INPUT` entries
+/// without ever splitting a UTF-16 surrogate pair across batch boundaries.
+pub fn build_unicode_input_batches(text: &str) -> Vec<Vec<WinKeyInputStep>> {
+    let mut batches: Vec<Vec<WinKeyInputStep>> = Vec::new();
+    let mut current: Vec<WinKeyInputStep> = Vec::with_capacity(MAX_UNICODE_BATCH_INPUTS);
+
+    for ch in text.chars() {
+        if ch == '\r' {
+            continue;
+        }
+        let mut buf = [0u16; 2];
+        let mut char_steps = [WinKeyInputStep {
+            vk: 0,
+            scan: 0,
+            flags: 0,
+        }; 4];
+        let step_count = match ch {
+            '\n' => {
+                char_steps[0] = WinKeyInputStep {
+                    vk: 0x0D,
+                    scan: 0,
+                    flags: 0,
+                };
+                char_steps[1] = WinKeyInputStep {
+                    vk: 0x0D,
+                    scan: 0,
+                    flags: WIN_KEYEVENTF_KEYUP,
+                };
+                2
+            }
+            '\t' => {
+                char_steps[0] = WinKeyInputStep {
+                    vk: 0x09,
+                    scan: 0,
+                    flags: 0,
+                };
+                char_steps[1] = WinKeyInputStep {
+                    vk: 0x09,
+                    scan: 0,
+                    flags: WIN_KEYEVENTF_KEYUP,
+                };
+                2
+            }
+            _ => {
+                let units = ch.encode_utf16(&mut buf);
+                let mut idx = 0usize;
+                for &mut code in units {
+                    char_steps[idx] = WinKeyInputStep {
+                        vk: 0,
+                        scan: code,
+                        flags: WIN_KEYEVENTF_UNICODE,
+                    };
+                    char_steps[idx + 1] = WinKeyInputStep {
+                        vk: 0,
+                        scan: code,
+                        flags: WIN_KEYEVENTF_UNICODE | WIN_KEYEVENTF_KEYUP,
+                    };
+                    idx += 2;
+                }
+                idx
+            }
+        };
+
+        if current.len() + step_count > MAX_UNICODE_BATCH_INPUTS && !current.is_empty() {
+            batches.push(std::mem::take(&mut current));
+        }
+        current.extend_from_slice(&char_steps[..step_count]);
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Allows `Ctrl+A` fallback ONLY when `start` & `end` are omitted (or `0..None`),
+/// or when an exact full-range selection `[0, text_len]` was requested.
+pub fn can_use_select_all_fallback(
+    start: Option<usize>,
+    end: Option<usize>,
+    text_len: Option<usize>,
+) -> bool {
+    match (start, end) {
+        (None, None) => true,
+        (Some(0), None) => true,
+        (s, Some(e)) if s.unwrap_or(0) == 0 => text_len.map(|len| e == len).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Proportionally downscales captured RGBA pixels if `options.max_width > 0` and
+/// computes digest + PNG/JPEG base64 using shared `som_png` helpers.
+pub fn prepare_capture_frame(
+    raw_w: usize,
+    raw_h: usize,
+    raw_rgba: Vec<u8>,
+    encode_image: bool,
+    options: &ImageEncodeOptions,
+) -> (usize, usize, Vec<u8>, String, String) {
+    let (w, h, rgba) = if options.max_width > 0 && raw_w > options.max_width {
+        downscale_rgba(&raw_rgba, raw_w, raw_h, options.max_width)
+    } else {
+        (raw_w, raw_h, raw_rgba)
+    };
+    let pixel_digest = compute_pixel_digest(w, h, &rgba);
+    let image_base64 = if encode_image {
+        encode_rgba_image_b64(w, h, &rgba, options.format, options.quality)
+    } else {
+        String::new()
+    };
+    (w, h, rgba, pixel_digest, image_base64)
+}
+
 pub struct WindowsDriver;
 
 #[cfg(target_os = "windows")]
 mod native {
     use super::*;
-    use crate::driver::common::{alias_candidates, app_matches, build_snapshot_from_raw, RawElement};
+    use crate::driver::common::{
+        alias_candidates, app_matches, build_snapshot_from_raw, is_editable_role, RawElement,
+    };
     use crate::driver::WindowMeta;
-    use crate::som_png::{cache_rgba_frame, compute_pixel_digest, encode_rgba_png_b64};
+    use crate::som_png::cache_rgba_frame;
     use std::ffi::c_void;
     use std::mem::{size_of, zeroed};
     use std::ptr::{null, null_mut};
@@ -266,11 +395,19 @@ mod native {
     const MOUSEEVENTF_VIRTUALDESK: Dword = 0x4000;
     const MOUSEEVENTF_ABSOLUTE: Dword = 0x8000;
 
-    const KEYEVENTF_KEYUP: Dword = 0x0002;
-    const KEYEVENTF_UNICODE: Dword = 0x0004;
+    const KEYEVENTF_KEYUP: Dword = WIN_KEYEVENTF_KEYUP;
 
     const UIA_INVOKE_PATTERN_ID: i32 = 10000;
     const UIA_VALUE_PATTERN_ID: i32 = 10002;
+    const UIA_TEXT_PATTERN_ID: i32 = 10014;
+    const UIA_CONTROL_TYPE_COMBOBOX: i32 = 50003;
+    const UIA_CONTROL_TYPE_EDIT: i32 = 50004;
+    const UIA_CONTROL_TYPE_SPINNER: i32 = 50016;
+    const UIA_CONTROL_TYPE_DOCUMENT: i32 = 50030;
+    const UIA_CONTROL_TYPE_WINDOW: i32 = 50032;
+    const TEXT_ENDPOINT_START: i32 = 0;
+    const TEXT_ENDPOINT_END: i32 = 1;
+    const TEXT_UNIT_CHARACTER: i32 = 0;
 
     const WS_POPUP: Dword = 0x80000000;
     const WS_EX_TOPMOST: Dword = 0x00000008;
@@ -547,7 +684,75 @@ mod native {
         base: IUnknownVtbl,
         set_value: unsafe extern "system" fn(*mut IUIAutomationValuePattern, Bstr) -> HResult,
         get_current_value: unsafe extern "system" fn(*mut IUIAutomationValuePattern, *mut Bstr) -> HResult,
-        get_current_is_read_only: *const c_void,
+        get_current_is_read_only: unsafe extern "system" fn(*mut IUIAutomationValuePattern, *mut Bool) -> HResult,
+    }
+
+    #[repr(C)]
+    struct IUIAutomationTextPattern {
+        vtbl: *const IUIAutomationTextPatternVtbl,
+    }
+
+    #[repr(C)]
+    struct IUIAutomationTextPatternVtbl {
+        base: IUnknownVtbl,
+        range_from_point: *const c_void,
+        range_from_child: *const c_void,
+        get_selection: *const c_void,
+        get_visible_ranges: *const c_void,
+        get_document_range: unsafe extern "system" fn(
+            *mut IUIAutomationTextPattern,
+            *mut *mut IUIAutomationTextRange,
+        ) -> HResult,
+        get_supported_text_selection: unsafe extern "system" fn(
+            *mut IUIAutomationTextPattern,
+            *mut i32,
+        ) -> HResult,
+    }
+
+    #[repr(C)]
+    struct IUIAutomationTextRange {
+        vtbl: *const IUIAutomationTextRangeVtbl,
+    }
+
+    #[repr(C)]
+    struct IUIAutomationTextRangeVtbl {
+        base: IUnknownVtbl,
+        clone: unsafe extern "system" fn(
+            *mut IUIAutomationTextRange,
+            *mut *mut IUIAutomationTextRange,
+        ) -> HResult,
+        compare: *const c_void,
+        compare_endpoints: *const c_void,
+        expand_to_enclosing_unit: *const c_void,
+        find_attribute: *const c_void,
+        find_text: *const c_void,
+        get_attribute_value: *const c_void,
+        get_bounding_rectangles: *const c_void,
+        get_enclosing_element: *const c_void,
+        get_text: unsafe extern "system" fn(
+            *mut IUIAutomationTextRange,
+            i32,
+            *mut Bstr,
+        ) -> HResult,
+        move_unit: *const c_void,
+        move_endpoint_by_unit: unsafe extern "system" fn(
+            *mut IUIAutomationTextRange,
+            i32,
+            i32,
+            i32,
+            *mut i32,
+        ) -> HResult,
+        move_endpoint_by_range: unsafe extern "system" fn(
+            *mut IUIAutomationTextRange,
+            i32,
+            *mut IUIAutomationTextRange,
+            i32,
+        ) -> HResult,
+        select: unsafe extern "system" fn(*mut IUIAutomationTextRange) -> HResult,
+        add_to_selection: *const c_void,
+        remove_from_selection: *const c_void,
+        scroll_into_view: *const c_void,
+        get_children: *const c_void,
     }
 
     #[link(name = "kernel32")]
@@ -1336,11 +1541,102 @@ foreach ($line in $res.Lines) {
         }
     }
 
+    pub fn window_state(bundle_id: &str) -> Result<WindowState, DriverError> {
+        init_dpi_and_com();
+        let fg_hwnd = unsafe { GetForegroundWindow() };
+        let mut fg_pid: Dword = 0;
+        if !fg_hwnd.is_null() {
+            unsafe {
+                let _ = GetWindowThreadProcessId(fg_hwnd, &mut fg_pid);
+            }
+        }
+        let fg_exe = if fg_pid != 0 {
+            get_process_exe_name(fg_pid)
+        } else {
+            String::new()
+        };
+        let fg_rect = if !fg_hwnd.is_null() {
+            window_bounds(fg_hwnd)
+        } else {
+            None
+        };
+        let all = visible_windows();
+
+        if bundle_id.eq_ignore_ascii_case("desktop") {
+            let active_win = all.iter().find(|w| w.active).or_else(|| all.first());
+            let frontmost = if !fg_exe.is_empty() {
+                fg_exe
+            } else {
+                active_win.map(|w| w.exe_name.clone()).unwrap_or_default()
+            };
+            let pid = if fg_pid != 0 {
+                fg_pid as i64
+            } else {
+                active_win.map(|w| w.pid as i64).unwrap_or(0)
+            };
+            let active_frame = fg_rect
+                .or_else(|| active_win.map(|w| w.rect.clone()))
+                .or_else(|| {
+                    let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) } as f64;
+                    let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) } as f64;
+                    let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1) as f64;
+                    let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1) as f64;
+                    Some(Rect {
+                        x: vx,
+                        y: vy,
+                        w: vw,
+                        h: vh,
+                    })
+                });
+            let windows_total = all.len().max(if active_frame.is_some() && fg_pid != 0 { 1 } else { 0 });
+            return Ok(WindowState {
+                frontmost_bundle_id: frontmost,
+                pid,
+                windows_total,
+                active_window_frame: active_frame,
+            });
+        }
+
+        let matched: Vec<WinInfo> = all
+            .iter()
+            .filter(|w| app_matches(bundle_id, &w.exe_name, None, Some(&w.title), w.pid as i64))
+            .cloned()
+            .collect();
+        if matched.is_empty() {
+            return Err(DriverError::new(
+                "app_not_running",
+                format!("No visible Windows window matching '{bundle_id}'"),
+            ));
+        }
+        let active_match = matched.iter().find(|w| w.active);
+        let primary = active_match.unwrap_or_else(|| {
+            matched
+                .iter()
+                .max_by(|a, b| (a.rect.w * a.rect.h).total_cmp(&(b.rect.w * b.rect.h)))
+                .unwrap()
+        });
+        let frontmost = if !fg_exe.is_empty() {
+            fg_exe
+        } else {
+            all.iter()
+                .find(|w| w.active)
+                .map(|w| w.exe_name.clone())
+                .unwrap_or_else(|| primary.exe_name.clone())
+        };
+        Ok(WindowState {
+            frontmost_bundle_id: frontmost,
+            pid: primary.pid as i64,
+            windows_total: matched.len(),
+            active_window_frame: Some(primary.rect.clone()),
+        })
+    }
+
     pub fn capture_and_ocr(
         bundle_id: &str,
         window: Option<i32>,
         ocr_mode: OcrMode,
-        encode_png: bool,
+        encode_image: bool,
+        options: &ImageEncodeOptions,
     ) -> Result<CaptureResult, DriverError> {
         let is_desktop = bundle_id.eq_ignore_ascii_case("desktop");
         let (target_hwnd, win_frame, out_bundle, front_bundle, pid, wid) = if is_desktop && window.is_none() {
@@ -1384,18 +1680,14 @@ foreach ($line in $res.Lines) {
             )
         };
 
-        let (w, h, rgba) = capture_rect_rgba(target_hwnd, &win_frame)?;
-        let pixel_digest = compute_pixel_digest(w, h, &rgba);
+        let (raw_w, raw_h, raw_rgba) = capture_rect_rgba(target_hwnd, &win_frame)?;
         let ocr_boxes = if ocr_mode == OcrMode::Off {
             Vec::new()
         } else {
-            run_winrt_ocr(w, h, &rgba, win_frame.x, win_frame.y)
+            run_winrt_ocr(raw_w, raw_h, &raw_rgba, win_frame.x, win_frame.y)
         };
-        let png_base64 = if encode_png {
-            encode_rgba_png_b64(w, h, &rgba)
-        } else {
-            String::new()
-        };
+        let (w, h, rgba, pixel_digest, image_base64) =
+            prepare_capture_frame(raw_w, raw_h, raw_rgba, encode_image, options);
         let capture_id = cache_rgba_frame("win", w, h, rgba);
 
         Ok(CaptureResult {
@@ -1408,9 +1700,9 @@ foreach ($line in $res.Lines) {
             window_frame: win_frame,
             image_width: w,
             image_height: h,
-            image_format: ImageFormat::Png,
-            image_base64: png_base64.clone(),
-            png_base64,
+            image_format: options.format,
+            image_base64: image_base64.clone(),
+            png_base64: image_base64,
             ocr_boxes,
         })
     }
@@ -1612,53 +1904,334 @@ foreach ($line in $res.Lines) {
         }
     }
 
-    fn push_vk_tap(inputs: &mut Vec<Input>, vk: u16) {
-        inputs.push(Input {
-            r#type: INPUT_KEYBOARD,
-            u: InputUnion {
-                ki: KeybdInput { w_vk: vk, w_scan: 0, dw_flags: 0, time: 0, dw_extra_info: 0 },
-            },
-        });
-        inputs.push(Input {
-            r#type: INPUT_KEYBOARD,
-            u: InputUnion {
-                ki: KeybdInput { w_vk: vk, w_scan: 0, dw_flags: KEYEVENTF_KEYUP, time: 0, dw_extra_info: 0 },
-            },
-        });
+    fn send_unicode_text_batched(text: &str, key_delay_us: u64) {
+        let batches = build_unicode_input_batches(text);
+        let delay_us = effective_key_delay_us(key_delay_us);
+        for (idx, batch) in batches.iter().enumerate() {
+            let mut inputs = Vec::with_capacity(batch.len());
+            for step in batch {
+                inputs.push(Input {
+                    r#type: INPUT_KEYBOARD,
+                    u: InputUnion {
+                        ki: KeybdInput {
+                            w_vk: step.vk,
+                            w_scan: step.scan,
+                            dw_flags: step.flags,
+                            time: 0,
+                            dw_extra_info: 0,
+                        },
+                    },
+                });
+            }
+            if !inputs.is_empty() {
+                unsafe {
+                    SendInput(
+                        inputs.len() as Dword,
+                        inputs.as_ptr(),
+                        size_of::<Input>() as i32,
+                    );
+                }
+            }
+            if delay_us > 0 && idx + 1 < batches.len() {
+                std::thread::sleep(Duration::from_micros(delay_us));
+            }
+        }
     }
 
-    fn send_unicode_text(text: &str) {
-        let utf16: Vec<u16> = text.encode_utf16().collect();
-        let mut inputs = Vec::with_capacity(utf16.len() * 2);
-        for code in utf16 {
-            if code == b'\r' as u16 {
-                continue;
-            }
-            if code == b'\n' as u16 {
-                push_vk_tap(&mut inputs, 0x0D);
-                continue;
-            }
-            if code == b'\t' as u16 {
-                push_vk_tap(&mut inputs, 0x09);
-                continue;
-            }
-            inputs.push(Input {
-                r#type: INPUT_KEYBOARD,
-                u: InputUnion {
-                    ki: KeybdInput { w_vk: 0, w_scan: code, dw_flags: KEYEVENTF_UNICODE, time: 0, dw_extra_info: 0 },
-                },
-            });
-            inputs.push(Input {
-                r#type: INPUT_KEYBOARD,
-                u: InputUnion {
-                    ki: KeybdInput { w_vk: 0, w_scan: code, dw_flags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, time: 0, dw_extra_info: 0 },
-                },
-            });
+    fn click_point_raw(x: f64, y: f64) {
+        send_mouse_abs(x, y, MOUSEEVENTF_MOVE, 0);
+        send_mouse_abs(x, y, MOUSEEVENTF_LEFTDOWN, 0);
+        send_mouse_abs(x, y, MOUSEEVENTF_LEFTUP, 0);
+        std::thread::sleep(Duration::from_millis(35));
+    }
+
+    fn send_ctrl_a() {
+        send_vk(0x11, false); // VK_CONTROL
+        send_vk(b'A' as u16, false);
+        send_vk(b'A' as u16, true);
+        send_vk(0x11, true);
+    }
+
+    unsafe fn element_value_pattern_info(
+        el: *mut IUIAutomationElement,
+    ) -> (Option<ComPtr<IUIAutomationValuePattern>>, bool) {
+        let mut pat_ptr: *mut c_void = null_mut();
+        if ((*(*el).vtbl).get_current_pattern)(el, UIA_VALUE_PATTERN_ID, &mut pat_ptr) != S_OK
+            || pat_ptr.is_null()
+        {
+            return (None, false);
         }
-        if !inputs.is_empty() {
-            unsafe {
-                SendInput(inputs.len() as Dword, inputs.as_ptr(), size_of::<Input>() as i32);
+        let vpat = ComPtr(pat_ptr as *mut IUIAutomationValuePattern);
+        let mut is_ro: Bool = 0;
+        let ro_hr = ((*(*vpat.0).vtbl).get_current_is_read_only)(vpat.0, &mut is_ro);
+        let explicitly_read_only = ro_hr == S_OK && is_ro != 0;
+        (Some(vpat), explicitly_read_only)
+    }
+
+    unsafe fn check_editable_candidate(
+        el: *mut IUIAutomationElement,
+    ) -> Result<(bool, bool), DriverError> {
+        let mut is_pwd: Bool = 0;
+        let _ = ((*(*el).vtbl).get_current_is_password)(el, &mut is_pwd);
+        if is_pwd != 0 {
+            return Err(DriverError::new(
+                "unsafe_target_field",
+                "Target point is a password control",
+            ));
+        }
+        let mut ctrl_type: i32 = 0;
+        let _ = ((*(*el).vtbl).get_current_control_type)(el, &mut ctrl_type);
+        let role_editable = matches!(
+            ctrl_type,
+            UIA_CONTROL_TYPE_COMBOBOX
+                | UIA_CONTROL_TYPE_EDIT
+                | UIA_CONTROL_TYPE_SPINNER
+                | UIA_CONTROL_TYPE_DOCUMENT
+        ) || is_editable_role(uia_control_type_name(ctrl_type));
+        let (vpat, is_read_only) = element_value_pattern_info(el);
+        if is_read_only {
+            return Ok((false, true));
+        }
+        let has_writable_value = vpat.is_some();
+        Ok((role_editable || has_writable_value, false))
+    }
+
+    fn verify_editable_element_at(
+        x: f64,
+        y: f64,
+    ) -> Result<ComPtr<IUIAutomationElement>, DriverError> {
+        if !verify_point_safe(x, y)? {
+            return Err(DriverError::new(
+                "unsafe_target_field",
+                "Target point is a password control",
+            ));
+        }
+        let uia = create_uia().map_err(|_| {
+            DriverError::new(
+                "target_identity_unverified",
+                "UI Automation unavailable to verify target control",
+            )
+        })?;
+        let mut el_ptr: *mut IUIAutomationElement = null_mut();
+        let hr = unsafe {
+            ((*(*uia.0).vtbl).element_from_point)(
+                uia.0,
+                Point {
+                    x: x.round() as i32,
+                    y: y.round() as i32,
+                },
+                &mut el_ptr,
+            )
+        };
+        if hr != S_OK || el_ptr.is_null() {
+            return Err(DriverError::new(
+                "target_identity_unverified",
+                "No UIA element verified at target coordinates",
+            ));
+        }
+        let el = ComPtr(el_ptr);
+        let (direct_ok, direct_ro) = unsafe { check_editable_candidate(el.0)? };
+        if direct_ro {
+            return Err(DriverError::new(
+                "target_identity_unverified",
+                "Target control is read-only",
+            ));
+        }
+        if direct_ok {
+            return Ok(el);
+        }
+
+        // Check up to 2 enclosing ancestors in case hit landed on a text leaf inside an editable field.
+        let mut walker_ptr: *mut IUIAutomationTreeWalker = null_mut();
+        if unsafe { ((*(*uia.0).vtbl).get_control_view_walker)(uia.0, &mut walker_ptr) } == S_OK
+            && !walker_ptr.is_null()
+        {
+            let walker = ComPtr(walker_ptr);
+            let mut holders: Vec<ComPtr<IUIAutomationElement>> = Vec::with_capacity(2);
+            let mut cur_ptr = el.0;
+            for _ in 0..2 {
+                let mut parent_ptr: *mut IUIAutomationElement = null_mut();
+                if unsafe {
+                    ((*(*walker.0).vtbl).get_parent_element)(walker.0, cur_ptr, &mut parent_ptr)
+                } != S_OK
+                    || parent_ptr.is_null()
+                {
+                    break;
+                }
+                let parent = ComPtr(parent_ptr);
+                let mut p_ctrl: i32 = 0;
+                let _ = unsafe { ((*(*parent.0).vtbl).get_current_control_type)(parent.0, &mut p_ctrl) };
+                if p_ctrl == UIA_CONTROL_TYPE_WINDOW {
+                    break;
+                }
+                let (p_ok, p_ro) = unsafe { check_editable_candidate(parent.0)? };
+                if p_ro {
+                    return Err(DriverError::new(
+                        "target_identity_unverified",
+                        "Target control is read-only",
+                    ));
+                }
+                if p_ok
+                    && matches!(
+                        p_ctrl,
+                        UIA_CONTROL_TYPE_COMBOBOX
+                            | UIA_CONTROL_TYPE_EDIT
+                            | UIA_CONTROL_TYPE_SPINNER
+                            | UIA_CONTROL_TYPE_DOCUMENT
+                    )
+                {
+                    return Ok(parent);
+                }
+                cur_ptr = parent.0;
+                holders.push(parent);
             }
+        }
+
+        Err(DriverError::new(
+            "target_identity_unverified",
+            "Target element is not an editable control",
+        ))
+    }
+
+    unsafe fn read_known_text_len(
+        el: *mut IUIAutomationElement,
+        tpat: Option<*mut IUIAutomationTextPattern>,
+    ) -> Option<usize> {
+        if let Some(tp) = tpat {
+            let mut doc_ptr: *mut IUIAutomationTextRange = null_mut();
+            if ((*(*tp).vtbl).get_document_range)(tp, &mut doc_ptr) == S_OK && !doc_ptr.is_null() {
+                let doc = ComPtr(doc_ptr);
+                let mut bstr: Bstr = null_mut();
+                if ((*(*doc.0).vtbl).get_text)(doc.0, -1, &mut bstr) == S_OK {
+                    let s = bstr_to_string_free(bstr);
+                    return Some(s.chars().count());
+                }
+            }
+        }
+        let (vpat, _) = element_value_pattern_info(el);
+        if let Some(vp) = vpat {
+            let mut val_bstr: Bstr = null_mut();
+            if ((*(*vp.0).vtbl).get_current_value)(vp.0, &mut val_bstr) == S_OK {
+                let s = bstr_to_string_free(val_bstr);
+                return Some(s.chars().count());
+            }
+        }
+        None
+    }
+
+    unsafe fn try_uia_select_text_range(
+        el: *mut IUIAutomationElement,
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Result<bool, Option<usize>> {
+        let mut pat_ptr: *mut c_void = null_mut();
+        if ((*(*el).vtbl).get_current_pattern)(el, UIA_TEXT_PATTERN_ID, &mut pat_ptr) != S_OK
+            || pat_ptr.is_null()
+        {
+            return Err(read_known_text_len(el, None));
+        }
+        let tpat = ComPtr(pat_ptr as *mut IUIAutomationTextPattern);
+        let mut supported: i32 = 1;
+        let sup_hr = ((*(*tpat.0).vtbl).get_supported_text_selection)(tpat.0, &mut supported);
+        if sup_hr == S_OK && supported == 0 {
+            return Err(read_known_text_len(el, Some(tpat.0)));
+        }
+        let known_len = read_known_text_len(el, Some(tpat.0));
+        let mut doc_ptr: *mut IUIAutomationTextRange = null_mut();
+        if ((*(*tpat.0).vtbl).get_document_range)(tpat.0, &mut doc_ptr) != S_OK || doc_ptr.is_null() {
+            return Err(known_len);
+        }
+        let doc = ComPtr(doc_ptr);
+
+        if start.unwrap_or(0) == 0 && end.is_none() {
+            if ((*(*doc.0).vtbl).select)(doc.0) == S_OK {
+                return Ok(true);
+            }
+            return Err(known_len);
+        }
+
+        let mut sel_ptr: *mut IUIAutomationTextRange = null_mut();
+        if ((*(*doc.0).vtbl).clone)(doc.0, &mut sel_ptr) != S_OK || sel_ptr.is_null() {
+            return Err(known_len);
+        }
+        let sel = ComPtr(sel_ptr);
+
+        let ok = match (known_len, end) {
+            (Some(total), _) => {
+                let s = start.unwrap_or(0).min(total);
+                let e = end.map(|v| v.max(s).min(total)).unwrap_or(total);
+                let mut moved: i32 = 0;
+                ((*(*sel.0).vtbl).move_endpoint_by_range)(
+                    sel.0,
+                    TEXT_ENDPOINT_END,
+                    doc.0,
+                    TEXT_ENDPOINT_START,
+                ) == S_OK
+                    && (e == 0
+                        || ((*(*sel.0).vtbl).move_endpoint_by_unit)(
+                            sel.0,
+                            TEXT_ENDPOINT_END,
+                            TEXT_UNIT_CHARACTER,
+                            e as i32,
+                            &mut moved,
+                        ) == S_OK)
+                    && (s == 0
+                        || ((*(*sel.0).vtbl).move_endpoint_by_unit)(
+                            sel.0,
+                            TEXT_ENDPOINT_START,
+                            TEXT_UNIT_CHARACTER,
+                            s as i32,
+                            &mut moved,
+                        ) == S_OK)
+                    && ((*(*sel.0).vtbl).select)(sel.0) == S_OK
+            }
+            (None, Some(ev)) => {
+                let s = start.unwrap_or(0);
+                let e = ev.max(s);
+                let mut moved: i32 = 0;
+                ((*(*sel.0).vtbl).move_endpoint_by_range)(
+                    sel.0,
+                    TEXT_ENDPOINT_END,
+                    doc.0,
+                    TEXT_ENDPOINT_START,
+                ) == S_OK
+                    && (e == 0
+                        || ((*(*sel.0).vtbl).move_endpoint_by_unit)(
+                            sel.0,
+                            TEXT_ENDPOINT_END,
+                            TEXT_UNIT_CHARACTER,
+                            e as i32,
+                            &mut moved,
+                        ) == S_OK)
+                    && (s == 0
+                        || ((*(*sel.0).vtbl).move_endpoint_by_unit)(
+                            sel.0,
+                            TEXT_ENDPOINT_START,
+                            TEXT_UNIT_CHARACTER,
+                            s as i32,
+                            &mut moved,
+                        ) == S_OK)
+                    && ((*(*sel.0).vtbl).select)(sel.0) == S_OK
+            }
+            (None, None) => {
+                let s = start.unwrap_or(0);
+                let mut moved: i32 = 0;
+                (s == 0
+                    || ((*(*sel.0).vtbl).move_endpoint_by_unit)(
+                        sel.0,
+                        TEXT_ENDPOINT_START,
+                        TEXT_UNIT_CHARACTER,
+                        s as i32,
+                        &mut moved,
+                    ) == S_OK)
+                    && ((*(*sel.0).vtbl).select)(sel.0) == S_OK
+            }
+        };
+
+        if ok {
+            Ok(true)
+        } else {
+            Err(known_len)
         }
     }
 
@@ -1780,7 +2353,7 @@ foreach ($line in $res.Lines) {
                 text,
                 mode,
                 click_first,
-                ..
+                key_delay_us,
             } => {
                 if !verify_point_safe(*x, *y)? {
                     return Err(DriverError::new("unsafe_target_field", "Target point is a password control"));
@@ -1792,10 +2365,7 @@ foreach ($line in $res.Lines) {
                     click: *click_first,
                 });
                 if *click_first {
-                    send_mouse_abs(*x, *y, MOUSEEVENTF_MOVE, 0);
-                    send_mouse_abs(*x, *y, MOUSEEVENTF_LEFTDOWN, 0);
-                    send_mouse_abs(*x, *y, MOUSEEVENTF_LEFTUP, 0);
-                    std::thread::sleep(Duration::from_millis(35));
+                    click_point_raw(*x, *y);
                 }
                 if mode == "replace" {
                     // Try native UIA ValuePattern first, fallback to Ctrl+A + Backspace.
@@ -1815,24 +2385,17 @@ foreach ($line in $res.Lines) {
                             && !el_ptr.is_null()
                         {
                             let el = ComPtr(el_ptr);
-                            let mut pat_ptr: *mut c_void = null_mut();
-                            if unsafe {
-                                ((*(*el.0).vtbl).get_current_pattern)(
-                                    el.0,
-                                    UIA_VALUE_PATTERN_ID,
-                                    &mut pat_ptr,
-                                )
-                            } == S_OK
-                                && !pat_ptr.is_null()
-                            {
-                                let vpat = ComPtr(pat_ptr as *mut IUIAutomationValuePattern);
-                                let w = to_wide(text);
-                                let b = unsafe { SysAllocString(w.as_ptr()) };
-                                if !b.is_null() {
-                                    if unsafe { ((*(*vpat.0).vtbl).set_value)(vpat.0, b) } == S_OK {
-                                        used_value = true;
+                            let (vpat, is_ro) = unsafe { element_value_pattern_info(el.0) };
+                            if !is_ro {
+                                if let Some(vp) = vpat {
+                                    let w = to_wide(text);
+                                    let b = unsafe { SysAllocString(w.as_ptr()) };
+                                    if !b.is_null() {
+                                        if unsafe { ((*(*vp.0).vtbl).set_value)(vp.0, b) } == S_OK {
+                                            used_value = true;
+                                        }
+                                        unsafe { SysFreeString(b) };
                                     }
-                                    unsafe { SysFreeString(b) };
                                 }
                             }
                         }
@@ -1842,15 +2405,12 @@ foreach ($line in $res.Lines) {
                             method: "windows_uia_value".into(),
                         });
                     }
-                    send_vk(0x11, false); // VK_CONTROL
-                    send_vk(b'A' as u16, false);
-                    send_vk(b'A' as u16, true);
-                    send_vk(0x11, true);
+                    send_ctrl_a();
                     send_vk(0x08, false);
                     send_vk(0x08, true);
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                send_unicode_text(text);
+                send_unicode_text_batched(text, *key_delay_us);
                 Ok(ActionResult {
                     method: "windows_type".into(),
                 })
@@ -1916,14 +2476,93 @@ foreach ($line in $res.Lines) {
                     method: "windows_scroll".into(),
                 })
             }
-            ActionRequest::SetValue { .. } => Err(DriverError::new(
-                "unsupported_on_platform",
-                "SetValue will be implemented in Task 4",
-            )),
-            ActionRequest::SelectText { .. } => Err(DriverError::new(
-                "unsupported_on_platform",
-                "SelectText will be implemented in Task 4",
-            )),
+            ActionRequest::SetValue {
+                bundle_id,
+                x,
+                y,
+                text,
+                key_delay_us,
+            } => {
+                let el = verify_editable_element_at(*x, *y)?;
+                let _ = activate_app(bundle_id);
+                let _ = cursor_sender().send(CursorMove {
+                    x: x.round() as i32,
+                    y: y.round() as i32,
+                    click: true,
+                });
+                unsafe {
+                    let _ = ((*(*el.0).vtbl).set_focus)(el.0);
+                }
+                let (vpat, is_ro) = unsafe { element_value_pattern_info(el.0) };
+                if is_ro {
+                    return Err(DriverError::new(
+                        "target_identity_unverified",
+                        "Target control is read-only",
+                    ));
+                }
+                if let Some(vp) = vpat {
+                    let w = to_wide(text);
+                    let b = unsafe { SysAllocString(w.as_ptr()) };
+                    if !b.is_null() {
+                        let ok = unsafe { ((*(*vp.0).vtbl).set_value)(vp.0, b) } == S_OK;
+                        unsafe { SysFreeString(b) };
+                        if ok {
+                            return Ok(ActionResult {
+                                method: "windows_uia_value".into(),
+                            });
+                        }
+                    }
+                }
+                click_point_raw(*x, *y);
+                send_ctrl_a();
+                send_vk(0x2E, false); // VK_DELETE
+                send_vk(0x2E, true);
+                std::thread::sleep(Duration::from_millis(20));
+                if !text.is_empty() {
+                    send_unicode_text_batched(text, *key_delay_us);
+                }
+                Ok(ActionResult {
+                    method: "windows_set_value_fallback".into(),
+                })
+            }
+            ActionRequest::SelectText {
+                bundle_id,
+                x,
+                y,
+                start,
+                end,
+            } => {
+                let el = verify_editable_element_at(*x, *y)?;
+                let _ = activate_app(bundle_id);
+                let _ = cursor_sender().send(CursorMove {
+                    x: x.round() as i32,
+                    y: y.round() as i32,
+                    click: true,
+                });
+                unsafe {
+                    let _ = ((*(*el.0).vtbl).set_focus)(el.0);
+                }
+                let known_len = match unsafe { try_uia_select_text_range(el.0, *start, *end) } {
+                    Ok(true) => {
+                        return Ok(ActionResult {
+                            method: "windows_uia_text_select".into(),
+                        });
+                    }
+                    Ok(false) => None,
+                    Err(len) => len,
+                };
+                if can_use_select_all_fallback(*start, *end, known_len) {
+                    click_point_raw(*x, *y);
+                    send_ctrl_a();
+                    return Ok(ActionResult {
+                        method: "windows_select_all_fallback".into(),
+                    });
+                }
+                Err(DriverError::new(
+                    "select_text_failed",
+                    "Partial range selection requires UIA TextPattern support",
+                ))
+            }
         }
     }
 }
@@ -1956,11 +2595,8 @@ impl OsDriver for WindowsDriver {
         native::inspect_app(bundle_id, window, max_elements, max_depth)
     }
 
-    fn window_state(&self, _bundle_id: &str) -> Result<WindowState, DriverError> {
-        Err(DriverError::new(
-            "unsupported_on_platform",
-            "window_state will be implemented in Task 4",
-        ))
+    fn window_state(&self, bundle_id: &str) -> Result<WindowState, DriverError> {
+        native::window_state(bundle_id)
     }
 
     fn capture_and_ocr(
@@ -1969,9 +2605,9 @@ impl OsDriver for WindowsDriver {
         window: Option<i32>,
         ocr_mode: OcrMode,
         encode_image: bool,
-        _options: &ImageEncodeOptions,
+        options: &ImageEncodeOptions,
     ) -> Result<CaptureResult, DriverError> {
-        native::capture_and_ocr(bundle_id, window, ocr_mode, encode_image)
+        native::capture_and_ocr(bundle_id, window, ocr_mode, encode_image, options)
     }
 
     fn render_som_image(
@@ -1979,9 +2615,16 @@ impl OsDriver for WindowsDriver {
         image_b64: &str,
         marks_json: &str,
         win_frame: &Rect,
-        _options: &ImageEncodeOptions,
+        options: &ImageEncodeOptions,
     ) -> Result<String, DriverError> {
-        render_som_rgba_to_b64(image_b64, marks_json, win_frame)
+        render_som_image_to_b64(
+            image_b64,
+            marks_json,
+            win_frame,
+            options.format,
+            options.quality,
+            options.max_width,
+        )
     }
 
     fn perform_action(&self, req: &ActionRequest) -> Result<ActionResult, DriverError> {
@@ -2057,9 +2700,16 @@ impl OsDriver for WindowsDriver {
         image_b64: &str,
         marks_json: &str,
         win_frame: &Rect,
-        _options: &ImageEncodeOptions,
+        options: &ImageEncodeOptions,
     ) -> Result<String, DriverError> {
-        render_som_rgba_to_b64(image_b64, marks_json, win_frame)
+        render_som_image_to_b64(
+            image_b64,
+            marks_json,
+            win_frame,
+            options.format,
+            options.quality,
+            options.max_width,
+        )
     }
 
     fn perform_action(&self, _req: &ActionRequest) -> Result<ActionResult, DriverError> {
@@ -2070,6 +2720,7 @@ impl OsDriver for WindowsDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ImageFormat;
 
     #[test]
     fn windows_key_role_and_virtual_desktop_mappings() {
@@ -2093,5 +2744,111 @@ mod tests {
         let bmp = build_cursor_argb_bitmap(64, true);
         assert_eq!(bmp.len(), 64 * 64);
         assert!(bmp.iter().any(|&p| (p >> 24) > 0));
+    }
+
+    #[test]
+    fn window_state_editable_roles_and_select_all_guard() {
+        use crate::driver::common::is_editable_role;
+
+        let ws = WindowState {
+            frontmost_bundle_id: "notepad.exe".into(),
+            pid: 4242,
+            windows_total: 2,
+            active_window_frame: Some(Rect {
+                x: 10.0,
+                y: 20.0,
+                w: 800.0,
+                h: 600.0,
+            }),
+        };
+        assert_eq!(ws.frontmost_bundle_id, "notepad.exe");
+        assert_eq!(ws.windows_total, 2);
+
+        assert!(is_editable_role(uia_control_type_name(50004)));
+        assert!(is_editable_role(uia_control_type_name(50030)));
+        assert!(is_editable_role(uia_control_type_name(50003)));
+        assert!(!is_editable_role(uia_control_type_name(50000)));
+        assert!(!is_editable_role(uia_control_type_name(50020)));
+
+        assert!(can_use_select_all_fallback(None, None, None));
+        assert!(can_use_select_all_fallback(Some(0), None, None));
+        assert!(can_use_select_all_fallback(Some(0), Some(10), Some(10)));
+        assert!(!can_use_select_all_fallback(Some(0), Some(5), Some(10)));
+        assert!(!can_use_select_all_fallback(Some(2), Some(10), Some(10)));
+        assert!(!can_use_select_all_fallback(Some(0), Some(10), None));
+        assert!(!can_use_select_all_fallback(None, Some(5), Some(10)));
+    }
+
+    #[test]
+    fn batched_utf16_inputs_never_split_surrogates_and_honor_zero_delay() {
+        assert_eq!(MAX_UNICODE_BATCH_INPUTS, 32);
+        assert_eq!(effective_key_delay_us(0), 0);
+        assert_eq!(effective_key_delay_us(250), 250);
+
+        // 15 BMP chars = 30 INPUTs; 16th char '🚀' needs 2 UTF-16 units = 4 INPUTs (would exceed 32).
+        let text = format!("{}🚀bc\n\t\r", "a".repeat(15));
+        let batches = build_unicode_input_batches(&text);
+        assert!(batches.len() >= 2);
+        assert_eq!(batches[0].len(), 30);
+        for batch in &batches {
+            assert!(batch.len() <= MAX_UNICODE_BATCH_INPUTS);
+            let mut i = 0;
+            while i < batch.len() {
+                let step = batch[i];
+                if (0xD800..=0xDBFF).contains(&step.scan) {
+                    // High surrogate down+up must be immediately followed by low surrogate down+up in the SAME batch.
+                    assert!(
+                        i + 3 < batch.len(),
+                        "surrogate pair split across batch boundary at index {i}"
+                    );
+                    assert_eq!(batch[i + 1].scan, step.scan);
+                    assert!((0xDC00..=0xDFFF).contains(&batch[i + 2].scan));
+                    assert_eq!(batch[i + 3].scan, batch[i + 2].scan);
+                    i += 4;
+                } else {
+                    i += 2;
+                }
+            }
+        }
+        assert!(build_unicode_input_batches("").is_empty());
+    }
+
+    #[test]
+    fn capture_downscale_jpeg_and_render_som_image_use_options() {
+        let w = 1600usize;
+        let h = 900usize;
+        let rgba = vec![80u8; w * h * 4];
+        let opts = ImageEncodeOptions {
+            format: ImageFormat::Jpeg,
+            quality: 75,
+            max_width: 800,
+        };
+        let (out_w, out_h, out_rgba, digest, b64) =
+            prepare_capture_frame(w, h, rgba, true, &opts);
+        assert_eq!((out_w, out_h), (800, 450));
+        assert_eq!(out_rgba.len(), 800 * 450 * 4);
+        assert_eq!(digest.len(), 128);
+        assert!(b64.starts_with("/9j/"));
+
+        let cap_id = crate::som_png::cache_rgba_frame("win", 1600, 900, vec![64u8; 1600 * 900 * 4]);
+        let marks = r#"[{"id":"m1","source":"ax","x":20,"y":20,"w":80,"h":30}]"#;
+        let wf = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1600.0,
+            h: 900.0,
+        };
+        let som_opts = ImageEncodeOptions {
+            format: ImageFormat::Jpeg,
+            quality: 80,
+            max_width: 1280,
+        };
+        let som_b64 = WindowsDriver
+            .render_som_image(&cap_id, marks, &wf, &som_opts)
+            .unwrap();
+        assert!(
+            som_b64.starts_with("/9j/"),
+            "render_som_image should honor ImageFormat::Jpeg"
+        );
     }
 }
