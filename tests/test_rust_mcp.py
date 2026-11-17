@@ -352,10 +352,17 @@ def test_rust_cli_subcommands_end_to_end(tmp_path):
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()
+    appdata = tmp_path / "appdata"
+    appdata.mkdir()
+    xdg_config = fake_home / ".config"
+    xdg_config.mkdir()
     state_dir = tmp_path / "state"
     env = dict(
         os.environ,
         HOME=str(fake_home),
+        USERPROFILE=str(fake_home),
+        APPDATA=str(appdata),
+        XDG_CONFIG_HOME=str(xdg_config),
         APEXUSE_STATE_DIR=str(state_dir),
         APEXUSE_POLICY=str(ROOT / "policy.autonomous.yaml"),
     )
