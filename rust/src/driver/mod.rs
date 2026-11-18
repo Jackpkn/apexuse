@@ -654,6 +654,9 @@ pub trait OsDriver: Send + Sync {
             "window_state is not supported on this platform",
         ))
     }
+    fn off_space_windows(&self, _bundle_id: &str) -> usize {
+        0
+    }
     fn capture_and_ocr(
         &self,
         bundle_id: &str,

@@ -48,6 +48,7 @@ fn common_action_argument_props() -> Vec<(&'static str, JsonValue)> {
         ("y2", type_schema("number")),
         ("include_bounds", include_bounds_schema()),
         ("return_state", return_state_schema()),
+        ("query", type_schema("string")),
         ("verify_mode", verify_mode_schema()),
         ("keep_snapshot", type_schema("boolean")),
         ("verify_change", type_schema("boolean")),
@@ -86,7 +87,6 @@ fn computer_argument_properties() -> JsonValue {
         ),
         ("inspect_after", type_schema("boolean")),
         ("diff", diff_schema()),
-        ("query", type_schema("string")),
         ("role", type_schema("string")),
         ("timeout_ms", type_schema("integer")),
         ("poll_ms", type_schema("integer")),
@@ -217,7 +217,7 @@ fn tool_defs() -> Vec<JsonValue> {
         ]),
         JsonValue::object(vec![
             ("name", JsonValue::String("computer".into())),
-            ("description", JsonValue::String("AX-first semantic & Set-of-Mark interaction: action=inspect (supports diff, include_bounds, window, query), click, double_click, right_click, hover (accepts ref, mark, target: {query, role?, fresh?}, or x/y after unfiltered snapshot), drag (from_ref/from_mark/x1,y1 -> to_ref/to_mark/x2,y2), type (ref, mark, or target), set_value (direct native text assignment/clearing on verified editable ref, mark, or target; text='' clears), select_text (optional start/end offsets on verified editable ref, mark, or target), press_key, scroll (direction, amount, optional target ref/mark/x,y), run_actions (up to 24 chained steps including inline wait_for, inspect, set_value, select_text, target, and per-step verify_mode/diff/include_bounds), wait_for (local AX/OCR poll up to 60s, optional window/role), or confirm (token). Pass return_state='diff'|'full' on actions & run_actions to capture updated AX state inline and keep refreshed refs live without extra inspect_app round-trips; pass verify_mode='ax' with verify_change=true to skip screenshots. Also supports keep_snapshot, max_retries (0..=3), settle_ms, poll_interval_ms, retry_delay_ms, and require_change.".into())),
+            ("description", JsonValue::String("AX-first semantic & Set-of-Mark interaction: action=inspect (supports diff, include_bounds, window, query), click, double_click, right_click, hover (accepts ref, mark, target: {query, role?, fresh?}, or x/y after unfiltered snapshot), drag (from_ref/from_mark/x1,y1 -> to_ref/to_mark/x2,y2), type (ref, mark, or target), set_value (direct native text assignment/clearing on verified editable ref, mark, or target; text='' clears), select_text (optional start/end offsets on verified editable ref, mark, or target), press_key, scroll (direction, amount, optional target ref/mark/x,y), run_actions (up to 24 chained steps including inline wait_for, inspect, set_value, select_text, target, and per-step verify_mode/diff/include_bounds), wait_for (local AX/OCR poll up to 60s, optional window/role), or confirm (token). Prefer return_state='diff' (plus optional query to scope returned lines while keeping refs live) over 'full' to minimize tokens, and batch multi-step flows with run_actions; pass verify_mode='ax' with verify_change=true to skip screenshots. Also supports keep_snapshot, max_retries (0..=3), settle_ms, poll_interval_ms, retry_delay_ms, and require_change.".into())),
             (
                 "inputSchema",
                 JsonValue::object(vec![
@@ -247,7 +247,7 @@ fn tool_defs() -> Vec<JsonValue> {
         ]),
         JsonValue::object(vec![
             ("name", JsonValue::String("desktop".into())),
-            ("description", JsonValue::String("Desktop-level operations: action=list_applications, launch_application, activate_application, open_url (instant http/https URL open in permitted browser/app), visual_click, double_click, right_click, hover, or drag (using mark, ref, target, or x/y coordinates). Supports return_state='none'|'diff'|'full' (eliminates extra inspect_app calls after activate/open_url/click), include_bounds, verify_change, verify_mode='auto'|'ax'|'visual' ('ax' skips screenshots), max_retries, settle_ms, poll_interval_ms, retry_delay_ms, and require_change.".into())),
+            ("description", JsonValue::String("Desktop-level operations: action=list_applications, launch_application, activate_application, open_url (instant http/https URL open in permitted browser/app), visual_click, double_click, right_click, hover, or drag (using mark, ref, target, or x/y coordinates). Supports return_state='none'|'diff'|'full' plus optional query (prefer 'diff' or scoped query over 'full' to minimize tokens and keep refs live), include_bounds, verify_change, verify_mode='auto'|'ax'|'visual' ('ax' skips screenshots), max_retries, settle_ms, poll_interval_ms, retry_delay_ms, and require_change.".into())),
             (
                 "inputSchema",
                 JsonValue::object(vec![
@@ -681,6 +681,7 @@ mod tests {
             .unwrap();
         for key in [
             "return_state",
+            "query",
             "verify_mode",
             "include_bounds",
             "window",

@@ -699,11 +699,9 @@ static void walk_ax_node(AXUIElementRef el, int depth, int maxDepth,
         valStr ? [valStr stringByTrimmingCharactersInSet:
                              [NSCharacterSet whitespaceAndNewlineCharacterSet]]
                : @"";
-    BOOL bigUnlabeledGroup =
+    BOOL unlabeledGroup =
         ([role isEqualToString:@"AXGroup"] && trimLabel.length == 0 &&
-         trimVal.length == 0 && hasFrame && !CGRectIsEmpty(windowClip) &&
-         (frame.size.width * frame.size.height) >
-             0.5 * (windowClip.size.width * windowClip.size.height));
+         trimVal.length == 0);
     BOOL isChromiumTab =
         (isChromium && [role isEqualToString:@"AXTab"] && trimLabel.length > 0);
     BOOL strongControl = is_interactive_role(role) || isChromiumTab ||
@@ -711,7 +709,7 @@ static void walk_ax_node(AXUIElementRef el, int depth, int maxDepth,
                           ![role isEqualToString:@"AXGroup"]) ||
                          [actions containsObject:@"AXOpen"];
     BOOL interactive =
-        !bigUnlabeledGroup &&
+        !unlabeledGroup &&
         (is_interactive_role(role) || isChromiumTab ||
          [actions containsObject:@"AXPress"] ||
          [actions containsObject:@"AXOpen"]);
@@ -1422,6 +1420,171 @@ char *apexuse_macos_list_apps(void) {
   return dup_json(@{@"ok" : @YES, @"apps" : apps});
 }
 
+static size_t count_offscreen_app_windows(pid_t pid) {
+  if (pid <= 0)
+    return 0;
+  CFArrayRef winList = CGWindowListCopyWindowInfo(
+      kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
+      kCGNullWindowID);
+  if (!winList)
+    return 0;
+  NSArray *arr = CFBridgingRelease(winList);
+  size_t count = 0;
+  for (NSDictionary *info in arr) {
+    pid_t winPid = (pid_t)[info[(id)kCGWindowOwnerPID] intValue];
+    if (winPid != pid)
+      continue;
+    int layer = [info[(id)kCGWindowLayer] intValue];
+    if (layer != 0)
+      continue;
+    CGRect f = CGRectZero;
+    if (CGRectMakeWithDictionaryRepresentation(
+            (__bridge CFDictionaryRef)info[(id)kCGWindowBounds], &f) &&
+        f.size.width > 50 && f.size.height > 50) {
+      count++;
+    }
+  }
+  return count;
+}
+
+static size_t ax_window_count(pid_t pid) {
+  if (pid <= 0 || !AXIsProcessTrusted())
+    return 0;
+  AXUIElementRef appEl = AXUIElementCreateApplication(pid);
+  id winsObj = ax_copy(appEl, kAXWindowsAttribute);
+  CFRelease(appEl);
+  return [winsObj isKindOfClass:[NSArray class]] ? ((NSArray *)winsObj).count : 0;
+}
+
+static BOOL press_matching_menu_item(AXUIElementRef menuEl,
+                                     NSArray<NSString *> *exactTitles,
+                                     BOOL allowMarkedItem) {
+  id childrenObj = ax_copy(menuEl, kAXChildrenAttribute);
+  if (![childrenObj isKindOfClass:[NSArray class]])
+    return NO;
+  for (id child in (NSArray *)childrenObj) {
+    AXUIElementRef cel = (__bridge AXUIElementRef)child;
+    NSString *role = ax_string(cel, kAXRoleAttribute);
+    if ([role isEqualToString:@"AXMenu"]) {
+      if (press_matching_menu_item(cel, exactTitles, allowMarkedItem))
+        return YES;
+      continue;
+    }
+    if (![role isEqualToString:@"AXMenuItem"])
+      continue;
+    NSNumber *enabled = ax_bool(cel, kAXEnabledAttribute);
+    if (enabled && !enabled.boolValue)
+      continue;
+    NSString *title =
+        [ax_string(cel, kAXTitleAttribute) ?: @""
+            stringByTrimmingCharactersInSet:[NSCharacterSet
+                                                whitespaceAndNewlineCharacterSet]];
+    BOOL titleMatch = NO;
+    for (NSString *target in exactTitles) {
+      if (target.length > 0 && [title caseInsensitiveCompare:target] == NSOrderedSame) {
+        titleMatch = YES;
+        break;
+      }
+    }
+    BOOL markMatch = NO;
+    if (!titleMatch && allowMarkedItem && title.length > 0) {
+      NSString *mark = ax_string(cel, kAXMenuItemMarkCharAttribute);
+      if (mark.length > 0)
+        markMatch = YES;
+    }
+    if ((titleMatch || markMatch) &&
+        AXUIElementPerformAction(cel, kAXPressAction) == kAXErrorSuccess) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
+static BOOL reopen_via_ax_menu(AXUIElementRef appEl, NSString *appName,
+                               BOOL hasOffSpaceWindows) {
+  id barObj = ax_copy(appEl, kAXMenuBarAttribute);
+  if (!barObj)
+    return NO;
+  id itemsObj = ax_copy((__bridge AXUIElementRef)barObj, kAXChildrenAttribute);
+  if (![itemsObj isKindOfClass:[NSArray class]])
+    return NO;
+  NSArray *items = (NSArray *)itemsObj;
+  NSArray<NSString *> *windowTargets =
+      appName.length > 0 ? @[ appName, @"Main Window", @"Chats" ]
+                         : @[ @"Main Window", @"Chats" ];
+
+  for (NSUInteger i = 1; i < items.count; i++) {
+    AXUIElementRef top = (__bridge AXUIElementRef)items[i];
+    NSString *topTitle = ax_string(top, kAXTitleAttribute) ?: @"";
+    if ([topTitle caseInsensitiveCompare:@"Window"] == NSOrderedSame) {
+      if (press_matching_menu_item(top, windowTargets, hasOffSpaceWindows))
+        return YES;
+    }
+  }
+  if (!hasOffSpaceWindows) {
+    for (NSUInteger i = 1; i < items.count; i++) {
+      AXUIElementRef top = (__bridge AXUIElementRef)items[i];
+      NSString *topTitle = ax_string(top, kAXTitleAttribute) ?: @"";
+      if ([topTitle caseInsensitiveCompare:@"File"] == NSOrderedSame) {
+        if (press_matching_menu_item(top, @[ @"New Window" ], NO))
+          return YES;
+      }
+    }
+  }
+  return NO;
+}
+
+static BOOL surface_app_windows(NSRunningApplication *app,
+                                BOOL allowMenuReopen,
+                                BOOL *outActivated) {
+  if (!app)
+    return NO;
+  if (app.isHidden) {
+    [app unhide];
+  }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  BOOL activated = [app activateWithOptions:NSApplicationActivateAllWindows |
+                                            NSApplicationActivateIgnoringOtherApps];
+#pragma clang diagnostic pop
+  if (outActivated)
+    *outActivated = activated;
+  if (!AXIsProcessTrusted())
+    return NO;
+  pid_t pid = app.processIdentifier;
+  AXUIElementRef appEl = AXUIElementCreateApplication(pid);
+  id winsObj = ax_copy(appEl, kAXWindowsAttribute);
+  NSArray *wins =
+      [winsObj isKindOfClass:[NSArray class]] ? (NSArray *)winsObj : @[];
+  BOOL nudged = NO;
+  if (wins.count > 0) {
+    BOOL anyVisible = NO;
+    AXUIElementRef firstMin = NULL;
+    for (id w in wins) {
+      AXUIElementRef wEl = (__bridge AXUIElementRef)w;
+      NSNumber *minVal = ax_bool(wEl, kAXMinimizedAttribute);
+      if (minVal && minVal.boolValue) {
+        if (!firstMin)
+          firstMin = wEl;
+      } else {
+        anyVisible = YES;
+        break;
+      }
+    }
+    if (!anyVisible && firstMin) {
+      AXUIElementSetAttributeValue(firstMin, kAXMinimizedAttribute,
+                                   kCFBooleanFalse);
+      AXUIElementPerformAction(firstMin, kAXRaiseAction);
+      nudged = YES;
+    }
+  } else if (allowMenuReopen) {
+    BOOL hasOffSpace = count_offscreen_app_windows(pid) > 0;
+    nudged = reopen_via_ax_menu(appEl, app.localizedName ?: @"", hasOffSpace);
+  }
+  CFRelease(appEl);
+  return nudged;
+}
+
 char *apexuse_macos_activate_app(const char *bundle_id) {
   if (!bundle_id)
     return dup_json(@{@"ok" : @NO, @"code" : @"invalid_argument"});
@@ -1429,10 +1592,13 @@ char *apexuse_macos_activate_app(const char *bundle_id) {
   NSRunningApplication *app = resolve_app(bid);
   if (!app)
     return dup_json(@{@"ok" : @NO, @"code" : @"app_not_running"});
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-  BOOL ok = [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
-#pragma clang diagnostic pop
+  BOOL ok = NO;
+  BOOL nudged = surface_app_windows(app, YES, &ok);
+  if (nudged) {
+    for (int i = 0; i < 8 && ax_window_count(app.processIdentifier) == 0; i++) {
+      usleep(50000);
+    }
+  }
   return dup_json(@{
     @"ok" : @(ok),
     @"pid" : @(app.processIdentifier),
@@ -1462,6 +1628,27 @@ char *apexuse_macos_launch_app(const char *bundle_id) {
       @"code" : @"launch_failed",
       @"message" : @"open exited nonzero"
     });
+  }
+  NSRunningApplication *app = resolve_app(bid);
+  for (int i = 0; i < 16 && !app; i++) {
+    usleep(50000);
+    app = resolve_app(bid);
+  }
+  if (app) {
+    for (int i = 0; i < 8 && ax_window_count(app.processIdentifier) == 0; i++) {
+      usleep(50000);
+    }
+    if (ax_window_count(app.processIdentifier) == 0) {
+      BOOL nudged = surface_app_windows(app, YES, NULL);
+      if (nudged) {
+        for (int i = 0; i < 12 && ax_window_count(app.processIdentifier) == 0;
+             i++) {
+          usleep(50000);
+        }
+      }
+    } else {
+      surface_app_windows(app, NO, NULL);
+    }
   }
   return dup_json(@{@"ok" : @YES, @"bundle_id" : bid});
 }
@@ -1557,6 +1744,12 @@ char *apexuse_macos_window_state(const char *bundle_id) {
     @"pid" : @(pid),
     @"windows_total" : @(totalWindows),
   }];
+  if (!isDesktop && totalWindows == 0 && pid > 0) {
+    size_t offSpace = count_offscreen_app_windows(pid);
+    if (offSpace > 0) {
+      res[@"off_space_windows"] = @(offSpace);
+    }
+  }
   if (haveActiveFrame) {
     res[@"active_window_frame"] = @{
       @"x" : @(activeFrame.origin.x),

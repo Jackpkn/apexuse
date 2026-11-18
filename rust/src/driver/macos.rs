@@ -352,6 +352,19 @@ impl OsDriver for MacosDriver {
         })
     }
 
+    fn off_space_windows(&self, bundle_id: &str) -> usize {
+        let Ok(c) = to_cstr(bundle_id) else {
+            return 0;
+        };
+        let Ok(val) = take_json(unsafe { apexuse_macos_window_state(c.as_ptr()) }) else {
+            return 0;
+        };
+        val.get("off_space_windows")
+            .and_then(|v| v.as_i64())
+            .filter(|&n| n > 0)
+            .unwrap_or(0) as usize
+    }
+
     fn capture_and_ocr(
         &self,
         bundle_id: &str,

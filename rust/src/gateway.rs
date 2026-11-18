@@ -55,6 +55,7 @@ struct ActionVerifyOptions {
     verify_change: bool,
     verify_mode: VerifyMode,
     return_state: ReturnStateMode,
+    return_query: Option<String>,
     include_bounds: Option<bool>,
     max_retries: u8,
     settle_ms: u64,
@@ -70,6 +71,7 @@ impl ActionVerifyOptions {
             verify_change: false,
             verify_mode: VerifyMode::Auto,
             return_state: ReturnStateMode::None,
+            return_query: None,
             include_bounds: None,
             max_retries: 0,
             settle_ms: timing.settle_ms,
@@ -534,12 +536,41 @@ impl Gateway {
         (result.content, result.mode.as_str(), snap)
     }
 
+    fn append_zero_window_hint(
+        &self,
+        bundle_id: &str,
+        windows_total: usize,
+        fields: &mut Vec<(&'static str, JsonValue)>,
+    ) {
+        if windows_total != 0 || bundle_id == "desktop" {
+            return;
+        }
+        let off_space = self.driver.off_space_windows(bundle_id);
+        if off_space > 0 {
+            fields.push(("off_space_windows", JsonValue::Number(off_space as f64)));
+            fields.push((
+                "window_hint",
+                JsonValue::String(format!(
+                    "{off_space} window(s) detected on another macOS Space/Desktop; try launch_application/activate_application or switch Space."
+                )),
+            ));
+        } else {
+            fields.push((
+                "window_hint",
+                JsonValue::String(
+                    "Application has 0 open windows on this Space; try launch_application.".into(),
+                ),
+            ));
+        }
+    }
+
     fn attach_post_action_state(
         &mut self,
         app: &str,
         window: Option<i32>,
         return_state: ReturnStateMode,
         include_bounds: bool,
+        query: Option<&str>,
         fields: &mut Vec<(&'static str, JsonValue)>,
     ) -> bool {
         if return_state == ReturnStateMode::None {
@@ -574,19 +605,36 @@ impl Gateway {
         }
         let raw_comparable = snap.comparable_text();
         let diff_enabled = return_state == ReturnStateMode::Diff;
-        let (content, state_mode, reconciled_snap) = self.finalize_ax_outline_and_baseline(
-            snap,
-            window,
-            None,
-            diff_enabled,
-            include_bounds,
-        );
+        let (content, state_mode, reconciled_snap) = if let Some(q) = query {
+            let (_, _, rec) = self.finalize_ax_outline_and_baseline(
+                snap,
+                window,
+                None,
+                diff_enabled,
+                include_bounds,
+            );
+            let filtered = rec.render_outline_with_options(Some(q), include_bounds);
+            (filtered, "filtered", rec)
+        } else {
+            self.finalize_ax_outline_and_baseline(
+                snap,
+                window,
+                None,
+                diff_enabled,
+                include_bounds,
+            )
+        };
         self.invalidate_snapshot();
-        self.record_snapshot_meta(&reconciled_snap, window, 150, 12, false);
+        self.record_snapshot_meta(&reconciled_snap, window, 150, 12, query.is_some());
         self.snapshot_comparable = Some(raw_comparable);
         fields.push(("content", JsonValue::String(content)));
         fields.push(("state_mode", JsonValue::String(state_mode.into())));
         fields.push(("snapshot_active", JsonValue::Bool(true)));
+        self.append_zero_window_hint(
+            &reconciled_snap.bundle_id,
+            reconciled_snap.windows_total,
+            fields,
+        );
         true
     }
 
@@ -677,16 +725,22 @@ impl Gateway {
             .map(|r| r.to_json())
             .collect();
 
-        ToolOutput::json(JsonValue::object(vec![
+        let mut out = vec![
             ("ok", JsonValue::Bool(true)),
-            ("app", JsonValue::String(reconciled_snap.bundle_id)),
+            ("app", JsonValue::String(reconciled_snap.bundle_id.clone())),
             ("frontmost_app", JsonValue::String(reconciled_snap.frontmost_bundle_id)),
             ("pid", JsonValue::Number(reconciled_snap.pid as f64)),
             ("windows_total", JsonValue::Number(reconciled_snap.windows_total as f64)),
             ("state_mode", JsonValue::String(state_mode.into())),
             ("content", JsonValue::String(content)),
             ("workflow_hints", JsonValue::Array(hints)),
-        ]))
+        ];
+        self.append_zero_window_hint(
+            &reconciled_snap.bundle_id,
+            reconciled_snap.windows_total,
+            &mut out,
+        );
+        ToolOutput::json(JsonValue::object(out))
     }
 
     fn validate_visual_snapshot(&self, target: &str, full: &AppSnapshot) -> Result<(), ToolOutput> {
@@ -1439,6 +1493,10 @@ impl Gateway {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
+                let return_query = match parse_optional_query(sub_args) {
+                    Ok(q) => q.map(str::to_string),
+                    Err(e) => return e,
+                };
                 if self.audit.record(action, "allow", "requested").is_err() {
                     return ToolOutput::json(err_json("audit_unavailable", "Audit log write failed"));
                 }
@@ -1462,6 +1520,7 @@ impl Gateway {
                                 None,
                                 return_state,
                                 eff_bounds,
+                                return_query.as_deref(),
                                 &mut fields,
                             );
                             fields.push(("snapshot_preserved", JsonValue::Bool(active)));
@@ -1504,6 +1563,10 @@ impl Gateway {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
+                let return_query = match parse_optional_query(sub_args) {
+                    Ok(q) => q.map(str::to_string),
+                    Err(e) => return e,
+                };
                 if self.audit.record("open_url", "allow", "requested").is_err() {
                     return ToolOutput::json(err_json("audit_unavailable", "Audit log write failed"));
                 }
@@ -1523,6 +1586,7 @@ impl Gateway {
                                 None,
                                 return_state,
                                 eff_bounds,
+                                return_query.as_deref(),
                                 &mut fields,
                             );
                             fields.push(("snapshot_preserved", JsonValue::Bool(active)));
@@ -2053,6 +2117,34 @@ impl Gateway {
         self.verify_points_with_identity(app, pts, &ExpectedPointTarget::Any)
     }
 
+    fn verify_probe_points(
+        &self,
+        app: &str,
+        pts: &[(f64, f64)],
+        expected: &ExpectedPointTarget,
+    ) -> Result<(), ToolOutput> {
+        for &(px, py) in pts {
+            match self.driver.probe_point_safe(app, px, py) {
+                Ok(probe) => {
+                    if !probe.safe {
+                        return Err(ToolOutput::json(err_json(
+                            "unsafe_target_field",
+                            "Target point became unsafe or left window bounds",
+                        )));
+                    }
+                    if !point_probe_matches_expected(&probe, expected) {
+                        return Err(ToolOutput::json(err_json(
+                            "stale_ref",
+                            "Target element changed or shifted before input; inspect again",
+                        )));
+                    }
+                }
+                Err(e) => return Err(ToolOutput::json(err_json(&e.code, &e.message))),
+            }
+        }
+        Ok(())
+    }
+
     fn verify_points_with_identity(
         &self,
         app: &str,
@@ -2078,26 +2170,136 @@ impl Gateway {
                 }
             }
         }
-        for &(px, py) in pts {
-            match self.driver.probe_point_safe(app, px, py) {
-                Ok(probe) => {
-                    if !probe.safe {
-                        return Err(ToolOutput::json(err_json(
-                            "unsafe_target_field",
-                            "Target point became unsafe or left window bounds",
-                        )));
-                    }
-                    if !point_probe_matches_expected(&probe, expected) {
-                        return Err(ToolOutput::json(err_json(
-                            "stale_ref",
-                            "Target element changed or shifted before input; inspect again",
-                        )));
-                    }
-                }
-                Err(e) => return Err(ToolOutput::json(err_json(&e.code, &e.message))),
+        self.verify_probe_points(app, pts, expected)
+    }
+
+    /// Re-inspects once when a ref target fails fast verification and relocates it
+    /// if a unique enabled element with identical `(role, label)` passes safety + point probing.
+    fn reconcile_stale_element(
+        &mut self,
+        app: &str,
+        orig: &UiElement,
+        expected: &ExpectedPointTarget,
+    ) -> Result<Option<UiElement>, ToolOutput> {
+        if orig.label.trim().is_empty() {
+            return Ok(None);
+        }
+        let fresh = self
+            .driver
+            .inspect_app(
+                app,
+                self.snapshot_window,
+                self.snapshot_max_elements,
+                self.snapshot_max_depth,
+            )
+            .map_err(|e| ToolOutput::json(err_json(&e.code, &e.message)))?;
+        if let Err(redaction) = self.check_ax_snapshot_safety(&fresh) {
+            return Err(redaction_to_error(redaction));
+        }
+        if !fresh.safety_scan_complete {
+            return Err(ToolOutput::json(err_json(
+                "unsafe_or_incomplete_tree",
+                "Safety scan incomplete or secure field detected",
+            )));
+        }
+
+        let window = self.snapshot_window;
+        let max_elements = self.snapshot_max_elements;
+        let max_depth = self.snapshot_max_depth;
+        let was_filtered = self.snapshot_filtered;
+        let raw_comparable = fresh.comparable_text();
+
+        let mut matches: Vec<&UiElement> = fresh
+            .elements
+            .iter()
+            .filter(|el| {
+                el.enabled != Some(false)
+                    && el.frame.is_some()
+                    && el.role == orig.role
+                    && el.label == orig.label
+            })
+            .collect();
+        if matches.len() > 1 {
+            let win_matches: Vec<&UiElement> = matches
+                .iter()
+                .copied()
+                .filter(|el| el.window == orig.window)
+                .collect();
+            if win_matches.len() == 1 {
+                matches = win_matches;
             }
         }
-        Ok(())
+        if matches.len() != 1 {
+            return Ok(None);
+        }
+        let relocated_raw = matches[0].clone();
+        let Some(ref rf) = relocated_raw.frame else {
+            return Ok(None);
+        };
+        let nx = rf.x + rf.w * 0.5;
+        let ny = rf.y + rf.h * 0.5;
+
+        if let Ok(ws) = self.driver.window_state(&fresh.bundle_id) {
+            if ws.pid != fresh.pid || ws.windows_total > fresh.windows_total {
+                return Ok(None);
+            }
+        }
+        if let Err(e) = self.verify_probe_points(&fresh.bundle_id, &[(nx, ny)], expected) {
+            if e.payload.get("code").and_then(|v| v.as_str()) == Some("stale_ref") {
+                return Ok(None);
+            }
+            return Err(e);
+        }
+
+        let (_, _, reconciled_snap) =
+            self.finalize_ax_outline_and_baseline(fresh, window, None, true, false);
+        let relocated = reconciled_snap
+            .elements
+            .iter()
+            .find(|el| {
+                el.enabled != Some(false)
+                    && el.frame == relocated_raw.frame
+                    && el.role == orig.role
+                    && el.label == orig.label
+            })
+            .cloned()
+            .unwrap_or(relocated_raw);
+
+        self.invalidate_snapshot();
+        self.record_snapshot_meta(
+            &reconciled_snap,
+            window,
+            max_elements,
+            max_depth,
+            was_filtered,
+        );
+        self.snapshot_comparable = Some(raw_comparable);
+        Ok(Some(relocated))
+    }
+
+    fn verify_or_reconcile_points(
+        &mut self,
+        app: &str,
+        orig_el: Option<&UiElement>,
+        expected: &ExpectedPointTarget,
+        safety_pts: &mut Vec<(f64, f64)>,
+    ) -> Result<Option<UiElement>, ToolOutput> {
+        match self.verify_points_with_identity(app, safety_pts, expected) {
+            Ok(()) => Ok(None),
+            Err(err_out) => {
+                if err_out.payload.get("code").and_then(|v| v.as_str()) == Some("stale_ref") {
+                    if let Some(orig) = orig_el {
+                        if let Some(relocated) = self.reconcile_stale_element(app, orig, expected)? {
+                            if let Some(ref rf) = relocated.frame {
+                                *safety_pts = vec![(rf.x + rf.w * 0.5, rf.y + rf.h * 0.5)];
+                            }
+                            return Ok(Some(relocated));
+                        }
+                    }
+                }
+                Err(err_out)
+            }
+        }
     }
 
     fn capture_verify_baseline(
@@ -2278,7 +2480,23 @@ impl Gateway {
             return ToolOutput::json(err_json("stale_ref", "Snapshot changed before confirmation"));
         }
 
-        let safety_pts = match &action {
+        let orig_el = match &action {
+            GatewayAction::Std(PendingAction::ClickRef { ref_id, .. })
+            | GatewayAction::Std(PendingAction::TypeText {
+                ref_id: Some(ref_id),
+                ..
+            })
+            | GatewayAction::SetValue {
+                ref_id: Some(ref_id),
+                ..
+            }
+            | GatewayAction::SelectText {
+                ref_id: Some(ref_id),
+                ..
+            } => self.elements_by_ref.get(ref_id).cloned(),
+            _ => None,
+        };
+        let mut safety_pts = match &action {
             GatewayAction::Std(PendingAction::ClickRef { ref_id, .. }) => {
                 let Some(pts) = self
                     .elements_by_ref
@@ -2309,11 +2527,15 @@ impl Gateway {
         };
 
         let fast_direct = policy_label == "direct" && self.driver.supports_fast_point_verify();
+        let mut reconciled_el: Option<UiElement> = None;
         if fast_direct {
             let expected = expected_target_for_action(&action, &self.elements_by_ref, &self.marks_by_id);
-            if let Err(err_out) = self.verify_points_with_identity(&app, &safety_pts, &expected) {
-                self.invalidate_snapshot();
-                return err_out;
+            match self.verify_or_reconcile_points(&app, orig_el.as_ref(), &expected, &mut safety_pts) {
+                Ok(rel) => reconciled_el = rel,
+                Err(err_out) => {
+                    self.invalidate_snapshot();
+                    return err_out;
+                }
             }
         } else {
             let fresh = match self.driver.inspect_app(
@@ -2368,14 +2590,17 @@ impl Gateway {
             return ToolOutput::json(err_json("audit_unavailable", "Audit log write failed"));
         }
 
-        let driver_req = match action {
+        let mut driver_req = match action {
             GatewayAction::Std(PendingAction::ClickRef {
                 ref_id,
                 click_count,
                 button,
                 ..
             }) => {
-                let Some(el) = self.elements_by_ref.get(&ref_id) else {
+                let target_el = reconciled_el
+                    .as_ref()
+                    .or_else(|| self.elements_by_ref.get(&ref_id));
+                let Some(el) = target_el else {
                     self.invalidate_snapshot();
                     return ToolOutput::json(err_json("stale_ref", "Element ref missing"));
                 };
@@ -2475,6 +2700,12 @@ impl Gateway {
                 y,
             },
         };
+        let ref_reconciled = if let Some(ref rel_el) = reconciled_el {
+            apply_reconciled_point(&mut driver_req, rel_el);
+            true
+        } else {
+            false
+        };
 
         let post_window = self.snapshot_window;
         let cached_ax = if self.snapshot_window.is_none() {
@@ -2524,6 +2755,9 @@ impl Gateway {
                     ("method", JsonValue::String(method)),
                     ("hint", JsonValue::String(hint.into())),
                 ];
+                if ref_reconciled {
+                    fields.push(("ref_reconciled", JsonValue::Bool(true)));
+                }
                 let snapshot_preserved = if verify_opts.return_state != ReturnStateMode::None {
                     let eff_bounds = verify_opts
                         .include_bounds
@@ -2533,6 +2767,7 @@ impl Gateway {
                         post_window,
                         verify_opts.return_state,
                         eff_bounds,
+                        verify_opts.return_query.as_deref(),
                         &mut fields,
                     ))
                 } else if is_non_navigating {
@@ -2772,6 +3007,7 @@ impl Gateway {
                 post_window,
                 eff_return_state,
                 eff_bounds,
+                batch_opts.return_query.as_deref(),
                 &mut out,
             );
             out.push(("snapshot_preserved", JsonValue::Bool(active)));
@@ -2952,11 +3188,11 @@ impl Gateway {
             verify_opts.verify_mode = batch_opts.verify_mode;
         }
 
-        let (req, safety_pts, expected_target) = match act {
+        let (mut req, mut safety_pts, expected_target, orig_el) = match act {
             "click" | "double_click" | "right_click" | "hover" => {
                 *navigated = true;
                 let target_spec = parse_semantic_target(step).map_err(step_err)?;
-                let (x, y, prefer_ax, exp) = if let Some(spec) = target_spec {
+                let (x, y, prefer_ax, exp, ref_el) = if let Some(spec) = target_spec {
                     let (resolved_app, el) = self
                         .resolve_semantic_target(Some(cur_app), step, &spec)
                         .map_err(step_err)?;
@@ -2975,13 +3211,19 @@ impl Gateway {
                         ))));
                     };
                     let exp = expected_target_for_element(&el);
-                    (f.x + f.w * 0.5, f.y + f.h * 0.5, supports_ax_press(&el), exp)
+                    let pax = supports_ax_press(&el);
+                    (f.x + f.w * 0.5, f.y + f.h * 0.5, pax, exp, Some(el))
                 } else {
                     let (px, py, pax) =
                         resolve_batch_point(step, &self.elements_by_ref, &self.marks_by_id)
                             .map_err(step_err)?;
                     let exp = expected_target_from_args(step, &self.elements_by_ref, &self.marks_by_id);
-                    (px, py, pax, exp)
+                    let ref_el = step
+                        .get("ref")
+                        .and_then(|v| v.as_str())
+                        .and_then(|r| self.elements_by_ref.get(r))
+                        .cloned();
+                    (px, py, pax, exp, ref_el)
                 };
                 let req = if act == "hover" {
                     ActionRequest::HoverPoint {
@@ -3001,7 +3243,7 @@ impl Gateway {
                         button: button.into(),
                     }
                 };
-                (req, vec![(x, y)], exp)
+                (req, vec![(x, y)], exp, ref_el)
             }
             "drag" => {
                 *navigated = true;
@@ -3037,6 +3279,7 @@ impl Gateway {
                     },
                     vec![(x1, y1), (x2, y2)],
                     ExpectedPointTarget::Any,
+                    None,
                 )
             }
             "type" => {
@@ -3058,7 +3301,7 @@ impl Gateway {
                     ))));
                 }
                 let target_spec = parse_semantic_target(step).map_err(step_err)?;
-                let (x, y, default_click_first, exp) = if let Some(spec) = target_spec {
+                let (x, y, default_click_first, exp, ref_el) = if let Some(spec) = target_spec {
                     let (resolved_app, el) = self
                         .resolve_semantic_target(Some(cur_app), step, &spec)
                         .map_err(step_err)?;
@@ -3078,13 +3321,18 @@ impl Gateway {
                         ))));
                     };
                     let exp = expected_target_for_element(&el);
-                    (f.x + f.w * 0.5, f.y + f.h * 0.5, !is_native, exp)
+                    (f.x + f.w * 0.5, f.y + f.h * 0.5, !is_native, exp, Some(el))
                 } else {
                     let (px, py, _) =
                         resolve_batch_point(step, &self.elements_by_ref, &self.marks_by_id)
                             .map_err(step_err)?;
                     let exp = expected_target_from_args(step, &self.elements_by_ref, &self.marks_by_id);
-                    (px, py, true, exp)
+                    let ref_el = step
+                        .get("ref")
+                        .and_then(|v| v.as_str())
+                        .and_then(|r| self.elements_by_ref.get(r))
+                        .cloned();
+                    (px, py, true, exp, ref_el)
                 };
                 let click_first = step
                     .get("click_first")
@@ -3107,6 +3355,7 @@ impl Gateway {
                     },
                     vec![(x, y)],
                     eff_exp,
+                    ref_el,
                 )
             }
             "set_value" => {
@@ -3117,11 +3366,15 @@ impl Gateway {
                     ))));
                 };
                 validate_input_text(text, true).map_err(step_err)?;
-                let (resolved_app, _, x, y, _) = self
+                let (resolved_app, resolved_ref, x, y, _) = self
                     .resolve_editable_target("set_value", step, Some(cur_app))
                     .map_err(step_err)?;
                 *cur_app = resolved_app;
                 *step_filtered = self.snapshot_filtered;
+                let ref_el = resolved_ref
+                    .as_deref()
+                    .and_then(|r| self.elements_by_ref.get(r))
+                    .cloned();
                 (
                     ActionRequest::SetValue {
                         bundle_id: cur_app.clone(),
@@ -3132,15 +3385,20 @@ impl Gateway {
                     },
                     vec![(x, y)],
                     ExpectedPointTarget::Editable,
+                    ref_el,
                 )
             }
             "select_text" => {
                 let (start, end) = parse_select_range(step).map_err(step_err)?;
-                let (resolved_app, _, x, y, _) = self
+                let (resolved_app, resolved_ref, x, y, _) = self
                     .resolve_editable_target("select_text", step, Some(cur_app))
                     .map_err(step_err)?;
                 *cur_app = resolved_app;
                 *step_filtered = self.snapshot_filtered;
+                let ref_el = resolved_ref
+                    .as_deref()
+                    .and_then(|r| self.elements_by_ref.get(r))
+                    .cloned();
                 (
                     ActionRequest::SelectText {
                         bundle_id: cur_app.clone(),
@@ -3151,6 +3409,7 @@ impl Gateway {
                     },
                     vec![(x, y)],
                     ExpectedPointTarget::Editable,
+                    ref_el,
                 )
             }
             "press_key" => {
@@ -3184,6 +3443,7 @@ impl Gateway {
                     },
                     Vec::new(),
                     ExpectedPointTarget::Any,
+                    None,
                 )
             }
             "scroll" => {
@@ -3227,6 +3487,7 @@ impl Gateway {
                     },
                     pts,
                     ExpectedPointTarget::Any,
+                    None,
                 )
             }
             _ => {
@@ -3250,8 +3511,21 @@ impl Gateway {
             }
         }
 
-        self.verify_points_with_identity(cur_app, &safety_pts, &expected_target)
-            .map_err(step_err)?;
+        let mut step_reconciled = false;
+        if self.driver.supports_fast_point_verify() {
+            if let Some(relocated) = self
+                .verify_or_reconcile_points(
+                    cur_app,
+                    orig_el.as_ref(),
+                    &expected_target,
+                    &mut safety_pts,
+                )
+                .map_err(step_err)?
+            {
+                apply_reconciled_point(&mut req, &relocated);
+                step_reconciled = true;
+            }
+        }
         let cached_ax = if idx == 0
             && initial_window_unscoped
             && initial_app.as_deref() == Some(cur_app.as_str())
@@ -3279,6 +3553,9 @@ impl Gateway {
             ("method", JsonValue::String(method)),
             ("ok", JsonValue::Bool(!step_failed_change)),
         ];
+        if step_reconciled {
+            item.push(("ref_reconciled", JsonValue::Bool(true)));
+        }
         if let Some(t) = telemetry {
             append_verify_fields(&mut item, &t);
         }
@@ -4285,10 +4562,12 @@ fn parse_verify_options(args: &JsonValue, timing: &TimingConfig) -> Result<Actio
     let keep_snapshot = parse_optional_bool_opt(args, "keep_snapshot")?;
     let verify_mode = parse_verify_mode(args)?;
     let (return_state, include_bounds) = parse_return_state_and_bounds(args)?;
+    let return_query = parse_optional_query(args)?.map(str::to_string);
     Ok(ActionVerifyOptions {
         verify_change: explicit_verify || max_retries > 0 || require_change,
         verify_mode,
         return_state,
+        return_query,
         include_bounds,
         max_retries,
         settle_ms,
@@ -4433,6 +4712,38 @@ fn expected_target_from_args(
     ExpectedPointTarget::Any
 }
 
+fn apply_reconciled_point(req: &mut ActionRequest, el: &UiElement) {
+    let Some(ref f) = el.frame else {
+        return;
+    };
+    let nx = f.x + f.w * 0.5;
+    let ny = f.y + f.h * 0.5;
+    match req {
+        ActionRequest::ClickPoint {
+            x,
+            y,
+            prefer_ax,
+            click_count,
+            button,
+            ..
+        } => {
+            *x = nx;
+            *y = ny;
+            *prefer_ax = *click_count == 1 && button == "left" && supports_ax_press(el);
+        }
+        ActionRequest::HoverPoint { x, y, .. }
+        | ActionRequest::TypePoint { x, y, .. }
+        | ActionRequest::SetValue { x, y, .. }
+        | ActionRequest::SelectText { x, y, .. } => {
+            *x = nx;
+            *y = ny;
+        }
+        ActionRequest::DragPoints { .. }
+        | ActionRequest::PressKey { .. }
+        | ActionRequest::Scroll { .. } => {}
+    }
+}
+
 fn point_probe_matches_expected(
     probe: &crate::driver::PointSafetyInfo,
     expected: &ExpectedPointTarget,
@@ -4463,7 +4774,12 @@ fn point_probe_matches_expected(
                     ("PopUpButton", "ComboBox") | ("ComboBox", "PopUpButton")
                 );
                 let compat_child = matches!(hit_role, "StaticText" | "Image" | "Group");
-                if !compat_combo && !compat_child {
+                let compat_wrapper = exp_role == "StaticText"
+                    && matches!(
+                        hit_role,
+                        "Button" | "ListItem" | "Tab" | "MenuItem" | "Link" | "Cell" | "Row" | "Group"
+                    );
+                if !compat_combo && !compat_child && !compat_wrapper {
                     return false;
                 }
             }
@@ -10119,6 +10435,333 @@ mod tests {
         assert_eq!(partial.payload.get("results").and_then(|v| v.as_array()).map(|a| a.len()), Some(1));
         assert_eq!(acted.load(Ordering::SeqCst), 1);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shifted_labeled_ref_auto_reconciles_and_static_text_wrapper_probe_matches() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+
+        struct ShiftDriver {
+            shifted: Arc<AtomicBool>,
+            wrapper_probe: Arc<AtomicBool>,
+            clicks: Arc<Mutex<Vec<(f64, f64)>>>,
+            inspect_calls: Arc<AtomicUsize>,
+        }
+        impl OsDriver for ShiftDriver {
+            fn doctor(&self) -> Result<DoctorStatus, crate::driver::DriverError> {
+                MockDriver::new().doctor()
+            }
+            fn list_apps(&self) -> Result<Vec<crate::driver::RunningApp>, crate::driver::DriverError> {
+                MockDriver::new().list_apps()
+            }
+            fn activate_app(&self, _: &str) -> Result<(), crate::driver::DriverError> {
+                Ok(())
+            }
+            fn launch_app(&self, _: &str) -> Result<(), crate::driver::DriverError> {
+                Ok(())
+            }
+            fn supports_fast_point_verify(&self) -> bool {
+                true
+            }
+            fn window_state(&self, bundle_id: &str) -> Result<WindowState, crate::driver::DriverError> {
+                Ok(WindowState {
+                    frontmost_bundle_id: bundle_id.into(),
+                    pid: 77,
+                    windows_total: 1,
+                    active_window_frame: Some(Rect { x: 0.0, y: 0.0, w: 600.0, h: 400.0 }),
+                })
+            }
+            fn probe_point_safe(
+                &self,
+                bundle_id: &str,
+                _x: f64,
+                y: f64,
+            ) -> Result<crate::driver::PointSafetyInfo, crate::driver::DriverError> {
+                if self.wrapper_probe.load(Ordering::SeqCst) {
+                    return Ok(crate::driver::PointSafetyInfo {
+                        safe: true,
+                        role: Some("Button".into()),
+                        label: Some("Chats, 72".into()),
+                        frontmost_bundle_id: Some(bundle_id.into()),
+                    });
+                }
+                let is_shifted = self.shifted.load(Ordering::SeqCst);
+                let save_y = if is_shifted { 114.0 } else { 54.0 };
+                let (role, label) = if (y - save_y).abs() <= 15.0 {
+                    ("Button", "Save")
+                } else if is_shifted && (y - 54.0).abs() <= 15.0 {
+                    ("Button", "Cancel")
+                } else {
+                    ("Group", "")
+                };
+                Ok(crate::driver::PointSafetyInfo {
+                    safe: true,
+                    role: Some(role.into()),
+                    label: Some(label.into()),
+                    frontmost_bundle_id: Some(bundle_id.into()),
+                })
+            }
+            fn inspect_app(
+                &self,
+                bundle_id: &str,
+                _: Option<i32>,
+                _: i32,
+                _: i32,
+            ) -> Result<AppSnapshot, crate::driver::DriverError> {
+                self.inspect_calls.fetch_add(1, Ordering::SeqCst);
+                let y = if self.shifted.load(Ordering::SeqCst) { 100.0 } else { 40.0 };
+                let elements = if self.wrapper_probe.load(Ordering::SeqCst) {
+                    vec![UiElement {
+                        ref_id: "e1".into(),
+                        role: "StaticText".into(),
+                        label: "Chats, 72".into(),
+                        value: None,
+                        url: None,
+                        window: 0,
+                        depth: 1,
+                        interactive: true,
+                        enabled: Some(true),
+                        focused: false,
+                        actions: vec![],
+                        frame: Some(Rect { x: 10.0, y: 70.0, w: 180.0, h: 30.0 }),
+                    }]
+                } else {
+                    vec![
+                        UiElement {
+                            ref_id: "e1".into(),
+                            role: "Button".into(),
+                            label: "Save".into(),
+                            value: None,
+                            url: None,
+                            window: 0,
+                            depth: 1,
+                            interactive: true,
+                            enabled: Some(true),
+                            focused: false,
+                            actions: vec!["AXPress".into()],
+                            frame: Some(Rect { x: 80.0, y, w: 80.0, h: 28.0 }),
+                        },
+                        UiElement {
+                            ref_id: "e2".into(),
+                            role: "TextField".into(),
+                            label: "Notes".into(),
+                            value: Some("draft".into()),
+                            url: None,
+                            window: 0,
+                            depth: 1,
+                            interactive: true,
+                            enabled: Some(true),
+                            focused: false,
+                            actions: vec![],
+                            frame: Some(Rect { x: 80.0, y: 180.0, w: 180.0, h: 28.0 }),
+                        },
+                    ]
+                };
+                Ok(AppSnapshot {
+                    bundle_id: bundle_id.into(),
+                    frontmost_bundle_id: bundle_id.into(),
+                    pid: 77,
+                    frontmost: true,
+                    windows_total: 1,
+                    windows: vec![crate::driver::WindowMeta {
+                        index: 0,
+                        title: "App".into(),
+                        frame: Some(Rect { x: 0.0, y: 0.0, w: 600.0, h: 400.0 }),
+                    }],
+                    elements,
+                    has_secure_field: false,
+                    has_unverified_field: false,
+                    truncated: false,
+                    depth_truncated: false,
+                    safety_scan_complete: true,
+                })
+            }
+            fn capture_and_ocr(
+                &self,
+                b: &str,
+                w: Option<i32>,
+                o: OcrMode,
+                e: bool,
+                opts: &ImageEncodeOptions,
+            ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
+                MockDriver::new().capture_and_ocr(b, w, o, e, opts)
+            }
+            fn render_som_image(
+                &self,
+                img: &str,
+                marks: &str,
+                win: &Rect,
+                opts: &ImageEncodeOptions,
+            ) -> Result<String, crate::driver::DriverError> {
+                MockDriver::new().render_som_image(img, marks, win, opts)
+            }
+            fn perform_action(&self, req: &ActionRequest) -> Result<crate::driver::ActionResult, crate::driver::DriverError> {
+                if let ActionRequest::ClickPoint { x, y, .. } = req {
+                    self.clicks.lock().unwrap().push((*x, *y));
+                }
+                Ok(crate::driver::ActionResult { method: "mock".into() })
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_reconcile_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let shifted = Arc::new(AtomicBool::new(false));
+        let wrapper_probe = Arc::new(AtomicBool::new(false));
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let inspect_calls = Arc::new(AtomicUsize::new(0));
+        let mut gw = Gateway::new(
+            Box::new(ShiftDriver {
+                shifted: Arc::clone(&shifted),
+                wrapper_probe: Arc::clone(&wrapper_probe),
+                clicks: Arc::clone(&clicks),
+                inspect_calls: Arc::clone(&inspect_calls),
+            }),
+            PolicySettings::default(),
+            dir.clone(),
+        );
+
+        // 1. Inspect at y=40 (center y=54), then shift Button "Save" to y=100 (center y=114)
+        gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("com.apple.TextEdit".into()))]),
+        );
+        shifted.store(true, Ordering::SeqCst);
+        let clk = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                (
+                    "arguments",
+                    JsonValue::object(vec![
+                        ("ref", JsonValue::String("e1".into())),
+                        ("return_state", JsonValue::String("diff".into())),
+                        ("query", JsonValue::String("Notes".into())),
+                    ]),
+                ),
+            ]),
+        );
+        assert_eq!(clk.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(clk.payload.get("ref_reconciled").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(clk.payload.get("state_mode").and_then(|v| v.as_str()), Some("filtered"));
+        let content = clk.payload.get("content").and_then(|v| v.as_str()).unwrap();
+        assert!(content.contains("Notes"), "filtered return_state missing Notes: {content}");
+        assert!(!content.contains("Save"), "filtered return_state leaked non-matching Save: {content}");
+        assert_eq!(clicks.lock().unwrap().as_slice(), &[(120.0, 114.0)]);
+
+        // Refs from reconciled filtered return_state remain live (e2 still usable)
+        let sv = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("set_value".into())),
+                ("arguments", JsonValue::object(vec![("ref", JsonValue::String("e2".into())), ("text", JsonValue::String("ok".into()))])),
+            ]),
+        );
+        assert_eq!(sv.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        // 2. StaticText wrapped in parent Button with matching label succeeds without extra inspect
+        wrapper_probe.store(true, Ordering::SeqCst);
+        gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("com.apple.TextEdit".into()))]),
+        );
+        let before_insp = inspect_calls.load(Ordering::SeqCst);
+        let clk_wrap = gw.dispatch(
+            "computer",
+            &JsonValue::object(vec![
+                ("action", JsonValue::String("click".into())),
+                ("arguments", JsonValue::object(vec![("ref", JsonValue::String("e1".into()))])),
+            ]),
+        );
+        assert_eq!(clk_wrap.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(inspect_calls.load(Ordering::SeqCst), before_insp);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_window_inspect_reports_off_space_hint() {
+        struct OffSpaceDriver;
+        impl OsDriver for OffSpaceDriver {
+            fn doctor(&self) -> Result<DoctorStatus, crate::driver::DriverError> {
+                MockDriver::new().doctor()
+            }
+            fn list_apps(&self) -> Result<Vec<crate::driver::RunningApp>, crate::driver::DriverError> {
+                MockDriver::new().list_apps()
+            }
+            fn activate_app(&self, _: &str) -> Result<(), crate::driver::DriverError> {
+                Ok(())
+            }
+            fn launch_app(&self, _: &str) -> Result<(), crate::driver::DriverError> {
+                Ok(())
+            }
+            fn off_space_windows(&self, _: &str) -> usize {
+                2
+            }
+            fn inspect_app(
+                &self,
+                bundle_id: &str,
+                _: Option<i32>,
+                _: i32,
+                _: i32,
+            ) -> Result<AppSnapshot, crate::driver::DriverError> {
+                Ok(AppSnapshot {
+                    bundle_id: bundle_id.into(),
+                    frontmost_bundle_id: bundle_id.into(),
+                    pid: 688,
+                    frontmost: true,
+                    windows_total: 0,
+                    windows: vec![],
+                    elements: vec![],
+                    has_secure_field: false,
+                    has_unverified_field: false,
+                    truncated: false,
+                    depth_truncated: false,
+                    safety_scan_complete: true,
+                })
+            }
+            fn capture_and_ocr(
+                &self,
+                b: &str,
+                w: Option<i32>,
+                o: OcrMode,
+                e: bool,
+                opts: &ImageEncodeOptions,
+            ) -> Result<crate::driver::CaptureResult, crate::driver::DriverError> {
+                MockDriver::new().capture_and_ocr(b, w, o, e, opts)
+            }
+            fn render_som_image(
+                &self,
+                img: &str,
+                marks: &str,
+                win: &Rect,
+                opts: &ImageEncodeOptions,
+            ) -> Result<String, crate::driver::DriverError> {
+                MockDriver::new().render_som_image(img, marks, win, opts)
+            }
+            fn perform_action(&self, _: &ActionRequest) -> Result<crate::driver::ActionResult, crate::driver::DriverError> {
+                Ok(crate::driver::ActionResult { method: "mock".into() })
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("apexuse_gw_offspace_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut gw = Gateway::new(Box::new(OffSpaceDriver), PolicySettings::default(), dir.clone());
+        let res = gw.dispatch(
+            "inspect_app",
+            &JsonValue::object(vec![("app", JsonValue::String("net.whatsapp.WhatsApp".into()))]),
+        );
+        assert_eq!(res.payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(res.payload.get("windows_total").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(res.payload.get("off_space_windows").and_then(|v| v.as_i64()), Some(2));
+        let hint = res.payload.get("window_hint").and_then(|v| v.as_str()).unwrap();
+        assert!(hint.contains("2 window(s)"), "unexpected window_hint: {hint}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -383,6 +383,16 @@ async def test_rust_mcp_direct_policy_executes_without_confirmation_loop(tmp_pat
             assert sv_live.structuredContent["ok"] is True
             assert sv_live.structuredContent["snapshot_preserved"] is True
 
+            clk_scoped = await session.call_tool(
+                "computer",
+                {"action": "click", "arguments": {"ref": "e1", "return_state": "diff", "query": "Notes"}},
+            )
+            assert clk_scoped.structuredContent["ok"] is True
+            assert clk_scoped.structuredContent["state_mode"] == "filtered"
+            assert clk_scoped.structuredContent["snapshot_active"] is True
+            assert "Notes" in clk_scoped.structuredContent["content"]
+            assert '"7"' not in clk_scoped.structuredContent["content"]
+
             clk_ax = await session.call_tool(
                 "computer",
                 {
